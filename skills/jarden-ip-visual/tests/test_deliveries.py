@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -20,6 +21,7 @@ import build_gallery
 import present_round
 import project
 import runtime_activity
+import update_runtime
 
 
 class DeliveryTests(unittest.TestCase):
@@ -89,6 +91,43 @@ class DeliveryTests(unittest.TestCase):
 
     def data(self):
         return project.load_project(self.root, writable=False)
+
+    def test_maintenance_snapshot_reads_local_cache_without_network_or_project_write(self):
+        update_directory = Path(self.temporary.name) / "maintenance"
+        project_before = (self.root / "project.json").read_bytes()
+        with mock.patch.dict(os.environ, {"JARDEN_UPDATE_HOME": str(update_directory)}), \
+                mock.patch.object(update_runtime.Source, "_request", side_effect=AssertionError("页面不能联网")):
+            self.assertEqual(build_gallery.maintenance_summary()["status"], "unchecked")
+            self.assertFalse(update_directory.exists())
+            update_runtime.atomic_json(update_runtime.check_state_path(), {
+                "current": "0.2.0", "latest": "0.3.0", "checked_at": time.time(), "update": True,
+            })
+            result = present_round.present_round(self.root, open_browser=False)
+            manifest = project.read_json(Path(result["manifest"]))
+            self.assertEqual(manifest["view"]["maintenance"]["status"], "available")
+            self.assertEqual(manifest["view"]["maintenance"]["latest"], "0.3.0")
+            update_runtime.atomic_json(update_runtime.failure_state_path(), {"last_failure_at": time.time() + 1})
+            summary = build_gallery.maintenance_summary()
+            self.assertEqual(summary["status"], "failed")
+            self.assertIsNone(summary["latest"])
+        after = self.data()
+        before = json.loads(project_before)
+        for key in before:
+            if key not in {"deliveries", "presentations"}:
+                self.assertEqual(after[key], before[key])
+
+    def test_stale_maintenance_cache_and_controls_cannot_install(self):
+        with mock.patch.dict(os.environ, {"JARDEN_UPDATE_HOME": str(Path(self.temporary.name) / "maintenance")}):
+            update_runtime.atomic_json(update_runtime.check_state_path(), {
+                "current": "0.2.0", "latest": "0.3.0", "checked_at": time.time() - update_runtime.CHECK_TTL - 1,
+                "update": True,
+            })
+            self.assertEqual(build_gallery.maintenance_summary()["status"], "stale")
+            result = present_round.present_round(self.root, open_browser=False)
+            page = Path(result["gallery"]).read_text()
+            self.assertIn("维护请求（尚未执行）", page)
+            self.assertIn("此请求不授权安装", page)
+            self.assertIn("maintenance.status !== \"available\"", page)
 
     def cli(self, script, *arguments):
         result = subprocess.run([sys.executable, str(SKILL / "scripts" / script), *map(str, arguments)],

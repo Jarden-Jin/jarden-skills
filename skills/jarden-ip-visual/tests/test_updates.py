@@ -592,6 +592,38 @@ class AssetSourceTests(FixtureMixin, unittest.TestCase):
             with self.subTest(destination=destination), self.assertRaises(update_runtime.SourceError):
                 handler.redirect_request(request, None, 302, "Found", {}, destination)
 
+    def test_json_redirect_is_rejected_before_a_followup_request_is_created(self):
+        handler = update_runtime._TrustedRedirect()
+        for endpoint, accept in (
+            ("/releases?per_page=100", "application/vnd.github+json"),
+            ("/releases?per_page=100", "application/octet-stream"),
+            ("/releases/assets/32", "application/vnd.github+json"),
+        ):
+            request = urllib.request.Request(update_runtime.API_ROOT + endpoint, headers={"Accept": accept})
+            with self.subTest(endpoint=endpoint, accept=accept), \
+                    mock.patch.object(urllib.request.HTTPRedirectHandler, "redirect_request") as follow:
+                with self.assertRaises(update_runtime.SourceError):
+                    handler.redirect_request(request, None, 302, "Found", {}, "https://github.com/asset")
+                follow.assert_not_called()
+
+    def test_binary_redirect_to_github_removes_auth_and_preserves_asset_chain(self):
+        request = urllib.request.Request(
+            update_runtime.API_ROOT + "/releases/assets/32",
+            headers={"Authorization": "Bearer synthetic-github-token", "Accept": "application/octet-stream"},
+        )
+        handler = update_runtime._TrustedRedirect()
+        first = handler.redirect_request(request, None, 302, "Found", {}, "https://github.com/asset")
+        self.assertIsNotNone(first)
+        self.assertNotIn("Authorization", dict(first.header_items()))
+        second = handler.redirect_request(
+            first, None, 302, "Found", {}, "https://release-assets.githubusercontent.com/example/asset",
+        )
+        self.assertIsNotNone(second)
+        self.assertNotIn("Authorization", dict(second.header_items()))
+        self.assertEqual(second.get_header("Accept"), "application/octet-stream")
+        with self.assertRaises(update_runtime.SourceError):
+            handler.redirect_request(second, None, 302, "Found", {}, "https://untrusted.example/asset")
+
 
 class CheckStateTests(FixtureMixin, unittest.TestCase):
     def test_maintenance_subprocesses_never_read_or_inherit_image_credentials(self):

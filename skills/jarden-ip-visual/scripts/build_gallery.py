@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import project as state  # noqa: E402
 import physics_review
+import update_runtime
 
 TEMPLATE = Path(__file__).resolve().parent.parent / "assets" / "gallery.html"
 ASSETS = TEMPLATE.parent
@@ -47,6 +49,32 @@ CHOICES = {
         "重新生成：整组重来，可以附上想改的地方",
     ],
 }
+
+
+def maintenance_summary() -> dict[str, Any]:
+    summary = {"current": None, "latest": None, "status": "unchecked", "checked_at": None}
+    try:
+        summary["current"] = update_runtime.installed_version(update_runtime.real_root())
+        try:
+            cached = update_runtime.read_json(update_runtime.check_state_path())
+        except update_runtime.UpdateError:
+            cached = {}
+        checked_at = cached.get("checked_at")
+        if cached.get("current") == summary["current"] and isinstance(checked_at, (int, float)) and update_runtime.safe_version(str(cached.get("latest", ""))):
+            summary.update(latest=cached["latest"], checked_at=checked_at)
+            summary["status"] = "stale" if time.time() - checked_at >= update_runtime.CHECK_TTL else (
+                "available" if update_runtime.version_key(cached["latest"]) > update_runtime.version_key(summary["current"]) else "current"
+            )
+        try:
+            failures = update_runtime.read_json(update_runtime.failure_state_path())
+        except update_runtime.UpdateError:
+            failures = {}
+        failed_at = failures.get("last_failure_at")
+        if isinstance(failed_at, (int, float)) and failed_at >= (checked_at if isinstance(checked_at, (int, float)) else 0):
+            summary.update(status="failed", latest=None)
+    except (update_runtime.UpdateError, OSError, ValueError):
+        summary.update(status="unavailable", latest=None)
+    return summary
 
 
 def label_of(options: list[dict[str, Any]], value: Any) -> str:
@@ -242,6 +270,7 @@ def build_data(root: Path, project: dict[str, Any], *, prefer_latest: bool = Tru
         "previous_delivery": None,
         "comparison": None,
         "delivery_history": [],
+        "maintenance": maintenance_summary(),
     }
 
 

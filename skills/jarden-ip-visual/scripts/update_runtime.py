@@ -70,13 +70,22 @@ def maintenance_environment() -> dict[str, str]:
 
 class _TrustedRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, msg, headers, newurl):
+        original = urllib.parse.urlsplit(request.full_url)
+        binary_asset = request.get_header("Accept") == "application/octet-stream" and (
+            re.fullmatch(re.escape(API_ROOT) + r"/releases/assets/[1-9]\d*", request.full_url)
+            or getattr(request, "_jarden_asset_redirect", False) and original.hostname in ASSET_REDIRECT_HOSTS
+        )
+        if not binary_asset:
+            raise SourceError("普通 API 请求不允许重定向", "untrusted_source")
         parsed = urllib.parse.urlsplit(newurl)
         if parsed.scheme != "https" or parsed.username or parsed.password or parsed.hostname not in ASSET_REDIRECT_HOSTS:
             raise SourceError("下载重定向到非受信 GitHub 资产地址", "untrusted_source")
         redirected = super().redirect_request(request, fp, code, msg, headers, newurl)
-        if redirected is not None and parsed.hostname not in {"github.com", "api.github.com"}:
-            for name in ("Authorization", "authorization"):
-                redirected.remove_header(name)
+        if redirected is not None:
+            redirected._jarden_asset_redirect = True
+            if original.hostname != parsed.hostname:
+                for name in ("Authorization", "authorization"):
+                    redirected.remove_header(name)
         return redirected
 
 

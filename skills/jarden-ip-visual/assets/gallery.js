@@ -706,6 +706,47 @@
     modal.showModal();
   }
 
+  function maintenanceRequest(plan) {
+    const maintenance = data.maintenance || {};
+    const message = plan
+      ? `请为 jarden-ip-visual ${maintenance.latest} 生成更新计划，核对变化与备份。此请求不授权安装。`
+      : "请检查 jarden-ip-visual 是否有更新，只检查，不安装。";
+    const modal = el("dialog", { id: "maintenance-dialog", "aria-label": "维护请求（尚未执行）" }, [
+      el("div", { class: "dialog-toolbar" }, [
+        el("strong", { text: "维护请求（尚未执行）" }),
+        el("button", { type: "button", text: "关闭", onclick: () => modal.close() })
+      ]),
+      el("div", { class: "export-content" }, [
+        el("p", { text: "复制后回到对话发送。页面不会下载或安装更新，也不会改变当前创作。" }),
+        el("textarea", { readonly: true, value: message })
+      ])
+    ]);
+    modal.addEventListener("close", () => modal.remove());
+    app.appendChild(modal);
+    modal.showModal();
+  }
+
+  function maintenanceSection() {
+    const maintenance = data.maintenance || {};
+    const descriptions = {
+      unchecked: "本轮快照没有版本检查结果；离线或关闭检查时可继续创作。",
+      unavailable: "暂无法读取版本信息；当前创作不受影响。",
+      failed: "暂无法检查更新，不能确认是否为最新版本。",
+      stale: "版本检查结果已过期，可重新检查。",
+      available: `有新版本 ${maintenance.latest}，可先查看变化与更新计划。`,
+      current: "最近一次检查未发现更高的正式版本。"
+    };
+    return el("details", { class: "archive maintenance", id: "maintenance" }, [
+      el("summary", { text: `版本与更新 · ${maintenance.current || "版本待核对"}` }),
+      el("p", { text: descriptions[maintenance.status] || descriptions.unchecked }),
+      el("p", { class: "meta", text: `结果随本页快照保存${maintenance.checked_at ? " · 检查于 " + compactTime(maintenance.checked_at * 1000) : ""}。检查与计划均不代表安装授权。` }),
+      el("div", { class: "dialog-tools" }, [
+        el("button", { type: "button", text: "检查更新", onclick: () => maintenanceRequest(false) }),
+        el("button", { type: "button", text: "查看更新计划", disabled: maintenance.status !== "available", onclick: () => maintenanceRequest(true) })
+      ])
+    ]);
+  }
+
   function openZoomItem(item) {
     state.zoomItem = item;
     state.lastFocused = document.activeElement;
@@ -741,7 +782,8 @@
       ...header(),
       ...notices(),
       agreements(),
-      el("div", { class: "workspace" }, [workarea(), sidebar()])
+      el("div", { class: "workspace" }, [workarea(), sidebar()]),
+      maintenanceSection()
     );
     if (savedSelection) {
       document.querySelector(`input[data-item-id="${CSS.escape(savedSelection)}"]`)?.focus({ preventScroll: true });

@@ -10,13 +10,15 @@
 {
   "raw": "用户原话",
   "interpretation": "Agent 对可观察问题的解释",
-  "change": "具体改法",
+  "changes": ["具体可观察的改法"],
   "keep": ["明确保持的身份、配色、构图或图位"],
   "scope": {"subjects": ["角色"], "slots": ["detail"], "delivery_id": "D0005"},
-  "baseline": "用于对比的交付或图位",
+  "baseline_delivery": "D0005",
   "verification": ["实际复查结果"]
 }
 ```
+
+把此结构保存为安装目录外的 JSON，再用 `<python> <skill>/scripts/project.py feedback <项目> --file <反馈JSON>` 登记。`changes` 必须是非空数组；`baseline_delivery` 填真实交付编号，无基线时用空字符串。
 
 不要求为每个小改动硬编码新字段；但至少能从原话追到改法、保持项和影响范围。用户已经明确的信息不重复提问，模糊反馈不自动视为撤销此前决定。
 
