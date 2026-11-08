@@ -1,12 +1,15 @@
 # jarden-ip-visual
 
-把原创 IP 的线框图、灵感图或平面 AI 图，逐步做成毛绒、手办、拼图等实体周边的商业视觉。它会先问清楚要做什么，再分阶段给方向、用 HTML 对比，最后交付可以直接发小红书的顺序图片、标题、正文与 tag，减少反复摸索和漏项。
+把原创 IP 的线框图、灵感图或平面 AI 图，逐步做成毛绒、手办、拼图等实体周边的商业视觉。每轮用 HTML 工作台看图、比较和确认：当前候选、上次交付、改动与保持项放在一起，最后交付可以直接发小红书的顺序图片、标题、正文与 tag。
 
 ## 会得到什么
 
 - 一次只问一个问题，已回答的内容保存在项目里，继续会话时不重复问。
 - 四种笔记结构：同系列合集、IP 设计手稿、单个玩偶多维展示、多个玩偶多场景展示。
 - 从概念、材质到透明资产、场景图的逐轮对比页，每轮默认三个方向。
+- 当前轮、真实上次交付和比较基线分别展示；历史图片采用不可变快照，原图改动不会悄悄替换旧交付。
+- 本机页面确认会写回项目并读回回执；无服务时可保存草稿、复制指令和导出意向，但不会显示假成功。
+- 只改指定图位时保留无关图片，恢复时从持久化状态继续；补图按钮只登记意向，不直接调用付费生图。
 - 编号并统一为3:4的发布图片、可复制的文案与有序话题；九宫格可另附预览。
 - 默认干净无提示字的成图，AI 与未知规格说明留在文案和 HTML；只有你明确要求才加图字。
 - 所有场景备选、编辑/合成图和实际发布图，逐张交给不继承制图对话的独立 Agent 检查重力、连接件、人体接触和光影；没通过不交付定稿。
@@ -15,18 +18,18 @@
 
 ## 安装
 
-本 Skill 位于 [Joseph-Jin/jarden-skills](https://github.com/Joseph-Jin/jarden-skills) 的 `skills/jarden-ip-visual` 目录。仓库为私有时，安装者需要相应的 GitHub 读取权限。
+本 Skill 位于 [Jarden-Jin/jarden-skills](https://github.com/Jarden-Jin/jarden-skills) 的 `skills/jarden-ip-visual` 目录。仓库为私有时，安装者需要相应的 GitHub 读取权限。
 
 最方便的方式是告诉 Agent：
 
 ```text
-请帮我安装这个 Skill：https://github.com/Joseph-Jin/jarden-skills/tree/main/skills/jarden-ip-visual
+请帮我安装这个 Skill：https://github.com/Jarden-Jin/jarden-skills/tree/main/skills/jarden-ip-visual
 ```
 
 也可使用支持多 Skill 仓库的安装器：
 
 ```text
-npx skills add Joseph-Jin/jarden-skills --skill jarden-ip-visual
+npx skills add Jarden-Jin/jarden-skills --skill jarden-ip-visual
 ```
 
 手动安装时复制当前 jarden-ip-visual 目录到宿主支持的 skills 目录。npx 的 Node.js 依赖只属于可选安装方式。
@@ -43,6 +46,16 @@ npx skills add Joseph-Jin/jarden-skills --skill jarden-ip-visual
 
 开始前提供一张或多张图，或清楚的文字想法。告诉 Agent 已经确定的品类、角色数量和用途，就可以少回答相应的问题。
 
+## 每轮怎样确认
+
+Agent 会先保存真实图片与状态，再生成 HTML 并尝试打开。页面区分「已生成」「已请求打开」与「已核对显示」；打开失败时仍保留页面和绝对路径，不会丢失图片。
+
+本机交互模式可选方向、逐张保留、写备注，再确认提交。只有项目核心写入成功且回执读回一致才显示「已采用」。重复点击不会重复推进；旧标签页、换图、缺图或必要审查未通过时会说明原因。
+
+静态 HTML 可离线看图、保存草稿或导出意向，但不能直接写项目。页面会明确显示「尚未提交」；把意向交回对话后，Agent 再校验。没有宿主事件回调时，页面选完回对话说「继续」，Agent 才会读回并续作，不会离线自动运行。
+
+只想修改一张时，直接说图号和改法。工作台保留修改前后的可比版本及不变项；模糊反馈不会自动重做全部图片或更换角色。
+
 ## 配置与依赖
 
 使用宿主内置或已连接的生图能力时无需额外配置 Key。优先可用的高质量图像模型，实际模型取决于宿主。
@@ -50,6 +63,7 @@ npx skills add Joseph-Jin/jarden-skills --skill jarden-ip-visual
 | 能力 | 依赖 |
 | --- | --- |
 | 需求、状态与 HTML | Python 3.10+，宿主可读取图片与写本地文件 |
+| 本机交互工作台 | Python 标准库；仅监听 127.0.0.1，无额外 Web 框架 |
 | 检查、去底、拼版、发布整理 | Pillow 和可用中文字体 |
 | 真实生图 | 宿主内置生图、已连接服务或兼容图片接口之一 |
 | 场景物理验收 | Pillow 检查盲审图元数据；宿主支持新建不继承对话、能实际看图的独立 Agent；没有时停止在待审 |
@@ -68,6 +82,8 @@ macOS 是当前验证平台。Python 脚本使用 pathlib 和跨平台接口；W
 凭据组件使用 macOS Keychain、Windows Credential Manager 或 Linux Secret Service。后两者有适配器，尚未在本 Skill 中实机验收；不可用时停止，不转为明文存储。
 
 没有生图工具时可以保留提示词和带缺图标记的对比页，不能完成实际素材。没有 GUI 仍可生成 HTML，用户在自己的浏览器打开；离线时可整理已有图，不能调用云端生图。
+
+独立创作、身份、整套图序和文案审查分别记录，不用某个总分豁免物理门槛；未评不等于通过。传播评审检查封面识别、图间信息增量、场景代入和 tag 相关性，不保证实际流量或销量。
 
 物理审查是视觉可信度检查，不是数值仿真或工程证明。报告绑定图片哈希；旧项目缺审、改图或重新排版后需要补审。程序能校验报告声明和哈希，不能自动证明审查者真的独立，也不能保证从单张图判断全部物理事实。见 [物理审查](references/physics-review.md)。
 
@@ -95,6 +111,14 @@ python3 -m unittest discover -s tests -v
 
 透明背景问题可运行 check_images.py --alpha；发布整理先用 package_post.py --dry-run 查看缺项。图片比例、标题和话题采用保守交付预算，发布前以当前账号发布页的校验为准。
 
+## 更新与旧项目
+
+告诉 Agent「检查 jarden-ip-visual 更新」只检查固定仓库的发行，不改安装。明确要求升级某个版本后，Agent 先展示版本、来源、文件改动、备份与恢复计划，再执行已授权更新。本地修改、源码 checkout、共享符号链接或正在运行的业务不会被盲目覆盖。
+
+更新只处理 Skill 代码，不读取图片 Key，也不会扫描或迁移所有项目。旧项目可只读查看；继续写入前单独预览 schema 迁移，并保留原文件、未知字段、图片、选择和审查。代码回滚不回滚项目，旧代码不能盲写新 schema。
+
+更新入口是 `scripts/check_update.py`，迁移入口是 `scripts/migrate_project.py`；命令、来源、外部备份和失败恢复见 [更新说明](references/updates.md) 与 [项目状态](references/project-state.md)。
+
 ## 源码与许可证
 
-源码维护在 [Joseph-Jin/jarden-skills](https://github.com/Joseph-Jin/jarden-skills)，版本号以 SKILL.md 的 `metadata.version` 为准。当前未附带开源许可证。Windows/Linux、较弱模型及第三方线上图片接口尚未完成实机验证。
+源码维护在 [Jarden-Jin/jarden-skills](https://github.com/Jarden-Jin/jarden-skills)，版本号以 SKILL.md 的 `metadata.version` 为准。当前未附带开源许可证。Windows/Linux、较弱模型及第三方线上图片接口尚未完成实机验证。

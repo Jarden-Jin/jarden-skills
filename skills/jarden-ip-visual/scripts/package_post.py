@@ -95,11 +95,26 @@ def file_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def require_package_reviews(root: Path, project: dict[str, Any], paths: list[str], copy_path: Path | None = None) -> None:
+    import review_checks
+
+    state.require_reviews(root, project, paths, "scene")
+    try:
+        for category in ("sequence", "copy"):
+            result = review_checks.status(root, project, category, paths, copy_path)
+            if result.get("blocking"):
+                raise state.ProjectError(f"{category} 审查仍有阻断问题：" + json.dumps(result.get("findings") or result, ensure_ascii=False))
+    except review_checks.ReviewError as error:
+        raise state.ProjectError(str(error)) from error
+
+
 def make_plan(root: Path, project: dict[str, Any], copy: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     note_type = (project.get("answers") or {}).get("note_type")
     warnings = validate_copy(copy, note_type)
     finals = ordered_finals(project)
     state.require_physics(root, project, [final["path"] for final in finals])
+    copy_path = Path(args.copy).resolve() if args.copy else None
+    require_package_reviews(root, project, [final["path"] for final in finals], copy_path)
     images = []
     for index, final in enumerate(finals, 1):
         path = source_path(root, final["path"])
@@ -158,9 +173,16 @@ def grid_preview(paths: list[Path], out: Path) -> None:
 
 
 def commit_state(root: Path, project: dict[str, Any], out: Path, plan: dict[str, Any]) -> None:
-    project["stage"] = "done"
-    project["post"] = {"path": out.relative_to(root).as_posix(), "signature": plan["signature"], "images": len(plan["images"])}
-    state.save_project(root, project)
+    with state.project_lock(root):
+        current = state.load_project(root, writable=True)
+        if current.get("revision") != project.get("revision"):
+            raise state.ProjectError("stale_revision：整理期间项目有变化，请重新校验")
+        record = {"path": out.relative_to(root).as_posix(), "signature": plan["signature"], "images": len(plan["images"])}
+        if current.get("stage") == "done" and current.get("post") == record:
+            return
+        project["stage"] = "done"
+        project["post"] = record
+        state.save_project(root, project)
 
 
 def render_images(root: Path, plan: dict[str, Any], directory: Path, args: argparse.Namespace) -> list[str]:
@@ -199,6 +221,8 @@ def execute(root: Path, project: dict[str, Any], copy: dict[str, Any], plan: dic
     try:
         paths = render_images(root, plan, staging, args)
         reviews = state.require_physics(root, project, paths)
+        copy_path = Path(args.copy).resolve() if args.copy else None
+        state.require_reviews(root, project, paths, "package", copy_path)
         for entry, review in zip(plan["images"], reviews):
             entry["physics_review"] = {"verdict": review["verdict"], "report": review["report"]}
         (staging / "caption.md").write_text(text, encoding="utf-8")
@@ -217,18 +241,27 @@ def execute(root: Path, project: dict[str, Any], copy: dict[str, Any], plan: dic
             "warnings": plan["warnings"],
             "files": {path.relative_to(staging).as_posix(): file_hash(path) for path in staging.rglob("*") if path.is_file()},
         }
-        state.write_json(staging / "manifest.json", manifest)
+        state.atomic_json(staging / "manifest.json", manifest)
         backup = None
-        if out.exists():
-            backup = out.with_name(f"{out.name}-previous-{datetime.now():%Y%m%d-%H%M%S-%f}")
-            out.replace(backup)
-        try:
-            staging.replace(out)
-        except OSError:
-            if backup:
-                backup.replace(out)
-            raise
-        commit_state(root, project, out, plan)
+        with state.project_lock(root):
+            current = state.load_project(root, writable=True)
+            if current.get("revision") != project.get("revision"):
+                raise state.ProjectError("stale_revision：整理期间项目有变化，旧成品未覆盖")
+            latest_copy = state.read_json(Path(args.copy) if args.copy else root / "copy.json")
+            if make_plan(root, current, latest_copy, args)["signature"] != plan["signature"]:
+                raise state.ProjectError("整理期间文案或素材变化，旧成品未覆盖")
+            if out.exists():
+                backup = out.with_name(f"{out.name}-previous-{datetime.now():%Y%m%d-%H%M%S-%f}")
+                out.replace(backup)
+            try:
+                staging.replace(out)
+                commit_state(root, project, out, plan)
+            except BaseException:
+                if out.exists():
+                    out.replace(staging)
+                if backup:
+                    backup.replace(out)
+                raise
         result = {"ok": True, "post": out.resolve().as_posix(), "images": len(plan["images"]), "warnings": plan["warnings"]}
         if backup:
             result["previous"] = backup.resolve().as_posix()
@@ -255,7 +288,7 @@ def main(argv: list[str] | None = None) -> int:
         return imaging.fail("需要 Python 3.10 或更高版本")
     root = Path(args.project).resolve()
     try:
-        project = state.load_project(root)
+        project = state.load_project(root, writable=not args.dry_run)
         out = (root / args.out).resolve()
         if out == root or not out.is_relative_to(root):
             raise state.ProjectError("--out 必须是项目内的子目录")
@@ -266,7 +299,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.prepare_review:
             return state.emit(prepare_review(root, plan, args))
         if complete_existing(out, plan["signature"]):
-            state.require_physics(root, project, [(out / entry["file"]).relative_to(root).as_posix() for entry in plan["images"]])
+            existing = [(out / entry["file"]).relative_to(root).as_posix() for entry in plan["images"]]
+            state.require_physics(root, project, existing)
+            copy_path = Path(args.copy).resolve() if args.copy else None
+            state.require_reviews(root, project, existing, "package", copy_path)
             commit_state(root, project, out, plan)
             return state.emit({"ok": True, "unchanged": True, "post": out.as_posix(), "images": len(plan["images"])})
         if out.exists() and any(out.iterdir()) and not args.force:
@@ -277,4 +313,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    from runtime_activity import execution_lease
+    with execution_lease():
+        sys.exit(main())

@@ -8,20 +8,27 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import contextvars
+import copy
 import difflib
 import hashlib
+import io
 import json
 import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import physics_review
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 STAGES = ("concept", "material", "cutout", "scene", "package", "done")
 PER_SUBJECT_STAGES = ("concept", "material")
 ASK_ORDER = ("product_form", "subject_scope", "note_type", "concept_count", "delivery")
@@ -84,6 +91,9 @@ INPUT_KINDS = {"wireframe", "sketch", "flat-design", "ai-image", "photo", "text"
 IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"RIFF")
 REUSABLE_ANSWERS = ("product_form", "note_type", "delivery")
 METHODS = ("generate", "derive", "compose")
+_TRANSACTION = contextvars.ContextVar("project_transaction", default=None)
+_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_LOCKS_GUARD = threading.Lock()
 
 
 class ProjectError(Exception):
@@ -94,20 +104,118 @@ def now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def write_json(path: Path, data: dict[str, Any]) -> None:
+def atomic_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temp = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=path.parent)
     try:
         with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
             json.dump(data, stream, ensure_ascii=False, indent=2)
             stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temp, path)
     except BaseException:
         Path(temp).unlink(missing_ok=True)
         raise
 
 
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    transaction = _TRANSACTION.get()
+    resolved = path.resolve()
+    if transaction and resolved.is_relative_to(transaction["root"]):
+        transaction["writes"][resolved] = copy.deepcopy(data)
+        return
+    atomic_json(path, data)
+
+
+def _apply_journal(root: Path, journal: dict[str, Any]) -> None:
+    operations = journal.get("writes")
+    if journal.get("schema_version") != 1 or not isinstance(operations, list):
+        raise ProjectError("项目事务日志损坏；保留文件，不能继续写入")
+    for operation in operations:
+        relative = operation.get("path", "")
+        target = (root / relative).resolve()
+        if not relative or Path(relative).is_absolute() or not target.is_relative_to(root) or not isinstance(operation.get("data"), dict):
+            raise ProjectError("项目事务包含非法路径或数据")
+    for operation in operations:
+        atomic_json(root / operation["path"], operation["data"])
+
+
+@contextlib.contextmanager
+def project_lock(root: Path, timeout: float = 10.0):
+    root = root.expanduser().resolve()
+    current = _TRANSACTION.get()
+    if current and current["root"] == root:
+        yield current
+        return
+    if current:
+        raise ProjectError("不能在一个项目事务内写另一个项目")
+    with _LOCKS_GUARD:
+        thread_lock = _THREAD_LOCKS.setdefault(str(root), threading.RLock())
+    if not thread_lock.acquire(timeout=timeout):
+        raise ProjectError("project_busy：项目正在提交，请稍后重试")
+    stream = None
+    acquired = False
+    token = None
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        lock_path = root / ".project.lock"
+        if lock_path.is_symlink():
+            raise ProjectError("项目锁不能是符号链接")
+        stream = lock_path.open("a+b")
+        if stream.tell() == 0:
+            stream.write(b"0")
+            stream.flush()
+        deadline = time.monotonic() + timeout
+        while not acquired:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except (BlockingIOError, OSError) as error:
+                if time.monotonic() >= deadline:
+                    raise ProjectError("project_busy：项目正在提交，请稍后重试") from error
+                time.sleep(0.025)
+        journal_file = root / ".state-transaction.json"
+        if journal_file.is_file():
+            _apply_journal(root, read_json(journal_file))
+            journal_file.unlink()
+        transaction = {"root": root, "writes": {}}
+        token = _TRANSACTION.set(transaction)
+        yield transaction
+        if transaction["writes"]:
+            operations = [{"path": path.relative_to(root).as_posix(), "data": data}
+                          for path, data in transaction["writes"].items()]
+            operations.sort(key=lambda operation: operation["path"] == "project.json")
+            journal = {"schema_version": 1, "writes": operations}
+            atomic_json(journal_file, journal)
+            _apply_journal(root, journal)
+            journal_file.unlink()
+    finally:
+        if token is not None:
+            _TRANSACTION.reset(token)
+        if stream:
+            if acquired:
+                if os.name == "nt":
+                    import msvcrt
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            stream.close()
+        thread_lock.release()
+
+
 def read_json(path: Path) -> dict[str, Any]:
+    transaction = _TRANSACTION.get()
+    if transaction and path.resolve() in transaction["writes"]:
+        return copy.deepcopy(transaction["writes"][path.resolve()])
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as error:
@@ -119,17 +227,33 @@ def read_json(path: Path) -> dict[str, Any]:
     return data
 
 
-def load_project(root: Path) -> dict[str, Any]:
+def load_project(root: Path, writable: bool = False) -> dict[str, Any]:
     path = root / "project.json"
     if not path.is_file():
         raise ProjectError(f"{root.as_posix()} 里没有 project.json；先运行 init")
     project = read_json(path)
-    if project.get("schema_version") != SCHEMA_VERSION:
-        raise ProjectError("project.json 的 schema_version 必须是 1")
+    if project.get("schema_version") not in (1, SCHEMA_VERSION):
+        raise ProjectError("不支持的 project schema；保留文件，不能降级覆盖")
+    if writable and project.get("schema_version") != SCHEMA_VERSION:
+        raise ProjectError("migration_required：schema 1 只读；先用 migrate_project.py 预览并明确执行迁移")
     return project
 
 
 def save_project(root: Path, project: dict[str, Any]) -> None:
+    if project.get("schema_version") != SCHEMA_VERSION:
+        raise ProjectError("migration_required：不能直接写入旧项目")
+    if not _TRANSACTION.get():
+        with project_lock(root):
+            save_project(root, project)
+        return
+    if (root / "project.json").is_file():
+        current = load_project(root, writable=True)
+        if current.get("revision", 0) != project.get("revision", 0):
+            raise ProjectError("stale_revision：项目已变化，请重新读取")
+        for key in ("presentations", "deliveries"):
+            if key in current:
+                project[key] = current[key]
+    project["revision"] = project.get("revision", 0) + 1
     project["updated_at"] = now()
     write_json(root / "project.json", project)
 
@@ -141,14 +265,32 @@ def require_physics(root: Path, project: dict[str, Any], paths: list[str]) -> li
         raise ProjectError(str(error)) from error
 
 
+def require_reviews(root: Path, project: dict[str, Any], paths: list[str], stage: str, copy_path: Path | None = None) -> None:
+    import review_checks
+    try:
+        result = review_checks.blocking_findings(root, project, paths, stage, copy_path)
+    except review_checks.ReviewError as error:
+        raise ProjectError(str(error)) from error
+    if result.get("blocking"):
+        raise ProjectError("分类审查仍有阻断问题：" + json.dumps(result["findings"], ensure_ascii=False))
+    if result.get("not_assessed"):
+        project.setdefault("review_not_assessed", {})
+        for finding in result["not_assessed"]:
+            key = f"{finding.get('category')}:{finding.get('path') or stage}"
+            project["review_not_assessed"][key] = {**finding, "recorded_at": now()}
+
+
 def new_project(name: str, inputs: list[dict[str, str]]) -> dict[str, Any]:
     stamp = now()
     return {
         "schema_version": SCHEMA_VERSION,
+        "project_id": uuid.uuid4().hex,
+        "revision": 0,
+        "requirements_revision": 0,
         "project": name,
         "created_at": stamp,
         "updated_at": stamp,
-        "brief": {"ip_name": "", "selling_points": [], "bible": {}},
+        "brief": {"ip_name": "", "selling_points": [], "bible": {}, "decisions": []},
         "inputs": inputs,
         "answers": {},
         "preferences": {"directions_per_round": 3},
@@ -157,6 +299,11 @@ def new_project(name: str, inputs: list[dict[str, str]]) -> dict[str, Any]:
         "rounds": [],
         "selections": {},
         "finals": [],
+        "deliveries": [],
+        "presentations": {},
+        "pending_intents": [],
+        "decision_receipts": {},
+        "feedback": [],
     }
 
 
@@ -333,7 +480,7 @@ def requirement_signature(project: dict[str, Any], stage: str | None = None) -> 
     if stage is None or stage == "scene":
         data.update(note_type=answers.get("note_type"), delivery=answers.get("delivery"))
     if stage is None:
-        data["revision"] = project.get("revision", 0)
+        data["revision"] = project.get("requirements_revision", 0) if project.get("schema_version") == 2 else project.get("revision", 0)
     return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
@@ -368,7 +515,7 @@ def stage_action(project: dict[str, Any]) -> dict[str, Any]:
     return {"action": "done", "say": "交付发帖目录和对比页，提醒合规事项，列出接下来可以做"}
 
 
-def next_action(project: dict[str, Any]) -> dict[str, Any]:
+def next_action(project: dict[str, Any], root: Path | None = None) -> dict[str, Any]:
     answers = project.get("answers") or {}
     for field in ASK_ORDER:
         if answers.get(field) in (None, "", []):
@@ -382,6 +529,18 @@ def next_action(project: dict[str, Any]) -> dict[str, Any]:
         return {"action": "backend", "say": "按 SKILL.md 的顺序选定生图能力并写入 image_backend.kind；宿主自带或已连接的能力可用时不问用户"}
     entry = open_round(project)
     if entry and entry.get("status") == "planned":
+        if root is not None:
+            root = root.resolve()
+            data = read_json(project_path(root, entry["dir"] + "/round.json"))
+            paths = [entry["dir"] + "/" + item["image"] for item in data.get("items") or []]
+            if paths and all(project_path(root, path).is_file() for path in paths):
+                if entry.get("stage") == "scene":
+                    pending = [physics_review.status(root, project, path) for path in paths]
+                    if any(item["verdict"] != "pass" for item in pending):
+                        return {"action": "review", "round": entry["id"], "category": "physics", "paths": paths,
+                                "say": "本轮图片已保存，先恢复已有独立物理审查；只修不通过项，不重复生成整轮"}
+                return {"action": "record-round", "round": entry["id"], "paths": paths,
+                        "say": "本轮图片已保存；先检查并登记已有图片，不重复调用生图"}
         return {
             "action": "generate",
             "round": entry["id"],
@@ -396,6 +555,31 @@ def next_action(project: dict[str, Any]) -> dict[str, Any]:
             "gallery": "gallery.html",
             "say": "回复对比页路径，问三选一：文字方向已经可以并保留意向、要新的方向、重新生成；缺图不能 select" if entry.get("missing") else "回复对比页路径，问三选一：已经可以并选定、要新的图、重新生成",
         }
+    if root is not None and project.get("stage") == "done":
+        import review_checks
+        root = root.resolve()
+        paths = [item["path"] for item in project.get("finals") or []]
+        result = review_checks.blocking_findings(root, project, paths, "scene")
+        if result.get("blocking"):
+            return {"action": "review", "stage": "scene", "findings": result["findings"],
+                    "say": "历史定稿仍有缺失或未通过的审查；先补审或修对应项，旧文件保留，不代表当前可发布"}
+        post = project.get("post") or {}
+        manifest_file = project_path(root, (post.get("path") or "post") + "/manifest.json")
+        if not paths or missing_scene_slots(project) or not post or not manifest_file.is_file():
+            return {"action": "package", "say": "已有历史状态但当前发布包不完整；先核对定稿、文案和实际输出，不重新生成未受影响图"}
+        manifest = read_json(manifest_file)
+        published = [(post.get("path") or "post") + "/" + item["file"] for item in manifest.get("images") or []]
+        result = review_checks.blocking_findings(root, project, published, "package")
+        if result.get("blocking"):
+            return {"action": "review", "stage": "package", "findings": result["findings"],
+                    "say": "实际发布图或文案尚有阻断问题；先补审对应输出，不能以历史 done 宣称完成"}
+        if not published or manifest.get("signature") != post.get("signature") or manifest.get("requirements") != requirement_signature(project):
+            return {"action": "package", "say": "历史发布包与当前约定不一致；重新校验并整理，保留旧包"}
+        files = manifest.get("files") or {}
+        if not files or any(not project_path(root, (post.get("path") or "post") + "/" + name).is_file()
+                            or hashlib.sha256(project_path(root, (post.get("path") or "post") + "/" + name).read_bytes()).hexdigest() != digest
+                            for name, digest in files.items()):
+            return {"action": "package", "say": "历史发布文件缺失或摘要变化；保留原包并重新校验整理"}
     return stage_action(project)
 
 
@@ -415,9 +599,14 @@ def warnings_of(project: dict[str, Any]) -> list[str]:
     return found
 
 
-def status_payload(project: dict[str, Any], note: str = "") -> dict[str, Any]:
+def status_payload(project: dict[str, Any], note: str = "", root: Path | None = None) -> dict[str, Any]:
     payload = {
         "ok": True,
+        "schema_version": project.get("schema_version"),
+        "project_id": project.get("project_id"),
+        "revision": project.get("revision", 0),
+        "presentations": project.get("presentations") or {},
+        "pending_intents": project.get("pending_intents") or [],
         "project": project.get("project"),
         "stage": project.get("stage"),
         "answers": project.get("answers"),
@@ -429,7 +618,7 @@ def status_payload(project: dict[str, Any], note: str = "") -> dict[str, Any]:
             for entry in (project.get("rounds") or [])[-6:]
         ],
         "finals": len(project.get("finals") or []),
-        "next": next_action(project),
+        "next": next_action(project, root),
     }
     warnings = warnings_of(project)
     if warnings:
@@ -478,7 +667,7 @@ def apply_setting(project: dict[str, Any], key: str, value: Any) -> None:
 def cmd_init(args: argparse.Namespace) -> int:
     root = Path(args.project)
     if (root / "project.json").is_file():
-        return emit(status_payload(load_project(root), note="项目已存在，沿用已有记录，没有改动"))
+        return emit(status_payload(load_project(root), note="项目已存在，沿用已有记录，没有改动", root=root))
     if args.kind not in INPUT_KINDS:
         raise ProjectError(f"--kind 只能是 {', '.join(sorted(INPUT_KINDS))}")
     sources = [Path(value) for value in args.input or []]
@@ -508,11 +697,12 @@ def cmd_init(args: argparse.Namespace) -> int:
         project["image_backend"] = previous.get("image_backend") or {}
     save_project(root, project)
     note = "已建立项目" + ("，沿用了上一个项目的产品形态、笔记类型、交付形式和生图设置" if args.reuse_from else "")
-    return emit(status_payload(project, note=note))
+    return emit(status_payload(project, note=note, root=root))
 
 
 def cmd_show(args: argparse.Namespace) -> int:
-    return emit(status_payload(load_project(Path(args.project))))
+    root = Path(args.project)
+    return emit(status_payload(load_project(root), root=root))
 
 
 def cmd_set(args: argparse.Namespace) -> int:
@@ -556,7 +746,7 @@ def cmd_set(args: argparse.Namespace) -> int:
         reset_note = f"；需求有变化，已回到 {restart}，旧图片仍保留但不再视为当前定稿"
     advance(project)
     save_project(root, project)
-    return emit(status_payload(project, note="已写入" + reset_note))
+    return emit(status_payload(project, note="已写入" + reset_note, root=root))
 
 
 def invalidate_from(project: dict[str, Any], stage: str) -> None:
@@ -570,7 +760,7 @@ def invalidate_from(project: dict[str, Any], stage: str) -> None:
             entry["status"] = "superseded"
     project["finals"] = []
     project.pop("post", None)
-    project["revision"] = project.get("revision", 0) + 1
+    project["requirements_revision"] = project.get("requirements_revision", 0) + 1
     project["stage"] = STAGES[min(STAGES.index(current), STAGES.index(stage))]
 
 
@@ -597,7 +787,7 @@ def cmd_accept_input(args: argparse.Namespace) -> int:
     project["stage"] = args.stage
     advance(project)
     save_project(root, project)
-    return emit(status_payload(project, note="已登记用户明确确认的输入图；没有调用生图"))
+    return emit(status_payload(project, note="已登记用户明确确认的输入图；没有调用生图", root=root))
 
 
 def stage_refs(project: dict[str, Any], stage: str, subject: str | None) -> dict[str, list[str]]:
@@ -766,6 +956,55 @@ def is_image(path: Path) -> bool:
     return head.startswith(IMAGE_MAGIC[:2]) or (head.startswith(b"RIFF") and head[8:12] == b"WEBP")
 
 
+def project_path(root: Path, relative: str) -> Path:
+    path = (root / relative).resolve()
+    if not relative or Path(relative).is_absolute() or not path.is_relative_to(root.resolve()):
+        raise ProjectError("路径必须位于当前项目内")
+    return path
+
+
+def round_eligibility(root: Path, project: dict[str, Any], entry: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    data = read_json(project_path(root, entry["dir"] + "/round.json"))
+    stale = bool(data.get("requirements") and data["requirements"] != requirement_signature(project, entry["stage"]))
+    results = {}
+    for item in data.get("items") or []:
+        relative = entry["dir"] + "/" + item.get("image", "")
+        reason = ""
+        digest_value = None
+        try:
+            path = project_path(root, relative)
+            if not path.is_file() or not is_image(path):
+                reason = "图片缺失或不可读取"
+            else:
+                digest_value = hashlib.sha256(path.read_bytes()).hexdigest()
+                if entry["stage"] == "scene":
+                    require_physics(root, project, [relative])
+                if entry["stage"] == "cutout":
+                    import check_images
+                    check = argparse.Namespace(alpha=True, ratio=None, tolerance=0.02, min_side=0)
+                    if not check_images.inspect(path, check)["ok"]:
+                        reason = "未通过真透明检查"
+                try:
+                    import review_checks
+                    blockers = review_checks.blocking_findings(root, project, [relative], entry["stage"])
+                    if blockers.get("blocking"):
+                        reason = "分类审查有未解决问题"
+                except ImportError:
+                    pass
+        except (ProjectError, physics_review.ReviewError) as error:
+            reason = str(error)
+        if stale:
+            reason = "需求已变化，本轮已失效"
+        if entry.get("status") != "recorded":
+            reason = "本轮尚未登记或已选定/失效"
+        results[item["id"]] = {"selectable": not reason, "disabled_reason": reason, "image_sha256": digest_value}
+    if entry.get("kind") == "alternatives" and any(not item["selectable"] for item in results.values()):
+        for result in results.values():
+            if result["selectable"]:
+                result.update(selectable=False, disabled_reason="同轮其他候选缺图或未通过必要检查")
+    return results
+
+
 def cmd_record_round(args: argparse.Namespace) -> int:
     root = Path(args.project)
     project = load_project(root)
@@ -802,7 +1041,7 @@ def cmd_record_round(args: argparse.Namespace) -> int:
         raise ProjectError("；".join(problems))
     missing = []
     for item in items:
-        path = root / entry["dir"] / item["image"]
+        path = project_path(root, entry["dir"] + "/" + item["image"])
         if path.is_file():
             if not is_image(path):
                 raise ProjectError(f"{item['image']} 不是 PNG、JPEG 或 WEBP 图片")
@@ -814,11 +1053,12 @@ def cmd_record_round(args: argparse.Namespace) -> int:
             missing.append(item["image"])
     if missing and not args.allow_missing:
         raise ProjectError(f"缺少图片：{', '.join(missing)}。生图不可用时加 --allow-missing，对比页会显示占位，不要伪造图片")
+    require_reviews(root, project, [f"{entry['dir']}/{item['image']}" for item in items if item["status"] == "generated"], entry["stage"])
     write_json(round_file, data)
     entry["status"] = "recorded"
     entry["missing"] = missing
     save_project(root, project)
-    payload = status_payload(project, note=f"已登记 {entry['id']}，缺图 {len(missing)} 张")
+    payload = status_payload(project, note=f"已登记 {entry['id']}，缺图 {len(missing)} 张", root=root)
     payload["say"] = "运行 build_gallery.py，然后回复对比页路径并问三选一"
     return emit(payload)
 
@@ -834,12 +1074,18 @@ def cmd_select(args: argparse.Namespace) -> int:
         raise ProjectError("这轮对应的需求已变化，不能采用旧图")
     items = {item["id"]: item for item in data.get("items") or []}
     stage = entry["stage"]
+    eligibility = round_eligibility(root, project, entry)
+    origin = getattr(args, "origin", "user-confirmed")
+    if origin not in {"user-confirmed", "agent-inferred", "reference-derived"}:
+        raise ProjectError("选择来源无效")
     if entry.get("kind") == "alternatives":
         if not args.item or args.approve:
             raise ProjectError("多方向轮次要指定一个方向，例如 select <项目> <轮次> A")
         item = items.get(args.item)
         if not item:
             raise ProjectError(f"{entry['id']} 里没有方向 {args.item}")
+        if not eligibility[item["id"]]["selectable"]:
+            raise ProjectError(eligibility[item["id"]]["disabled_reason"])
         image = f"{entry['dir']}/{item['image']}"
         if not (root / image).is_file():
             raise ProjectError(f"{image} 还没有生成，不能选定")
@@ -847,7 +1093,7 @@ def cmd_select(args: argparse.Namespace) -> int:
             require_physics(root, project, [f"{entry['dir']}/{candidate['image']}" for candidate in items.values()
                                            if (root / entry["dir"] / candidate["image"]).is_file()])
         key = entry.get("subject") if stage in PER_SUBJECT_STAGES else "_"
-        selections(project, stage)[key] = {"round": entry["id"], "item": item["id"], "image": image}
+        selections(project, stage)[key] = {"round": entry["id"], "item": item["id"], "image": image, "origin": origin}
         entry["status"] = "picked"
         entry["pick"] = item["id"]
     else:
@@ -858,6 +1104,9 @@ def cmd_select(args: argparse.Namespace) -> int:
         if unknown:
             raise ProjectError(f"未知的图位：{', '.join(sorted(unknown))}")
         approved = [item for key, item in items.items() if key not in skip]
+        for item in approved:
+            if not eligibility[item["id"]]["selectable"]:
+                raise ProjectError(eligibility[item["id"]]["disabled_reason"])
         missing = [item["image"] for item in approved if not (root / entry["dir"] / item["image"]).is_file()]
         if missing:
             raise ProjectError(f"这些图还没有生成，不能通过：{', '.join(missing)}")
@@ -873,13 +1122,13 @@ def cmd_select(args: argparse.Namespace) -> int:
             if invalid:
                 raise ProjectError(f"这些图没有通过真透明检查：{', '.join(invalid)}；先修复再登记")
             for item in approved:
-                selections(project, "cutout")[item["subject"]] = {"round": entry["id"], "item": item["id"], "image": f"{entry['dir']}/{item['image']}"}
+                selections(project, "cutout")[item["subject"]] = {"round": entry["id"], "item": item["id"], "image": f"{entry['dir']}/{item['image']}", "origin": origin}
         else:
             require_physics(root, project, [f"{entry['dir']}/{item['image']}" for item in approved])
             finals = mapped_scene_finals(project)
             project["finals"] = finals
             for item in approved:
-                record = {"role": item.get("role", "scene"), "slot": item["id"], "path": f"{entry['dir']}/{item['image']}"}
+                record = {"role": item.get("role", "scene"), "slot": item["id"], "path": f"{entry['dir']}/{item['image']}", "origin": origin}
                 if item.get("subject"):
                     record["subject"] = item["subject"]
                 finals[:] = [final for final in finals if final.get("slot") != item["id"]]
@@ -891,17 +1140,19 @@ def cmd_select(args: argparse.Namespace) -> int:
             scene["_pending"] = missing_scene_slots(project)
         entry["status"] = "approved" if not skip else "partly-approved"
         entry["skipped"] = sorted(skip)
+    entry["selection_origin"] = origin
     advance(project)
     save_project(root, project)
-    return emit(status_payload(project, note="已记录选择"))
+    return emit(status_payload(project, note="已记录选择", root=root))
 
 
 def cmd_final(args: argparse.Namespace) -> int:
     root = Path(args.project)
     project = load_project(root)
-    if not (root / args.path).is_file():
+    if not project_path(root, args.path).is_file():
         raise ProjectError(f"{args.path} 不存在；路径相对于项目目录")
     require_physics(root, project, [args.path])
+    require_reviews(root, project, [args.path], "scene")
     record = {"role": args.role, "path": Path(args.path).as_posix()}
     if args.subject:
         record["subject"] = args.subject
@@ -917,7 +1168,195 @@ def cmd_final(args: argparse.Namespace) -> int:
     if (project.get("answers") or {}).get("note_type"):
         project["stage"] = "package" if not missing_scene_slots(project) else "scene"
     save_project(root, project)
-    return emit(status_payload(project, note="已登记定稿图"))
+    return emit(status_payload(project, note="已登记定稿图", root=root))
+
+
+def _invoke(function, args: argparse.Namespace) -> dict[str, Any]:
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        result = function(args)
+    payload = json.loads(output.getvalue())
+    if result or not payload.get("ok"):
+        raise ProjectError(payload.get("error", "项目操作未完成"))
+    return payload
+
+
+def receipt(root: Path, request_id: str) -> dict[str, Any] | None:
+    return (load_project(root).get("decision_receipts") or {}).get(request_id)
+
+
+def submit_decision(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    root = root.resolve()
+    allowed = {"schema_version", "request_id", "project_id", "delivery_id", "expected_revision", "round_id", "action", "items", "note", "keep", "field", "value", "origin"}
+    if not isinstance(payload, dict) or set(payload) - allowed or payload.get("schema_version") != 1:
+        raise ProjectError("invalid_request：不支持的提交结构")
+    request_id = payload.get("request_id")
+    if not isinstance(request_id, str) or not 8 <= len(request_id) <= 128 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in request_id):
+        raise ProjectError("invalid_request_id：需要稳定的字母数字请求标识")
+    fingerprint = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    with project_lock(root):
+        project = load_project(root, writable=True)
+        existing = (project.get("decision_receipts") or {}).get(request_id)
+        if existing:
+            if existing.get("fingerprint") != fingerprint:
+                raise ProjectError("request_id_conflict：同一请求标识不能提交不同内容")
+            return existing
+        if payload.get("project_id") != project.get("project_id"):
+            raise ProjectError("wrong_project：提交不属于当前项目")
+        if isinstance(payload.get("expected_revision"), bool) or payload.get("expected_revision") != project.get("revision"):
+            raise ProjectError("stale_revision：项目已变化，请刷新后重新核对")
+        delivery_id = payload.get("delivery_id")
+        latest = (project.get("presentations") or {}).get("latest_delivery_id")
+        if not latest or delivery_id != latest:
+            raise ProjectError("stale_delivery：不能在旧交付上提交")
+        manifest = read_json(project_path(root, f"deliveries/{delivery_id}/manifest.json"))
+        if manifest.get("project_id") != project["project_id"] or manifest.get("project_revision") != project["revision"]:
+            raise ProjectError("stale_delivery：交付不再对应当前状态")
+        action = payload.get("action")
+        origin = payload.get("origin", "user-confirmed")
+        if origin not in {"user-confirmed", "agent-inferred", "reference-derived"}:
+            raise ProjectError("invalid_origin：确认来源无效")
+        if action not in {"answer-field", "select", "approve-set", "request-variation", "request-slots", "request-redo"}:
+            raise ProjectError("invalid_action：不支持的动作")
+        if not isinstance(payload.get("note", ""), str) or len(payload.get("note", "")) > 5000:
+            raise ProjectError("invalid_note：备注必须是有限长度文字")
+        keep = payload.get("keep", [])
+        if not isinstance(keep, (list, str)) or len(json.dumps(keep, ensure_ascii=False)) > 10000:
+            raise ProjectError("invalid_keep：保持项格式不正确")
+        selected = []
+        if action == "answer-field":
+            next_step = next_action(project, root)
+            field = payload.get("field")
+            if next_step.get("action") != "ask" or next_step.get("field") != field or payload.get("round_id"):
+                raise ProjectError("stale_question：只能回答当前唯一缺失问题")
+            _invoke(cmd_set, argparse.Namespace(project=str(root), pairs=[field + "=" + json.dumps(payload.get("value"), ensure_ascii=False)]))
+        else:
+            entry = open_round(project)
+            if not entry or entry["id"] != payload.get("round_id") or manifest.get("round_id") != entry["id"]:
+                raise ProjectError("stale_round：本轮不再接受提交")
+            submitted = payload.get("items", [])
+            if not isinstance(submitted, list) or len(submitted) > 30:
+                raise ProjectError("invalid_items：图位格式不正确")
+            current = read_json(project_path(root, entry["dir"] + "/round.json"))
+            current_items = {item["id"]: item for item in current.get("items") or []}
+            shown_items = {item["id"]: item for item in manifest.get("items") or []}
+            seen = set()
+            for item in submitted:
+                if not isinstance(item, dict) or set(item) != {"id", "sha256"} or item["id"] in seen or item["id"] not in current_items or item["id"] not in shown_items:
+                    raise ProjectError("invalid_items：未知或重复图位")
+                seen.add(item["id"])
+                original = project_path(root, entry["dir"] + "/" + current_items[item["id"]]["image"])
+                actual = hashlib.sha256(original.read_bytes()).hexdigest() if original.is_file() else None
+                if actual != item["sha256"] or actual != shown_items[item["id"]].get("image_sha256"):
+                    raise ProjectError("changed_image：图片已变化，请重新交付")
+                selected.append(item["id"])
+            if action == "select":
+                if entry.get("kind") != "alternatives" or len(selected) != 1:
+                    raise ProjectError("invalid_selection：候选方向必须互斥单选")
+                _invoke(cmd_select, argparse.Namespace(project=str(root), round=entry["id"], item=selected[0], approve=False, skip=None, origin=origin))
+            elif action == "approve-set":
+                if entry.get("kind") != "set" or not selected:
+                    raise ProjectError("invalid_selection：整组需明确保留图位")
+                skipped = sorted(set(current_items) - set(selected))
+                _invoke(cmd_select, argparse.Namespace(project=str(root), round=entry["id"], item=None, approve=True, skip=",".join(skipped), origin=origin))
+            else:
+                if action in {"request-variation", "request-slots"} and not selected:
+                    raise ProjectError("invalid_intent：先指定方向或图位")
+                project.setdefault("pending_intents", []).append({"request_id": request_id, "action": action, "round_id": entry["id"], "items": selected, "note": payload.get("note", ""), "keep": keep, "delivery_id": delivery_id, "created_at": now(), "status": "pending"})
+                save_project(root, project)
+        project = load_project(root, writable=True)
+        if payload.get("note") or keep:
+            project.setdefault("feedback", []).append({"request_id": request_id, "raw": payload.get("note", ""), "keep": keep, "items": selected, "baseline_delivery": delivery_id, "origin": origin, "created_at": now()})
+        result = {"ok": True, "committed": True, "request_id": request_id, "fingerprint": fingerprint, "delivery_id": delivery_id, "action": action, "origin": origin, "new_revision": project["revision"], "selected": selected, "next": next_action(project, root), "updated_at": project["updated_at"]}
+        project.setdefault("decision_receipts", {})[request_id] = result
+        write_json(root / "decisions" / (request_id + ".json"), result)
+        write_json(root / "project.json", project)
+        return result
+
+
+def cmd_submit(args: argparse.Namespace) -> int:
+    return emit(submit_decision(Path(args.project), read_json(Path(args.request))))
+
+
+def cmd_decision(args: argparse.Namespace) -> int:
+    root = Path(args.project)
+    project = load_project(root, writable=True)
+    scope = parse_value(args.scope)
+    if not isinstance(scope, dict):
+        raise ProjectError("scope 必须是 JSON 对象")
+    entry = {"id": "decision-" + uuid.uuid4().hex[:12], "rule": args.rule, "scope": scope, "origin": args.origin, "evidence": parse_value(args.evidence), "created_at": now()}
+    project.setdefault("brief", {}).setdefault("decisions", []).append(entry)
+    save_project(root, project)
+    return emit({"ok": True, "decision": entry, "revision": project["revision"]})
+
+
+def cmd_feedback(args: argparse.Namespace) -> int:
+    root = Path(args.project)
+    project = load_project(root, writable=True)
+    change = read_json(Path(args.file))
+    required = {"raw", "interpretation", "changes", "keep", "scope", "baseline_delivery"}
+    if not required <= set(change) or not all(isinstance(change.get(key), str) and change[key].strip() for key in ("raw", "interpretation")):
+        raise ProjectError("反馈需要原话、解释、可观察改法、保持项、影响范围和比较基线")
+    if not isinstance(change["changes"], list) or not change["changes"] or not isinstance(change["keep"], list) or not isinstance(change["scope"], dict):
+        raise ProjectError("改法和保持项必须是列表，scope 必须是对象")
+    if change["baseline_delivery"] and not (root / "deliveries" / change["baseline_delivery"] / "manifest.json").is_file():
+        raise ProjectError("反馈比较基线不存在")
+    entry = {**change, "id": "feedback-" + uuid.uuid4().hex[:12], "created_at": now(), "verification": change.get("verification") or "pending", "origin": "user-feedback-agent-interpretation"}
+    project.setdefault("feedback", []).append(entry)
+    save_project(root, project)
+    return emit({"ok": True, "feedback": entry, "revision": project["revision"]})
+
+
+def cmd_resolve_intent(args: argparse.Namespace) -> int:
+    root = Path(args.project)
+    project = load_project(root, writable=True)
+    intent = next((item for item in project.get("pending_intents") or [] if item.get("request_id") == args.request_id), None)
+    if not intent:
+        raise ProjectError("没有此待处理意向")
+    if intent.get("status") != "pending":
+        return emit({"ok": True, "unchanged": True, "intent": intent})
+    intent.update(status=args.status, resolution=args.note or "", resolved_at=now())
+    save_project(root, project)
+    return emit(status_payload(project, note="已登记意向处理结果", root=root))
+
+
+def migration_plan(root: Path) -> dict[str, Any]:
+    root = root.resolve()
+    project = load_project(root)
+    digest_value = hashlib.sha256((root / "project.json").read_bytes()).hexdigest()
+    return {"schema_version": 1, "project": str(root), "from_schema": project["schema_version"], "to_schema": 2, "project_sha256": digest_value, "already_migrated": project["schema_version"] == 2, "changes": [] if project["schema_version"] == 2 else ["增加稳定项目ID与业务revision", "保留旧需求签名和全部未知字段", "新增空交付索引与回执；不伪造历史展示"], "backup": "backups/migrations/" + digest_value + "/project.json"}
+
+
+def apply_migration(root: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    root = root.resolve()
+    with project_lock(root):
+        project = load_project(root)
+        if plan.get("schema_version") != 1 or plan.get("project") != str(root) or plan.get("to_schema") != 2:
+            raise ProjectError("invalid_migration_plan：计划目标不正确")
+        if project["schema_version"] == 2:
+            return {"ok": True, "unchanged": True, "schema_version": 2}
+        digest_value = hashlib.sha256((root / "project.json").read_bytes()).hexdigest()
+        if digest_value != plan.get("project_sha256") or plan != migration_plan(root):
+            raise ProjectError("stale_migration_plan：项目或计划已变化")
+        backup = project_path(root, plan["backup"])
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        if backup.exists() and backup.read_bytes() != (root / "project.json").read_bytes():
+            raise ProjectError("迁移备份冲突，拒绝覆盖")
+        if not backup.exists():
+            shutil.copyfile(root / "project.json", backup)
+        project["schema_version"] = 2
+        project["requirements_revision"] = project.get("revision", 0)
+        project.setdefault("project_id", uuid.uuid4().hex)
+        project.setdefault("revision", 0)
+        project.setdefault("presentations", {})
+        project.setdefault("deliveries", [])
+        project.setdefault("decision_receipts", {})
+        project.setdefault("pending_intents", [])
+        project.setdefault("feedback", [])
+        project.setdefault("brief", {}).setdefault("decisions", [])
+        project["migration"] = {"from_schema": 1, "at": now(), "backup": plan["backup"], "source_sha256": digest_value}
+        write_json(root / "project.json", project)
+        return {"ok": True, "schema_version": 2, "backup": str(backup), "unchanged_images": True}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -964,6 +1403,7 @@ def build_parser() -> argparse.ArgumentParser:
     select.add_argument("item", nargs="?")
     select.add_argument("--approve", action="store_true")
     select.add_argument("--skip", help="整组轮次里不通过、要重出的图位")
+    select.add_argument("--origin", choices=("user-confirmed", "agent-inferred", "reference-derived"), default="user-confirmed", help="模拟或推断选择必须明确标 agent-inferred，不得冒充真人批准")
     select.set_defaults(func=cmd_select)
     final = sub.add_parser("final", help="手动登记定稿图")
     final.add_argument("project")
@@ -973,6 +1413,27 @@ def build_parser() -> argparse.ArgumentParser:
     final.add_argument("--slot")
     final.add_argument("--note")
     final.set_defaults(func=cmd_final)
+    submit = sub.add_parser("submit", help="校验交付选择或意向并返回幂等回执")
+    submit.add_argument("project")
+    submit.add_argument("--request", required=True)
+    submit.set_defaults(func=cmd_submit)
+    decision = sub.add_parser("decision", help="记录约定及其真实来源，不自动推断为用户确认")
+    decision.add_argument("project")
+    decision.add_argument("--rule", required=True)
+    decision.add_argument("--scope", default="{}")
+    decision.add_argument("--origin", required=True, choices=("user-confirmed", "agent-inferred", "reference-derived"))
+    decision.add_argument("--evidence", default="{}")
+    decision.set_defaults(func=cmd_decision)
+    feedback = sub.add_parser("feedback", help="保存原话、可观察改法和保持项，不自动撤销身份")
+    feedback.add_argument("project")
+    feedback.add_argument("--file", required=True)
+    feedback.set_defaults(func=cmd_feedback)
+    resolve = sub.add_parser("resolve-intent", help="处理已读取的补图/重做意向，不自动生图")
+    resolve.add_argument("project")
+    resolve.add_argument("--request-id", required=True)
+    resolve.add_argument("--status", choices=("completed", "cancelled"), required=True)
+    resolve.add_argument("--note")
+    resolve.set_defaults(func=cmd_resolve_intent)
     return parser
 
 
@@ -982,8 +1443,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     args = build_parser().parse_args(argv)
     try:
-        return args.func(args)
-    except ProjectError as error:
+        from runtime_activity import execution_lease
+        with execution_lease():
+            if args.command == "show":
+                if (Path(args.project) / ".state-transaction.json").exists():
+                    with project_lock(Path(args.project)):
+                        return args.func(args)
+                return args.func(args)
+            with project_lock(Path(args.project)):
+                if args.command != "init":
+                    load_project(Path(args.project), writable=True)
+                return args.func(args)
+    except (ProjectError, OSError, ValueError) as error:
         return emit({"ok": False, "error": str(error)})
 
 

@@ -263,15 +263,19 @@ def main() -> int:
     args = parser.parse_args()
     root = Path(args.project).resolve()
     try:
-        project = state.load_project(root)
-        if args.command == "record":
-            return state.emit(record(root, project, args.request, Path(args.report)))
-        paths = args.images
-        if args.round:
-            entry = state.find_round(project, args.round)
-            data = state.read_json(root / entry["dir"] / "round.json")
-            paths = [f"{entry['dir']}/{item['image']}" for item in data.get("items") or [] if (root / entry["dir"] / item["image"]).is_file()]
-        return state.emit(prepare(root, project, paths, args.producer))
+        from runtime_activity import execution_lease
+        with execution_lease(), state.project_lock(root):
+            project = state.load_project(root, writable=True)
+            if args.command == "record":
+                result = record(root, project, args.request, Path(args.report))
+                state.save_project(root, project)
+                return state.emit(result)
+            paths = args.images
+            if args.round:
+                entry = state.find_round(project, args.round)
+                data = state.read_json(root / entry["dir"] / "round.json")
+                paths = [f"{entry['dir']}/{item['image']}" for item in data.get("items") or [] if (root / entry["dir"] / item["image"]).is_file()]
+            return state.emit(prepare(root, project, paths, args.producer))
     except (ReviewError, state.ProjectError, OSError) as error:
         return state.emit({"ok": False, "error": str(error)})
 

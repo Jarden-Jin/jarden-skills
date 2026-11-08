@@ -195,4 +195,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    from runtime_activity import execution_lease
+    with execution_lease():
+        sys.exit(main())
