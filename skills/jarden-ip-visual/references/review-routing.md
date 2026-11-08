@@ -144,6 +144,8 @@ gate = review_checks.blocking_findings(root, project, paths, stage="package")
 
 `record` 是业务写入。它在 `project.project_lock(root)` 内重新执行 `state.load_project(root, writable=True)`，复验请求摘要、报告范围、当前图片/文案/模板签名，然后通过 `state.save_project` 写入 `review_records` 并增加一次 `revision`。相同报告的幂等重试返回 `unchanged=true`，不再增加 revision。旧页面看到 revision 变化后应重新读取，不能拿旧资格继续提交。
 
+独立报告的 `pass` 要求 `findings=[]`，未通过则列出具体问题。每条问题含 `code/severity/detail/evidence/fix`；不影响结论的可选意见放顶层 `advisory` 列表，并用 `severity=advisory`。读取旧报告兼容非阻断的 `info` 值，其他严重级别、缺字段或非列表均拒绝，不能把仍标为 `blocking` 的问题移入此处使报告通过。
+
 全部 CLI 动作都包在 `runtime_activity.execution_lease()` 内，避免更新与审查记录混用。
 
 `physics` 在本模块仅允许只读 `status/check`，`prepare/record` 明确拒绝并指向原 `physics_review.py`，不改写匿名包。

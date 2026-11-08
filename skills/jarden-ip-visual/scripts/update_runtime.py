@@ -44,6 +44,7 @@ MAX_FILE_BYTES = 32 * 1024 * 1024
 CHECK_TTL = 24 * 60 * 60
 FAILURE_COOLDOWN = 60 * 60
 NETWORK_BUDGET = 2.0
+DOWNLOAD_BUDGET = 30.0
 TERMINAL = {"committed", "rolled_back", "recovered", "aborted"}
 
 
@@ -603,9 +604,10 @@ def make_plan(version: str, out: Path, source: Source | None = None) -> dict:
         raise UpdateError("目标版本必须高于当前安装版本", "version_mismatch")
     if has_git_marker(root):
         raise UpdateError("这是源码 checkout，更新请由作者在仓库维护；不在源码树安装", "source_checkout")
-    release = (source or Source()).release(version)
+    download_source = source or Source(timeout=DOWNLOAD_BUDGET)
+    release = download_source.release(version)
     remember_release(release)
-    archive = download_cache(version, release, source or Source())
+    archive = download_cache(version, release, download_source)
     staging = instance_home(root) / "staging" / f"plan-{uuid.uuid4().hex}"
     try:
         unpack(archive.read_bytes(), staging, release)

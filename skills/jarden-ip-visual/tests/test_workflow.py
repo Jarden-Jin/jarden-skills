@@ -148,7 +148,9 @@ class WorkflowTests(unittest.TestCase):
                               "柔软温暖小熊的原创概念图短耳朵大口袋背带细节暖黄色" if index == 1 else
                               "几何风格绿色小猫完整的造型面部五官自然比例半闭眼小帽子") * 2
         round_file.write_text(json.dumps(data, ensure_ascii=False))
-        self.call("project.py", "record-round", self.job, info["round"], "--allow-missing")
+        recorded = self.call("project.py", "record-round", self.job, info["round"], "--allow-missing")
+        self.assertIn("present_round.py", recorded["say"])
+        self.assertNotIn("build_gallery.py", recorded["say"])
         before = sorted(self.job.rglob("*.png"))
         gallery = self.call("build_gallery.py", self.job)
         self.assertEqual(gallery["missing_images"], 3)

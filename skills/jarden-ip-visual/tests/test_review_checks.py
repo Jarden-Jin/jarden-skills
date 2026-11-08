@@ -156,6 +156,64 @@ class ReviewChecksTests(unittest.TestCase):
             "overlays": {},
         })
 
+    def test_prepare_explains_findings_and_advisory_contract(self):
+        packet = self.packet("identity", "inputs/original.png")
+        request = project.read_json(Path(packet["request"]))
+        rules = request["task"]["finding_rules"]
+        self.assertEqual(set(rules["fields"]), set(review_checks.FINDING_FIELDS))
+        self.assertIn("pass", rules["verdict"])
+        self.assertIn("uncertain", rules["verdict"])
+        self.assertIn("advisory", rules["advisory"])
+        self.assertEqual(request["task"]["advisory"], [])
+        report = self.make_report(packet)
+        report["advisory"] = [{
+            "code": "identity.optional_crop", "severity": "advisory",
+            "detail": "可选地收紧无关留白", "evidence": "测试夹具主体外有留白，不影响身份辨认",
+            "fix": "仅在用户希望时调整构图",
+        }]
+        self.record_report(packet, report)
+        state = self.call("review_checks.py", "status", self.job, "--category", "identity", "--images", "inputs/original.png")
+        self.assertEqual(state["verdict"], "pass")
+
+    def test_pass_findings_error_points_to_advisory_without_committing(self):
+        packet = self.packet("identity", "inputs/original.png")
+        report = self.make_report(packet, findings=[{
+            "code": "identity.visible_difference", "severity": "blocking",
+            "detail": "测试缺陷", "evidence": "测试图中存在待修差异", "fix": "修正对应项后复查",
+        }])
+        report_path = self.root / "invalid-pass.json"
+        project.write_json(report_path, report)
+        before = (self.job / "project.json").read_bytes()
+        result = self.call("review_checks.py", "record", self.job, "--category", "identity",
+                           "--request", packet["review_id"], "--report", report_path, code=2)
+        self.assertIn("顶层 advisory", result["error"])
+        self.assertIn("不得迁移阻断问题", result["error"])
+        self.assertEqual(before, (self.job / "project.json").read_bytes())
+
+    def test_advisory_rejects_moved_blocking_and_malformed_reports_at_cli(self):
+        packet = self.packet("identity", "inputs/original.png")
+        finding = {"code": "identity.visible_difference", "severity": "blocking",
+                   "detail": "测试缺陷", "evidence": "测试图中存在待修差异", "fix": "修正后复查"}
+        before = (self.job / "project.json").read_bytes()
+        for advisory in ([finding], "not a list", [{}], [{**finding, "severity": "unknown"}]):
+            with self.subTest(advisory=advisory):
+                report = self.make_report(packet)
+                report["advisory"] = advisory
+                report_path = self.root / "invalid-advisory.json"
+                project.write_json(report_path, report)
+                result = self.call("review_checks.py", "record", self.job, "--category", "identity",
+                                   "--request", packet["review_id"], "--report", report_path, code=2)
+                self.assertIn("advisory", result["error"])
+                self.assertEqual(before, (self.job / "project.json").read_bytes())
+                directory = Path(packet["request"]).parent
+                self.assertFalse((directory / "recorded.json").exists())
+                self.assertFalse((directory.parent.parent / (packet["review_id"] + ".json")).exists())
+        report = self.make_report(packet)
+        report["advisory"] = [{**finding, "severity": "info"}]
+        self.record_report(packet, report)
+        state = self.call("review_checks.py", "status", self.job, "--category", "identity", "--images", "inputs/original.png")
+        self.assertEqual(state["verdict"], "pass")
+
     def test_status_never_turns_missing_identity_or_creative_into_pass(self):
         before = (self.job / "project.json").read_bytes()
         state = self.call("review_checks.py", "status", self.job, "--category", "identity", "--images", "inputs/original.png")

@@ -355,6 +355,18 @@ def _task(category: str) -> dict[str, Any]:
         "reviewer": {"id": "实际独立执行者标识", "independence": "zero-context", "viewed_images": True},
         "verdict": "pass | needs_revision | uncertain",
         "findings": [],
+        "finding_rules": {
+            "verdict": "pass 时 findings 必须为 []；needs_revision 或 uncertain 时必须列出具体问题。",
+            "fields": {
+                "code": "稳定的问题标识",
+                "severity": "blocking | advisory",
+                "detail": "具体缺陷或决定真实性的不确定点",
+                "evidence": "可核查的图片位置、页面或约定依据",
+                "fix": "最小整改建议",
+            },
+            "advisory": "不影响通过的可选意见放顶层 advisory 列表，每条含相同字段且 severity=advisory，不放 findings；不得把阻断问题移入 advisory。",
+        },
+        "advisory": [],
         "evidence": "可见证据摘要，不能只写通过",
         "paths": [],
     }
@@ -473,14 +485,14 @@ def prepare(root: Path, project: dict[str, Any], category: str, paths: list[str]
     }
 
 
-def _validate_findings(findings: Any) -> None:
+def _validate_findings(findings: Any, field: str = "findings", severities: tuple[str, ...] = ("blocking", "advisory")) -> None:
     if not isinstance(findings, list):
-        raise ReviewError("findings 必须是列表")
+        raise ReviewError(f"{field} 必须是列表")
     for finding in findings:
         if not isinstance(finding, dict) or any(not isinstance(finding.get(field), str) or not finding[field].strip() for field in FINDING_FIELDS):
-            raise ReviewError("每条 finding 都需要 code、severity、detail、evidence、fix")
-        if finding["severity"] not in ("blocking", "advisory"):
-            raise ReviewError("finding.severity 只能是 blocking 或 advisory")
+            raise ReviewError(f"每条 {field} 都需要 code、severity、detail、evidence、fix")
+        if finding["severity"] not in severities:
+            raise ReviewError(f"{field}.severity 只能是 {' 或 '.join(severities)}，不得移入阻断问题")
 
 
 def _validate_path_verdicts(report: dict[str, Any], scope: dict[str, Any]) -> None:
@@ -557,11 +569,12 @@ def _validate_report(report: dict[str, Any], request: dict[str, Any]) -> None:
     if verdict not in VERDICTS:
         raise ReviewError("verdict 只能是 pass、needs_revision 或 uncertain")
     _validate_findings(report.get("findings"))
+    _validate_findings(report.get("advisory", []), "advisory", ("advisory", "info"))
     evidence = report.get("evidence")
     if not isinstance(evidence, str) or len(evidence.strip()) < MIN_EVIDENCE:
         raise ReviewError("报告缺少可核查的整体证据")
     if verdict == "pass" and report["findings"]:
-        raise ReviewError("存在 findings 时不能登记为 pass")
+        raise ReviewError("pass 时 findings 必须为空；非阻断意见放顶层 advisory，不得迁移阻断问题")
     if verdict != "pass" and not report["findings"]:
         raise ReviewError("未通过的审查必须列出具体问题")
     if request["category"] in {"identity", "creative", "sequence", "copy"}:

@@ -531,6 +531,42 @@ with execution_lease(Path(sys.argv[2])):
 
 
 class AssetSourceTests(FixtureMixin, unittest.TestCase):
+    def test_plan_cli_download_budget_is_separate_from_session_check(self):
+        self.write_skill(self.inst, "0.1.0")
+        self.write_skill(self.new, "0.2.0")
+        release_path, archive_path, _ = self.make_release_files(self.new, "0.2.0")
+        helper = """
+import runpy
+import sys
+from pathlib import Path
+from unittest import mock
+sys.path.insert(0, sys.argv[1])
+import update_runtime
+source = update_runtime.Source()
+release_path = Path(sys.argv[2])
+archive_path = Path(sys.argv[3])
+source.release = lambda version: update_runtime.read_json(release_path)
+source.asset = lambda release: archive_path.read_bytes()
+script = Path(sys.argv[1]) / "check_update.py"
+arguments = [str(script), *sys.argv[4:]]
+with mock.patch.object(update_runtime, "Source", return_value=source) as constructor:
+    sys.argv = arguments
+    try:
+        runpy.run_path(str(script), run_name="__main__")
+    except SystemExit as result:
+        assert result.code == 0, result.code
+    constructor.assert_called_once_with(timeout=update_runtime.DOWNLOAD_BUDGET)
+    assert update_runtime.NETWORK_BUDGET == 2.0
+    assert update_runtime.DOWNLOAD_BUDGET == 30.0
+"""
+        output = self.temp / "download-budget-plan.json"
+        result = self.run_command([
+            sys.executable, "-c", helper, str(self.inst / "scripts"), str(release_path), str(archive_path),
+            "plan", "--version", "0.2.0", "--out", str(output), "--json",
+        ])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(output.read_text())["target_version"], "0.2.0")
+
     def test_release_index_and_archive_use_bound_asset_api_ids(self):
         self.write_skill(self.inst, "0.1.0")
         self.write_skill(self.new, "0.2.0")

@@ -1059,7 +1059,7 @@ def cmd_record_round(args: argparse.Namespace) -> int:
     entry["missing"] = missing
     save_project(root, project)
     payload = status_payload(project, note=f"已登记 {entry['id']}，缺图 {len(missing)} 张", root=root)
-    payload["say"] = "运行 build_gallery.py，然后回复对比页路径并问三选一"
+    payload["say"] = "运行 present_round.py 保存不可变交付和工作台，然后交付页面入口与一个待决定动作"
     return emit(payload)
 
 

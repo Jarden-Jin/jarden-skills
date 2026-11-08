@@ -100,7 +100,8 @@ class DeliveryTests(unittest.TestCase):
             self.assertEqual(build_gallery.maintenance_summary()["status"], "unchecked")
             self.assertFalse(update_directory.exists())
             update_runtime.atomic_json(update_runtime.check_state_path(), {
-                "current": "0.2.0", "latest": "0.3.0", "checked_at": time.time(), "update": True,
+                "current": update_runtime.installed_version(update_runtime.real_root()),
+                "latest": "0.3.0", "checked_at": time.time(), "update": True,
             })
             result = present_round.present_round(self.root, open_browser=False)
             manifest = project.read_json(Path(result["manifest"]))
@@ -119,7 +120,8 @@ class DeliveryTests(unittest.TestCase):
     def test_stale_maintenance_cache_and_controls_cannot_install(self):
         with mock.patch.dict(os.environ, {"JARDEN_UPDATE_HOME": str(Path(self.temporary.name) / "maintenance")}):
             update_runtime.atomic_json(update_runtime.check_state_path(), {
-                "current": "0.2.0", "latest": "0.3.0", "checked_at": time.time() - update_runtime.CHECK_TTL - 1,
+                "current": update_runtime.installed_version(update_runtime.real_root()),
+                "latest": "0.3.0", "checked_at": time.time() - update_runtime.CHECK_TTL - 1,
                 "update": True,
             })
             self.assertEqual(build_gallery.maintenance_summary()["status"], "stale")
