@@ -22,7 +22,6 @@ jobs:
     timeout-minutes: 10
     env:
       PYTHONDONTWRITEBYTECODE: "1"
-      JARDEN_UPDATE_HOME: ${{ runner.temp }}/jarden-update-tests
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,4 +35,6 @@ jobs:
       - name: Install test dependency
         run: python -m pip install Pillow
       - name: Run workflow, delivery, review and update regressions
+        env:
+          JARDEN_UPDATE_HOME: ${{ runner.temp }}/jarden-update-tests
         run: python -m unittest discover -s skills/jarden-ip-visual/tests -v
