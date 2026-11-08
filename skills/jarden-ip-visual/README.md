@@ -105,6 +105,8 @@ API Key 保存在当前用户的系统凭据库，运行时只注入可信业务
 python3 -m unittest discover -s tests -v
 ```
 
+作者的两项发行构建测试需要源码仓库的 `tools/build_release.py`，独立安装包会明确跳过；完整构建回归在源码仓库运行。原生系统凭据测试需显式开启，不将默认跳过算作通过。
+
 凭据组件的检查在它自己的目录运行 `npm run check`、`npm run build`、`npm test`；原生假凭据验证用 `npm run test:native`，会清理随机测试项。
 
 失败后保留项目，告诉 Agent 继续同一个目录。不要删除已经生成的图；接口超时先核对服务端记录，防止重复收费。

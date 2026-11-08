@@ -814,6 +814,7 @@ class PersistentReleaseTests(FixtureMixin, unittest.TestCase):
         self.assertTrue(record.is_symlink())
 
 
+@unittest.skipUnless((REPO / "tools" / "build_release.py").is_file(), "作者发行构建测试只在源码仓库运行")
 class ReleaseBuilderTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
