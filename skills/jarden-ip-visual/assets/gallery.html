@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>IP 视觉对比页</title>
+<style>
+  :root {
+    --bg: #f5f4f0;
+    --card: #ffffff;
+    --ink: #1f1f1f;
+    --muted: #6f6c66;
+    --line: #e4e1da;
+    --accent: #d9485f;
+    --tag: #3d5a99;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  }
+  main { max-width: 1240px; margin: 0 auto; padding: 32px 24px 80px; }
+  header h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: .5px; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 0; padding: 0; list-style: none; }
+  .chips li { background: var(--card); border: 1px solid var(--line); border-radius: 999px; padding: 3px 12px; font-size: 13px; }
+  section { margin-top: 36px; }
+  h2 { font-size: 19px; margin: 0 0 14px; }
+  h2 small { font-weight: 400; color: var(--muted); font-size: 13px; margin-left: 8px; }
+  .grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; display: flex; flex-direction: column; }
+  .card.picked { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent) inset; }
+  .frame {
+    position: relative; aspect-ratio: 3 / 4; display: flex; align-items: center; justify-content: center;
+    background-color: #efede8;
+    background-image: linear-gradient(45deg, #e6e3dc 25%, transparent 25%), linear-gradient(-45deg, #e6e3dc 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #e6e3dc 75%), linear-gradient(-45deg, transparent 75%, #e6e3dc 75%);
+    background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0;
+  }
+  .frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .badge { position: absolute; top: 10px; left: 10px; background: var(--ink); color: #fff; border-radius: 8px; padding: 1px 9px; font-weight: 600; font-size: 14px; }
+  .placeholder { width: 82%; height: 82%; border: 2px dashed #c9c4ba; border-radius: 12px; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; color: var(--muted); padding: 16px; background: rgba(255,255,255,.7); }
+  .placeholder strong { color: var(--ink); font-size: 15px; margin-bottom: 6px; }
+  .body { padding: 12px 14px 14px; }
+  .body h3 { margin: 0 0 4px; font-size: 16px; }
+  .body p { margin: 0 0 8px; color: #43413d; font-size: 14px; }
+  details { font-size: 13px; color: var(--muted); }
+  details pre { white-space: pre-wrap; word-break: break-word; background: #faf9f6; border: 1px solid var(--line); border-radius: 8px; padding: 8px; color: #3b3935; }
+  .choices { margin-top: 18px; background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px 20px; }
+  .choices ol { margin: 8px 0 0; padding-left: 22px; }
+  .choices li { margin: 4px 0; }
+  .refs { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 14px; }
+  .refs figure { margin: 0; width: 92px; }
+  .refs img { width: 92px; height: 92px; object-fit: contain; background: #fff; border: 1px solid var(--line); border-radius: 8px; }
+  .refs figcaption { font-size: 12px; color: var(--muted); text-align: center; }
+  .phone { width: 390px; max-width: 100%; background: #fff; border-radius: 28px; border: 1px solid var(--line); overflow: hidden; box-shadow: 0 12px 40px rgba(0,0,0,.08); }
+  .carousel { display: flex; overflow-x: auto; scroll-snap-type: x mandatory; }
+  .carousel figure { margin: 0; flex: 0 0 100%; scroll-snap-align: start; position: relative; }
+  .carousel img { width: 100%; aspect-ratio: 3 / 4; object-fit: cover; display: block; }
+  .carousel figcaption { position: absolute; right: 10px; top: 10px; background: rgba(0,0,0,.55); color: #fff; border-radius: 999px; font-size: 12px; padding: 0 9px; }
+  .post-text { padding: 14px 16px 20px; }
+  .post-text h3 { margin: 0 0 8px; font-size: 17px; }
+  .post-text .text { white-space: pre-wrap; font-size: 15px; }
+  .post-text .tags { color: var(--tag); margin-top: 10px; font-size: 14px; }
+  .post-wrap { display: flex; gap: 28px; flex-wrap: wrap; align-items: flex-start; }
+  .strip { display: grid; width: 372px; max-width: 100%; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+  .strip div { position: relative; min-width: 0; }
+  .strip img { width: 100%; aspect-ratio: 3 / 4; object-fit: cover; border-radius: 6px; display: block; }
+  .strip span { position: absolute; left: 6px; top: 4px; color: #fff; font-size: 12px; text-shadow: 0 1px 2px rgba(0,0,0,.6); }
+  .notes { color: var(--muted); font-size: 13px; margin-top: 10px; }
+  .empty { color: var(--muted); }
+</style>
+</head>
+<body>
+<main id="app"></main>
+<script id="gallery-data" type="application/json">__GALLERY_DATA__</script>
+<script>
+(function () {
+  const data = JSON.parse(document.getElementById('gallery-data').textContent);
+  const app = document.getElementById('app');
+  const el = (tag, attrs, children) => {
+    const node = document.createElement(tag);
+    Object.entries(attrs || {}).forEach(([key, value]) => {
+      if (value === undefined || value === null) return;
+      if (key === 'text') node.textContent = value; else node.setAttribute(key, value);
+    });
+    (children || []).forEach(child => child && node.appendChild(child));
+    return node;
+  };
+  const src = path => encodeURI(path);
+  document.title = data.title;
+  const frame = (item, badge) => {
+    const box = el('div', { class: 'frame' });
+    if (item.exists) {
+      box.appendChild(el('img', { src: src(item.path), alt: item.title || item.id, loading: 'lazy' }));
+    } else {
+      box.appendChild(el('div', { class: 'placeholder' }, [
+        el('strong', { text: '图片未生成' }),
+        el('span', { text: item.title || item.id }),
+        el('span', { text: item.reason || '' })
+      ]));
+    }
+    if (badge) box.appendChild(el('span', { class: 'badge', text: badge }));
+    return box;
+  };
+  const card = (item, picked) => el('article', { class: 'card' + (picked ? ' picked' : '') }, [
+    frame(item, item.badge),
+    el('div', { class: 'body' }, [
+      el('h3', { text: item.title || '（未命名）' }),
+      item.idea ? el('p', { text: item.idea }) : null,
+      item.method ? el('p', { class: 'meta', text: '制作方式：' + item.method }) : null,
+      item.physics ? el('p', { class: 'meta', text: '独立物理审查：' + item.physics.verdict + ' · ' + item.physics.reason }) : null,
+      item.prompt ? el('details', {}, [el('summary', { text: item.prompt_label || '制作说明' }), el('pre', { text: item.prompt })]) : null,
+      item.sources && item.sources.length ? el('details', {}, [el('summary', { text: '来源图片' }), el('pre', { text: item.sources.join('\n') })]) : null
+    ])
+  ]);
+  const header = el('header', {}, [
+    el('h1', { text: data.title }),
+    el('div', { class: 'meta', text: data.subtitle }),
+    el('ul', { class: 'chips' }, data.chips.map(text => el('li', { text })))
+  ]);
+  app.appendChild(header);
+
+  if (data.current) {
+    const current = data.current;
+    const section = el('section', {}, [el('h2', { text: current.heading }, [el('small', { text: current.hint })])]);
+    if (current.refs.length) {
+      section.appendChild(el('div', { class: 'refs' }, current.refs.map(ref => el('figure', {}, [
+        el('img', { src: src(ref.path), alt: ref.label }), el('figcaption', { text: ref.label })
+      ]))));
+    }
+    section.appendChild(el('div', { class: 'grid' }, current.items.map(item => card(item, item.picked))));
+    section.appendChild(el('div', { class: 'choices' }, [
+      el('strong', { text: '看完在对话里回复编号就行，也可以直接说想法' }),
+      el('ol', {}, data.choices.map(text => el('li', { text })))
+    ]));
+    app.appendChild(section);
+  }
+
+  if (data.post) {
+    const post = data.post;
+    const phone = el('div', { class: 'phone' }, [
+      el('div', { class: 'carousel' }, post.images.map((image, index) => el('figure', {}, [
+        el('img', { src: src(image.path), alt: image.role }), el('figcaption', { text: (index + 1) + '/' + post.images.length })
+      ]))),
+      el('div', { class: 'post-text' }, [
+        el('h3', { text: post.title }),
+        el('div', { class: 'text', text: post.body }),
+        el('div', { class: 'tags', text: post.tags.join(' ') })
+      ])
+    ]);
+    const strip = el('div', { class: 'strip' }, post.images.map((image, index) => el('div', {}, [
+      el('img', { src: src(image.path), alt: image.role }), el('span', { text: String(index + 1).padStart(2, '0') + ' ' + image.label })
+    ])));
+    app.appendChild(el('section', {}, [
+      el('h2', { text: '发帖预览' }, [el('small', { text: post.hint })]),
+      el('div', { class: 'post-wrap' }, [phone, strip]),
+      el('div', { class: 'notes', text: post.notes })
+    ]));
+  }
+
+  if (data.picks.length) {
+    app.appendChild(el('section', {}, [
+      el('h2', { text: '已选定' }),
+      el('div', { class: 'grid' }, data.picks.map(item => card(item, false)))
+    ]));
+  }
+
+  if (data.history.length) {
+    const section = el('section', {}, [el('h2', { text: '历史轮次' })]);
+    data.history.forEach(round => {
+      section.appendChild(el('details', {}, [
+        el('summary', { text: round.heading }),
+        el('div', { class: 'grid' }, round.items.map(item => card(item, item.picked)))
+      ]));
+    });
+    app.appendChild(section);
+  }
+
+  if (!data.current && !data.post && !data.picks.length) {
+    app.appendChild(el('p', { class: 'empty', text: '还没有生成任何一轮。' }));
+  }
+})();
+</script>
+</body>
+</html>

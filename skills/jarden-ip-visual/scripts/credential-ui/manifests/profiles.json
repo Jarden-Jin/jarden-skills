@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "profiles": {
+    "image-api": [{"manifest": "default.json", "env": "JARDEN_IP_VISUAL_IMAGE_API_KEY"}]
+  }
+}
