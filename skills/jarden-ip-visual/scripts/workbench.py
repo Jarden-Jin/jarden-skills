@@ -30,6 +30,19 @@ SERVER_READY_TIMEOUT = 8.0
 SERVER_TTL = 1800
 HEALTH_TIMEOUT = 1.5
 MAX_HEALTH_BYTES = 1024 * 1024
+MAX_SERVER_ERROR_BYTES = 8192
+
+
+def redact_server_error(detail: str) -> str:
+    return re.sub(r"(?i)(token(?:=|%3d)|Bearer\s+)[A-Za-z0-9_%+-]+", r"\1[redacted]", detail)
+
+
+def server_failure_detail(path: Path) -> str:
+    with path.open("rb") as stream:
+        stream.seek(0, os.SEEK_END)
+        stream.seek(max(0, stream.tell() - MAX_SERVER_ERROR_BYTES))
+        detail = stream.read(MAX_SERVER_ERROR_BYTES).decode("utf-8", errors="replace")
+    return " ".join(redact_server_error(detail).split())
 
 
 def workbench_directory(root: Path) -> Path:
@@ -243,22 +256,26 @@ def ensure_server(root: Path, project_id: str) -> dict[str, Any]:
         if cache.is_symlink():
             raise state.ProjectError("unsafe_server_record")
         ready_file = directory / f".ready-{uuid.uuid4().hex}.json"
+        stderr_file = directory / f".server-{uuid.uuid4().hex}.stderr.log"
         process = None
         keep = False
         deadline = time.monotonic() + SERVER_READY_TIMEOUT
         try:
-            process = subprocess.Popen(
-                [sys.executable, str(Path(__file__).with_name("serve_gallery.py")), str(root),
-                 "--ready-file", str(ready_file), "--idle-timeout", str(SERVER_TTL)],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                close_fds=True,
-            )
+            descriptor = os.open(stderr_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(descriptor, "wb") as stderr:
+                process = subprocess.Popen(
+                    [sys.executable, str(Path(__file__).with_name("serve_gallery.py")), str(root),
+                     "--ready-file", str(ready_file), "--idle-timeout", str(SERVER_TTL)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr,
+                    close_fds=True,
+                )
             while time.monotonic() < deadline and process.poll() is None:
                 try:
                     info = read_server_info(ready_file)
                     remaining = deadline - time.monotonic()
                     if remaining > 0 and healthy_server(root, project_id, info, timeout=min(HEALTH_TIMEOUT, remaining), expected_pid=process.pid):
-                        info.update(project_id=project_id, expires_at=time.time() + SERVER_TTL, idle_timeout=SERVER_TTL)
+                        info.update(project_id=project_id, expires_at=time.time() + SERVER_TTL,
+                                    idle_timeout=SERVER_TTL, stderr_log=str(stderr_file))
                         state.atomic_json(cache, info)
                         cache.chmod(0o600)
                         keep = True
@@ -268,7 +285,10 @@ def ensure_server(root: Path, project_id: str) -> dict[str, Any]:
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
                     time.sleep(min(0.04, remaining))
-            raise state.ProjectError("server_not_ready：本机服务未在期限内通过健康校验")
+            returncode = process.poll()
+            reason = f"child_exit={returncode}" if returncode is not None else "startup_deadline"
+            detail = server_failure_detail(stderr_file)
+            raise state.ProjectError(f"server_not_ready：{reason}; ready_file={ready_file.exists()}; stderr_log={stderr_file}; {detail}")
         finally:
             if process is not None and not keep:
                 stop_created_process(process)
@@ -320,9 +340,10 @@ def _run_workbench(root: Path, *, serve: bool, open_browser: bool, record_ready:
         try:
             server = ensure_server(root, current["project_id"])
             target = server["url"]
-        except (state.ProjectError, OSError, ValueError):
+        except (state.ProjectError, OSError, ValueError) as error:
             server = {"status": "unavailable", "reused": False, "created": False,
-                      "error": "server_unavailable：已保留静态工作台；新选择尚未提交"}
+                      "error": "server_unavailable：已保留静态工作台；新选择尚未提交",
+                      "reason": redact_server_error(str(error))}
     elif serve:
         server["status"] = "readonly"
     opened = presentation.dispatch_open(target) if open_browser else {

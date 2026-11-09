@@ -9,6 +9,7 @@ import json
 import mimetypes
 import re
 import secrets
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -154,9 +155,16 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=45)
     args = parser.parse_args()
     root = Path(args.project).resolve()
+
+    def startup_stage(stage: str) -> None:
+        if args.ready_file:
+            print("startup: " + stage, file=sys.stderr, flush=True)
+
     try:
         from runtime_activity import execution_lease
+        startup_stage("execution_lease")
         with execution_lease():
+            startup_stage("load_project")
             project = state.load_project(root)
             if args.wait_choice:
                 revision = args.after_revision if args.after_revision is not None else project.get("revision", 0)
@@ -168,9 +176,11 @@ def main() -> int:
                     time.sleep(0.2)
                 return state.emit({"ok": True, "status": "awaiting-user", "revision": revision})
             token = secrets.token_urlsafe(32)
+            startup_stage("bind_loopback")
             server = server_for(root, token, args.port)
             info = {"ok": True, "pid": __import__("os").getpid(), "url": f"http://127.0.0.1:{server.server_port}/gallery.html#token={token}", "origin": f"http://127.0.0.1:{server.server_port}", "project": str(root), "automatic_generation": False}
             if args.ready_file:
+                startup_stage("write_ready")
                 ready = Path(args.ready_file)
                 state.atomic_json(ready, info)
                 ready.chmod(0o600)
@@ -179,6 +189,7 @@ def main() -> int:
             timer.daemon = True
             timer.start()
             try:
+                startup_stage("serving")
                 server.serve_forever(poll_interval=0.2)
             except KeyboardInterrupt:
                 pass
@@ -187,6 +198,9 @@ def main() -> int:
                 server.server_close()
             return 0
     except (state.ProjectError, OSError, ValueError) as error:
+        detail = re.sub(r"(?i)(token(?:=|%3d)|Bearer\s+)[A-Za-z0-9_%+-]+", r"\1[redacted]", str(error))
+        if args.ready_file:
+            print(json.dumps({"ok": False, "error": detail}, ensure_ascii=True), file=sys.stderr, flush=True)
         return state.emit({"ok": False, "error": str(error)})
 
 

@@ -514,8 +514,8 @@ class WorkbenchTests(unittest.TestCase):
         with self.launch_spy() as launch:
             first = self.run_workbench(serve=True)
             second = self.run_workbench(serve=True)
-        self.assertEqual(launch.call_count, 1)
-        self.assertTrue(first["server"]["created"])
+        self.assertEqual(launch.call_count, 1, workbench.redact_server_error(repr((first["server"], second["server"]))))
+        self.assertTrue(first["server"]["created"], workbench.redact_server_error(repr(first["server"])))
         self.assertTrue(second["server"]["reused"])
         self.assertEqual(first["url"], second["url"])
         self.assertIn("#token=", first["url"])
@@ -530,11 +530,16 @@ class WorkbenchTests(unittest.TestCase):
         self.assertIn("--idle-timeout", command)
         self.assertEqual(list(cache.parent.glob(".ready-*.json")), [])
         self.assertEqual(first["open"]["status"], "unavailable")
+        stderr_log = Path(first["server"]["stderr_log"])
+        self.assertEqual(stat.S_IMODE(stderr_log.stat().st_mode), 0o600)
+        diagnostics = stderr_log.read_text(encoding="utf-8")
+        self.assertIn("startup: serving", diagnostics)
+        self.assertNotIn(first["url"].split("#token=")[1], diagnostics)
 
     def test_child_has_bounded_ttl(self):
         with mock.patch.object(workbench, "SERVER_TTL", 4), self.launch_spy():
             result = self.run_workbench(serve=True)
-        self.assertTrue(result["server"]["created"])
+        self.assertTrue(result["server"]["created"], workbench.redact_server_error(repr(result["server"])))
         self.launched[0].wait(timeout=8)
         self.assertEqual(self.launched[0].returncode, 0)
         self.assertFalse(workbench.healthy_server(self.root, self.current["project_id"], result["server"]))
@@ -557,6 +562,24 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(result["server"]["status"], "unavailable")
         self.assertIsNotNone(created[0].poll())
         self.assertFalse((self.root / ".workbench/server.json").exists())
+
+    def test_child_failure_preserves_private_diagnostics_and_redacts_reason(self):
+        self.save({**self.current, "schema_version": 999})
+        with self.assertRaisesRegex(project.ProjectError, "child_exit=2") as raised:
+            workbench.ensure_server(self.root, self.current["project_id"])
+        logs = list((self.root / ".workbench").glob(".server-*.stderr.log"))
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(stat.S_IMODE(logs[0].stat().st_mode), 0o600)
+        self.assertIn("startup: load_project", logs[0].read_text(encoding="utf-8"))
+        self.assertIn("startup: load_project", str(raised.exception))
+        logs[0].write_text("token=private-token Bearer private-bearer", encoding="utf-8")
+        detail = workbench.server_failure_detail(logs[0])
+        self.assertNotIn("private-token", detail)
+        self.assertNotIn("private-bearer", detail)
+        self.save(self.current)
+        with mock.patch.object(workbench.subprocess, "Popen", side_effect=OSError("token=private-launch")):
+            result = self.run_workbench(serve=True)
+        self.assertNotIn("private-launch", result["server"]["reason"])
 
     def test_ready_file_with_wrong_pid_cannot_be_accepted(self):
         healthy = self.live_server()
