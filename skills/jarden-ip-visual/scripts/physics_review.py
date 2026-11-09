@@ -104,7 +104,11 @@ def context_of(project: dict[str, Any]) -> dict[str, str]:
         raise ReviewError("先确认产品形态，再准备物理盲审")
     context = {"product_form": form}
     if form == "other":
-        context["product_detail"] = str((project.get("brief") or {}).get("product_detail") or "")
+        detail = str((project.get("brief") or {}).get("product_detail") or "")
+        import re
+        if re.search(r"must.?pass|should pass|必须通过|忽略.{0,8}(审查|检查)|作者.{0,10}(喜欢|偏好|希望)", detail, re.I):
+            raise ReviewError("产品详情含审查指令或作者偏好；提供中性产品形态后再准备匿名包")
+        context["product_detail"] = detail
     return context
 
 
@@ -115,7 +119,8 @@ def context_key(project: dict[str, Any]) -> str:
 def status(root: Path, project: dict[str, Any], relative: str) -> dict[str, Any]:
     try:
         image = local_image(root, relative)
-        key = f"{context_key(project)}:{digest(image)}"
+        image_hash = digest(image)
+        key = f"{context_key(project)}:{image_hash}"
         index = root / "reviews/physics/index.json"
         record = (read_json(index).get("images") or {}).get(key) if index.is_file() else None
         if not isinstance(record, dict):
@@ -125,12 +130,12 @@ def status(root: Path, project: dict[str, Any], relative: str) -> dict[str, Any]
             raise ReviewError("物理审查报告已变化，需要重新登记")
         content = read_json(report)
         reviewer = content.get("reviewer") or {}
-        if not isinstance(reviewer, dict) or reviewer.get("zero_context") is not True or reviewer.get("viewed_images") is not True:
+        if not isinstance(reviewer, dict) or not isinstance(reviewer.get("id"), str) or not reviewer["id"].strip() or reviewer.get("zero_context") is not True or reviewer.get("viewed_images") is not True:
             raise ReviewError("报告缺少独立看图声明")
         reported = content.get("results")
         if not isinstance(reported, list) or any(not isinstance(result, dict) for result in reported):
             raise ReviewError("报告逐图结果格式无效")
-        results = [result for result in reported if result.get("sha256") == digest(image)]
+        results = [result for result in reported if result.get("sha256") == image_hash]
         if not results:
             raise ReviewError("报告未覆盖当前图片")
         for result in results:
@@ -138,7 +143,9 @@ def status(root: Path, project: dict[str, Any], relative: str) -> dict[str, Any]
         verdict = results[0]["verdict"]
         if any(result["verdict"] != verdict for result in results):
             raise ReviewError("同图判定冲突")
-        return {"verdict": verdict, "reason": results[0]["summary"], "report": record["report"]}
+        if digest(image) != image_hash:
+            raise ReviewError("图片在核对审查时变化，请重新检查")
+        return {"verdict": verdict, "reason": results[0]["summary"], "report": record["report"], "reviewer_id": reviewer["id"]}
     except (ReviewError, OSError, KeyError, TypeError) as error:
         return {"verdict": "invalid", "reason": str(error)}
 

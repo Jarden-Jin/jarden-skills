@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import unittest
 
 from PIL import Image
@@ -8,6 +9,7 @@ from PIL import Image
 import test_workflow
 import package_post
 import project
+import contract_fixtures
 
 
 class RecoveryTests(test_workflow.WorkflowTests):
@@ -15,9 +17,9 @@ class RecoveryTests(test_workflow.WorkflowTests):
         for stage in ("concept", "material"):
             self.call("project.py", "accept-input", self.job, "--stage", stage, "--path", "inputs/original.png")
 
-    def complete(self, note="single-multiview"):
+    def complete(self, note="single-multiview", delivery="full-post"):
         self.init()
-        self.known(note_type=note)
+        self.known(note_type=note, delivery=delivery)
         self.accept_design()
         round_id, _ = self.round("cutout")
         self.call("project.py", "select", self.job, round_id, "--approve")
@@ -58,13 +60,18 @@ class RecoveryTests(test_workflow.WorkflowTests):
 
     def test_upstream_regeneration_invalidates_post_and_downstream(self):
         self.complete()
-        old_round = json.loads((self.job / "project.json").read_text())["rounds"][0]["id"]
+        before = json.loads((self.job / "project.json").read_text())
+        old_round = before["rounds"][0]["id"]
+        previous_bytes = {item["path"]: (self.job / item["path"]).read_bytes() for item in before["finals"]}
         round_id, _ = self.round("concept")
         self.call("project.py", "select", self.job, round_id, "A")
         info = self.call("project.py", "show", self.job)
         self.assertEqual(info["stage"], "material")
         data = json.loads((self.job / "project.json").read_text())
-        self.assertEqual(data["finals"], [])
+        self.assertEqual({item["path"] for item in data["finals"]}, set(previous_bytes))
+        self.assertTrue(all(item["pending_change"] for item in data["finals"]))
+        self.assertEqual(project.missing_scene_slots(data), [slot["id"] for slot in project.scene_slots(data)])
+        self.assertTrue(all((self.job / relative).read_bytes() == content for relative, content in previous_bytes.items()))
         self.assertNotIn("post", data)
         self.assertFalse(self.call("build_gallery.py", self.job)["has_post"])
         html = (self.job / "gallery.html").read_text()
@@ -93,6 +100,7 @@ class RecoveryTests(test_workflow.WorkflowTests):
         self.init()
         self.known()
         self.call("project.py", "set", self.job, "answers.concept_count=3")
+        contract_fixtures.configure(self.job)
         subjects = self.call("project.py", "show", self.job)["subjects"]
         for stage in ("concept", "material"):
             for subject in subjects:
@@ -111,6 +119,7 @@ class RecoveryTests(test_workflow.WorkflowTests):
         self.init()
         self.known(["角色2"])
         self.call("project.py", "set", self.job, "answers.concept_count=3")
+        contract_fixtures.configure(self.job)
         subjects = self.call("project.py", "show", self.job)["subjects"]
         self.assertEqual(len(subjects), len(set(subjects)))
         for stage in ("concept", "material"):
@@ -125,24 +134,22 @@ class RecoveryTests(test_workflow.WorkflowTests):
         for delivery, slot in (("full-post", "cover"), ("full-post", "scene-1"), ("grid-9", "cover")):
             with self.subTest(delivery=delivery, slot=slot):
                 self.job = self.root / f"legacy-{delivery}-{slot}"
-                self.complete()
-                if delivery == "grid-9":
-                    self.call("project.py", "set", self.job, "answers.delivery=grid-9")
-                    round_id, _ = self.round("scene")
-                    self.call("project.py", "select", self.job, round_id, "A")
-                    round_id, _ = self.round("scene")
-                    self.call("project.py", "select", self.job, round_id, "--approve")
+                self.complete(delivery=delivery)
                 data = project.load_project(self.job)
                 originals = [dict(final) for final in data["finals"]]
                 for final in originals:
                     legacy = self.job / ("legacy-" + final["slot"] + ".png")
                     legacy.write_bytes((self.job / final["path"]).read_bytes())
+                    contract_fixtures.bind_final(self.job, legacy.name, final["slot"])
+                    self.review([legacy.name])
                     self.call("project.py", "final", self.job, "--role", final["role"], "--slot", final["slot"], "--path", legacy.name)
                 data = project.load_project(self.job)
                 data["finals"] = [{key: value for key, value in final.items() if key != "slot"} for final in data["finals"]]
                 project.save_project(self.job, data)
                 required_count = len(data["finals"])
                 first = originals[0]
+                contract_fixtures.bind_final(self.job, first["path"], first["slot"])
+                self.review([first["path"]])
                 self.call("project.py", "final", self.job, "--role", first["role"], "--slot", first["slot"], "--path", first["path"])
                 self.assertEqual(len(project.load_project(self.job)["finals"]), required_count)
                 data = project.load_project(self.job)
@@ -159,8 +166,38 @@ class RecoveryTests(test_workflow.WorkflowTests):
                 round_id, _ = self.round("scene", slots=slot)
                 self.call("project.py", "select", self.job, round_id, "--approve")
                 self.assertEqual(len(project.load_project(self.job)["finals"]), required_count)
+                current = project.load_project(self.job)
+                contract_fixtures.review(self.job, [final["path"] for final in project.mapped_scene_finals(current)])
                 self.package_review()
                 self.call("package_post.py", self.job, "--force")
+
+    def test_append_scene_keeps_confirmed_front_and_only_generates_the_new_image(self):
+        self.complete()
+        before = project.load_project(self.job)
+        front = next(final for final in before["finals"] if final["slot"] == "cover")
+        front_bytes = (self.job / front["path"]).read_bytes()
+        front_sha = hashlib.sha256(front_bytes).hexdigest()
+        patch = {
+            "schema_version": 1, "op": "append", "expected_revision": before["scene_plan"]["revision"],
+            "scope": {"slots": ["desk-scene"]}, "preserve_slots": ["cover"], "baseline_hashes": {"cover": front_sha},
+            "slots": [{"id": "desk-scene", "role": "scene", "subject": "小云", "view": "front",
+                       "description": "增加桌边使用场景，保留已确认正面", "keep": ["已确认的轮廓与配色"]}],
+        }
+        patch_file = self.root / "append-scene.json"
+        project.write_json(patch_file, patch)
+        result = self.call("project.py", "scene-patch", self.job, "--file", patch_file)
+        current = project.load_project(self.job)
+        self.assertEqual(current["finals"], before["finals"])
+        self.assertEqual(current["selections"], before["selections"])
+        self.assertEqual(result["next"]["slots"], ["desk-scene"])
+        self.assertEqual((self.job / front["path"]).read_bytes(), front_bytes)
+        round_id, path = self.round("scene")
+        self.assertEqual([item["id"] for item in project.read_json(path)["items"]], ["desk-scene"])
+        self.call("project.py", "select", self.job, round_id, "--approve")
+        current = project.load_project(self.job)
+        self.assertEqual(len(current["finals"]), len(before["finals"]) + 1)
+        self.assertIn(front, current["finals"])
+        self.assertEqual((self.job / front["path"]).read_bytes(), front_bytes)
 
     def test_identical_input_filenames_are_preserved(self):
         first = self.root / "first"
@@ -247,8 +284,10 @@ class RecoveryTests(test_workflow.WorkflowTests):
         for slot in project.scene_slots(data):
             path = self.job / f"{slot['id']}.png"
             Image.new("RGB", (120, 160), "teal").save(path)
+            contract_fixtures.bind_final(self.job, path.name, slot["id"])
             self.review([path.name])
             self.call("project.py", "final", self.job, "--role", slot["role"], "--slot", slot["id"], "--path", path.name)
+        contract_fixtures.review(self.job, [final["path"] for final in project.load_project(self.job)["finals"]])
         (self.job / "copy.json").write_text(json.dumps({"title": "测试九宫格", "body": "AI设计效果图", "tags": ["#一", "#二", "#三"]}))
         self.package_review()
         self.call("package_post.py", self.job)

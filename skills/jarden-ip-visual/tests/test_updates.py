@@ -243,6 +243,24 @@ with mock.patch.object(update_runtime.Source, "_request", request):
 
 
 class UpdateInstallTests(FixtureMixin, unittest.TestCase):
+    def test_backup_excludes_rebuildable_dependencies_without_following_their_links(self):
+        source = self.temp / "backup-source"
+        source.mkdir()
+        (source / "managed.txt").write_text("managed", encoding="utf-8")
+        dependency = source / "scripts/credential-ui/node_modules/.bin"
+        dependency.mkdir(parents=True)
+        outside = self.temp / "outside-secret"
+        outside.write_text("not part of skill", encoding="utf-8")
+        (dependency / "compiler").symlink_to(outside)
+        destination = self.temp / "backup-result"
+        update_runtime.copy_tree(source, destination)
+        self.assertEqual((destination / "managed.txt").read_text(), "managed")
+        self.assertFalse((destination / "scripts/credential-ui/node_modules").exists())
+        self.assertTrue((dependency / "compiler").is_symlink())
+        (source / "unsafe-link").symlink_to(outside)
+        with self.assertRaises(update_runtime.UpdateError):
+            update_runtime.copy_tree(source, self.temp / "unsafe-backup")
+
     def test_apply_yes_installs_verifies_and_rolls_back_without_project_migration(self):
         self.standard_fixture()
         (self.inst / "README.md").write_text("local modified readme\n", encoding="utf-8")

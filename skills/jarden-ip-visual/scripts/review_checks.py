@@ -376,7 +376,7 @@ def _task(category: str) -> dict[str, Any]:
         ]
     if category == "identity":
         requirements["criteria_definitions"] = {
-            "identity": "并排检查轮廓、五官、色区、配件、角色数量与系列规则；必须指出可见差异和对应确认依据。",
+            "identity": "并排检查轮廓、五官、色区、配件、角色数量与系列规则；透明主资产另核完整正面全身、毛尖/孔洞/浅深底边缘及已选材质，不用alpha替代看图。必须指出可见差异和对应确认依据。",
         }
     if category == "creative":
         requirements["criteria"] = {name: {"verdict": "pass | needs_revision | uncertain | not_applicable", "evidence": "可见依据"} for name in CREATIVE_CRITERIA}

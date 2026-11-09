@@ -2,6 +2,8 @@
 
 审查不是把主观分数和客观文件检查混成一个“总通过”。每类报告回答不同问题，绑定自己的实际对象；用户选定不能豁免，某类通过也不能覆盖另一类失败。物理审查始终按 [零上下文物理审查](physics-review.md) 执行。
 
+当前 schema 3 场景及发布集合另外强制执行 [产品与镜头](product-and-shots.md) 的 G1：实际身份、尺度、视面及完整排列。这不是下表可选 `identity/sequence` 报告的别名，不能因可选报告缺失不阻断就跳过 G1。G1 与 G2 用不同新上下文执行者；缺审或 uncertain 均不通过。G0 程序计划检查不证明图片质量。
+
 ## 类别和停止点
 
 | 类别 | 回答的问题 | 建议执行者 | 建议范围 | 失败或缺失时 |
@@ -132,7 +134,7 @@ gate = review_checks.blocking_findings(root, project, paths, stage="package")
 - `identity/creative/ux` 缺失或范围变化返回 `not_assessed`，不阻断普通客户流程；有效失败报告仍阻断身份或创作对象。`creative` 的覆盖代表所送代表方案，不宣称未送图片也已独立看过；逐图 `coverage` 保留实际范围。
 - `files/copy/sequence` 返回即时程序检查，并以 `review` 单独表示是否有有效独立记录；物理缺审仍为 `missing` 且阻断。
 
-`prepare` 和 `status` 都是只读业务状态：不增加项目 `revision`，不修改页面、选择、图片或物理盲审包。CLI `prepare` 在项目锁内通过 `state.load_project(root, writable=True)` 检查可写 schema，只新增自己的审查请求包和请求摘要，不调用 `save_project`；schema 1 需先迁移再生成新包。
+`prepare` 和 `status` 都是只读业务状态：不增加项目 `revision`，不修改页面、选择、图片或物理盲审包。CLI `prepare` 在项目锁内通过 `state.load_project(root, writable=True)` 检查可写 schema，只新增自己的审查请求包和请求摘要，不调用 `save_project`；schema 1/2 需先显式迁移至 schema 3 再生成新包。
 
 `blocking_findings(root, project, paths, stage)`：
 

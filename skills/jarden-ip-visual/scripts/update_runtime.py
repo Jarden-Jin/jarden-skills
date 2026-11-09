@@ -760,6 +760,8 @@ def copy_tree(source: Path, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=False)
     for item in source.rglob("*"):
         relative = item.relative_to(source)
+        if any(part in {".DS_Store", "__pycache__", ".git", ".venv", "node_modules"} for part in relative.parts):
+            continue
         if item.is_symlink():
             raise UpdateError("备份遇到符号链接；拒绝继续", "unsafe_path")
         if item.is_dir():

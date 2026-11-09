@@ -54,6 +54,11 @@
     try { return path.split("/").map(encodeURIComponent).join("/"); } catch (_) { return path; }
   };
   const stageLabel = { concept: "概念图", material: "材质方向", cutout: "透明图", scene: "场景图", package: "发帖素材", done: "已完成" };
+  const viewLabel = value => ({ front: "正面", "three-quarter": "四分之三视角", left: "左侧", right: "右侧", back: "背面", detail: "局部细节" })[value] || "视面待补";
+  const originLabel = value => ({ "user-confirmed": "用户说明", "agent-inferred": "设计推定", "reference-derived": "参考图提取" })[value] || "来源待补";
+  const confirmationLabel = value => ({ confirmed: "已确认", proposed: "待确认", unknown: "未知，待补", stale: "已失效，待核对" })[value] || "确认状态待补";
+  const reviewLabel = value => ({ needs_review: "缺审", stale: "已失效", invalid: "已失效", uncertain: "不确定", needs_revision: "需修改", pass: "通过", pending: "待补" })[value] || "待补";
+  const checkLabel = { identity: "身份与结构", scale: "设计尺度", view: "实际视面、姿态与取景", coverage: "整套覆盖", preservation: "原图保持", order: "实际排列" };
   const nextStatus = action => ({ review: "待审查", package: "待整理", ask: "等待回答", generate: "待制作", round: "待制作", backend: "待配置", "await-choice": "等待选择", done: "已完成" })[action] || "状态待核对";
   const statusLabel = draft => {
     if (state.adopted) return state.result.action === "answer-field" ? "回答已保存" : (state.result.action || "").startsWith("request-") ? "意向已登记" : "已采用";
@@ -105,7 +110,7 @@
         : "最后希望拿到哪种图片组合？两种形式都附标题、正文和标签，请按你的发布计划选择。"
     }
   };
-  const questionField = questionFields[offer?.field] || { label: "本轮需要确认", intro: "这次希望怎样安排？请填写你的想法，也可以回到聊天里补充说明。" };
+  const questionField = questionFields[offer?.field] || { label: offer?.label || "本轮需要确认", intro: offer?.intro || "这次希望怎样安排？请填写你的想法，也可以回到聊天里补充说明。" };
   const questionChoices = Array.isArray(offer?.options) && offer.options.length ? offer.options : questionField.options || [];
 
   function loadDraft() {
@@ -457,6 +462,79 @@
     ]);
   }
 
+  function productSection() {
+    const contract = data.product_contract;
+    return el("details", { class: "agreements contract", open: true }, [
+      el("summary", {}, [el("h2", { text: "产品约定" }), el("span", { class: "meta", text: "用途、设计尺度与来源" })]),
+      !contract || contract.reason ? el("p", { class: "meta", text: contract?.reason || "本交付未记录产品约定；未知内容待补。" }) : null,
+      ...(contract?.subjects || []).map(subject => el("article", { class: "contract-subject" }, [
+        el("h3", { text: subject.name }),
+        !subject.specs?.length ? el("p", { class: "meta", text: "用途与尺度记录待补" }) : null,
+        ...(subject.specs || []).map(spec => el("div", { class: "contract-spec" }, [
+          spec.name ? el("strong", { text: spec.name }) : null,
+          el("p", { text: `用途：${spec.usage?.text || "未知，待补"}` }),
+          el("p", { class: "meta", text: `${originLabel(spec.usage?.origin)} · ${confirmationLabel(spec.usage?.status)}` }),
+          el("p", { text: `尺度：${spec.size?.description || "未知，待补"}` }),
+          el("p", { class: "meta", text: `量取口径：${spec.size?.measurement_basis || "未知，待补"}` }),
+          el("p", { class: "meta", text: `${({ design_target: "设计目标", user_specification: "用户提供规格", measured_sample: "样品测量（依据另行核对）" })[spec.size?.evidence_kind] || "尺度依据待补"} · ${originLabel(spec.size?.origin)} · ${confirmationLabel(spec.size?.status)}` })
+        ])),
+        ...(subject.views || []).map(asset => el("div", { class: "plan-row" }, [
+          asset.image ? frame({ ...asset.image, title: `${subject.name} · ${viewLabel(asset.view)}` }, 3, "参考图待补") : null,
+          el("div", {}, [
+            el("p", { text: `${viewLabel(asset.view)}设计资料 · ${confirmationLabel(asset.status)}` }),
+            el("p", { class: "meta", text: `原始来源：${originLabel(asset.origin)}${asset.confirmation_origin ? ` · 确认来源：${originLabel(asset.confirmation_origin)}` : ""}` }),
+            asset.evidence ? el("p", { class: "meta", text: asset.evidence }) : null
+          ])
+        ]))
+      ]))
+    ]);
+  }
+
+  function planSection() {
+    const plan = data.scene_plan;
+    return el("details", { class: "agreements contract", open: true }, [
+      el("summary", {}, [el("h2", { text: "视角计划" }), el("span", { class: "meta", text: "G0 · 计划依据" })]),
+      el("p", { class: "meta", text: plan?.reason || "本交付未记录视角计划；G0 计划不是已实证图像。" }),
+      plan?.required_views?.length ? el("p", { class: "meta", text: `计划要求：${plan.required_views.map(viewLabel).join("、")}` }) : null,
+      plan?.missing_views?.length ? el("p", { class: "item-status blocked", text: `计划尚缺：${plan.missing_views.map(viewLabel).join("、")}` }) : null,
+      ...(plan?.slots || []).map(slot => el("article", { class: "plan-row", "data-plan-slot": slot.id }, [
+        slot.image ? frame({ ...slot.image, title: `${slot.id} · 已保留原图` }, 3, "原图待补") : null,
+        el("div", {}, [
+          el("h3", { text: `${slot.id} · ${viewLabel(slot.view)}${slot.subject ? ` · ${slot.subject}` : slot.subjects?.length ? ` · ${slot.subjects.join("、")}` : ""}` }),
+          el("p", { text: `姿态：${slot.pose || "待补"}` }),
+          el("p", { text: `取景：${slot.framing || "待补"}` }),
+          el("p", { class: "meta", text: `保持状态：${slot.preserve ? "要求保留原图；" : ""}${slot.image_state === "pending_change" ? "原图待修改" : slot.image_state === "retained" && slot.image?.exists ? "原图已保留，验收见 G1" : "图片待补"}${slot.keep?.length ? ` · 保持项：${slot.keep.join("、")}` : ""}` }),
+          slot.image?.original_path ? el("small", { class: "asset-path", text: `原图：${slot.image.original_path}` }) : null
+        ])
+      ]))
+    ]);
+  }
+
+  function reviewDetail(result, title) {
+    return el("div", { class: "review-detail" }, [
+      el("strong", { class: result.status === "pass" ? "item-status" : "item-status blocked", text: `${title} · ${reviewLabel(result.status)}` }),
+      el("p", { class: "meta", text: result.reason || "审查依据待补" }),
+      ...(result.checks || []).map(check => el("p", { class: "meta", text: `${checkLabel[check.name] || "检查项"}：${reviewLabel(check.verdict)} · ${check.reason || "依据待补"}` }))
+    ]);
+  }
+
+  function g1Section() {
+    const groups = data.g1 || [];
+    return el("details", { class: "agreements contract", open: true }, [
+      el("summary", {}, [el("h2", { text: "G1 实际图验收" }), el("span", { class: "meta", text: "逐图检查与整套范围" })]),
+      el("p", { class: "meta", text: "以下为已绑定原图和适用约定的报告状态。程序核对范围与记录，不能证明实际独立看图或精确测量。" }),
+      !groups.length ? el("p", { class: "meta", text: "本交付未记录 G1 实际图验收，待补；不由计划推定通过。" }) : null,
+      ...groups.map(group => el("details", { class: "review-group", open: true }, [
+        el("summary", { text: `${group.label} · ${group.stage === "package" || group.stage === "done" ? "完整实际发布集合" : "本批实际图片"} · ${reviewLabel(group.sequence?.status)}` }),
+        ...(group.items || []).map(item => el("div", {}, [
+          reviewDetail(item, item.slot_id || "图位待绑定"),
+          el("small", { class: "asset-path", text: `原图：${item.original_path || "待补"}${item.source_path && item.source_path !== item.original_path ? ` · 制作源图：${item.source_path}` : ""}` })
+        ])),
+        reviewDetail(group.sequence || {}, "整套覆盖、保持与排列")
+      ]))
+    ]);
+  }
+
   function notices() {
     const parts = [];
     if (!interactive) parts.push(el("div", { class: "notice" }, [
@@ -782,6 +860,9 @@
       ...header(),
       ...notices(),
       agreements(),
+      productSection(),
+      planSection(),
+      g1Section(),
       el("div", { class: "workspace" }, [workarea(), sidebar()]),
       maintenanceSection()
     );

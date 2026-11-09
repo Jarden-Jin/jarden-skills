@@ -16,6 +16,7 @@ sys.path.insert(0, str(SKILL / "scripts"))
 import package_post
 import project
 import physics_review
+import contract_fixtures
 
 
 class WorkflowTests(unittest.TestCase):
@@ -42,6 +43,7 @@ class WorkflowTests(unittest.TestCase):
         self.call("project.py", "set", self.job, "answers.product_form=plush", f"answers.subject_scope={'single' if len(names) == 1 else 'all'}",
                   "answers.subjects=" + json.dumps(names, ensure_ascii=False), f"answers.concept_count={len(names)}",
                   f"answers.note_type={note_type}", f"answers.delivery={delivery}", "image_backend.kind=builtin")
+        contract_fixtures.configure(self.job)
 
     def review(self, paths, verdict="pass", reviewer="unit-test-reviewer"):
         packet = self.call("physics_review.py", "prepare", self.job, "--producer", "unit-test-producer", "--images", *paths)
@@ -55,11 +57,19 @@ class WorkflowTests(unittest.TestCase):
         report_path = Path(packet["packet"]).parent / "test-report.json"
         project.write_json(report_path, report)
         result = self.call("physics_review.py", "record", self.job, "--request", packet["request_id"], "--report", report_path)
+        current = project.load_project(self.job)
+        try:
+            mappings = project.review_mappings(self.job, current, paths, "scene")
+        except project.ProjectError:
+            mappings = None
+        if mappings and verdict == "pass":
+            contract_fixtures.review(self.job, paths, mappings=mappings)
         return packet, report_path, result
 
     def package_review(self):
         prepared = self.call("package_post.py", self.job, "--prepare-review")
         self.review(prepared["images"])
+        contract_fixtures.review(self.job, prepared["images"], "package", package_post.actual_output_slots(self.job, project.load_project(self.job), prepared["images"]))
         return prepared
 
     def round(self, stage, subject=None, slots=None, register=True):
@@ -85,6 +95,7 @@ class WorkflowTests(unittest.TestCase):
                 with Image.open(self.source) as original:
                     image = original.copy()
             image.save(path.parent / item["image"])
+        contract_fixtures.generation(self.job, project.find_round(project.load_project(self.job), info["round"]), data)
         path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         if register:
             if stage == "scene":
@@ -98,10 +109,54 @@ class WorkflowTests(unittest.TestCase):
         before = (self.job / "project.json").read_bytes()
         self.init()
         self.assertEqual(before, (self.job / "project.json").read_bytes())
-        self.call("project.py", "set", self.job, "answers.product_form=plush", "answers.subject_scope=single", 'answers.subjects=["小云"]')
+        self.call("project.py", "set", self.job, "answers.product_form=plush")
         info = self.call("project.py", "show", self.job)
-        self.assertEqual(info["next"]["field"], "answers.note_type")
-        self.assertEqual(len(info["next"]["options"]), 4)
+        self.assertEqual(info["next"]["field"], "answers.subject_scope")
+        self.call("project.py", "set", self.job, "answers.subject_scope=single", 'answers.subjects=["小云"]')
+        info = self.call("project.py", "show", self.job)
+        self.assertEqual(info["next"]["field"], "answers.concept_count")
+        self.call("project.py", "set", self.job, "answers.concept_count=1")
+        info = self.call("project.py", "show", self.job)
+        self.assertTrue(info["next"]["field"].startswith("product.usage:"))
+        self.assertTrue(info["next"]["free_text"])
+        self.assertEqual(info["next"]["options"], [])
+        current = project.load_project(self.job)
+        self.assertEqual(current["schema_version"], project.SCHEMA_VERSION)
+        self.assertTrue(current["product_contract"]["enabled"])
+
+    def test_unknown_scale_allows_concepts_and_publishing_questions_wait_for_scene(self):
+        import product_contract
+
+        self.init()
+        self.call("project.py", "set", self.job, "answers.product_form=plush", "answers.subject_scope=single",
+                  'answers.subjects=["小云"]', "answers.concept_count=1", "image_backend.kind=builtin")
+        usage = "放在桌边陪我，也想偶尔挂在包上"
+        specification = self.root / "usage.json"
+        project.write_json(specification, {"usage": {"text": usage, "status": "confirmed", "origin": "user-confirmed"}})
+        self.call("project.py", "product", self.job, "--subject", "小云", "--file", specification)
+        current = project.load_project(self.job)
+        _, spec = product_contract.spec_for(current, "小云")
+        self.assertEqual(spec["usage"]["text"], usage)
+        self.assertEqual(spec["size"]["mode"], "unknown")
+        self.assertEqual(self.call("project.py", "show", self.job)["next"]["action"], "round")
+        for stage in ("concept", "material"):
+            round_id, _ = self.round(stage)
+            self.call("project.py", "select", self.job, round_id, "A")
+        round_id, _ = self.round("cutout")
+        self.call("project.py", "select", self.job, round_id, "--approve")
+        self.assertTrue(self.call("project.py", "show", self.job)["next"]["field"].startswith("product.size:"))
+        self.call("project.py", "new-round", self.job, "--stage", "scene", code=2)
+        project.write_json(specification, {"size": {"mode": "qualitative", "description": "本体约一只手掌大",
+                           "measurement_basis": "仅本体，不含挂扣", "status": "confirmed", "origin": "user-confirmed",
+                           "evidence_kind": "design_target"}})
+        self.call("project.py", "product", self.job, "--subject", "小云", "--file", specification)
+        self.assertEqual(self.call("project.py", "show", self.job)["next"]["field"], "answers.note_type")
+        self.call("project.py", "set", self.job, "answers.note_type=single-multiview")
+        self.assertEqual(self.call("project.py", "show", self.job)["next"]["field"], "answers.delivery")
+        self.call("project.py", "set", self.job, "answers.delivery=full-post")
+        self.assertEqual(self.call("project.py", "show", self.job)["next"]["action"], "scene-plan")
+        self.call("project.py", "scene-plan", self.job)
+        self.assertEqual(self.call("project.py", "show", self.job)["next"]["action"], "round")
 
     def test_invalid_setting_does_not_mutate(self):
         self.init()
@@ -113,8 +168,8 @@ class WorkflowTests(unittest.TestCase):
         self.init()
         self.call("project.py", "set", self.job, "answers.product_form=puzzle", "answers.subject_scope=single", 'answers.subjects=["雪夜"]')
         info = self.call("project.py", "show", self.job)
-        self.assertEqual(info["next"]["field"], "answers.note_type")
-        options = info["next"]["options"]
+        self.assertEqual(info["next"]["field"], "answers.concept_count")
+        options = project.ask_action(project.load_project(self.job), "note_type")["options"]
         self.assertEqual(len(options), 4)
         self.assertNotIn("玩偶", json.dumps(options, ensure_ascii=False))
         self.assertNotIn("挂包", json.dumps(options, ensure_ascii=False))
@@ -214,17 +269,24 @@ class WorkflowTests(unittest.TestCase):
         round_id, path = self.round("cutout")
         data = json.loads(path.read_text())
         Image.open(self.source).save(path.parent / data["items"][0]["image"])
+        data["items"][0].update(method="derive", sources=["inputs/original.png"])
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         self.call("project.py", "record-round", self.job, round_id)
         self.call("project.py", "select", self.job, round_id, "--approve", code=2)
 
     def test_packaging_order_ratio_recovery_and_copy_validation(self):
         self.init()
         self.known(["云", "雨"], "series-collection")
-        for role, name, color in (("scene", "scene.png", "orange"), ("character", "one.png", "blue"),
-                                  ("cover", "cover.png", "magenta"), ("character", "two.png", "green"), ("scene", "scene-two.png", "purple")):
+        for role, slot, name, color in (("scene", "scene-1", "scene.png", "orange"), ("character", "character-1", "one.png", "blue"),
+                                      ("cover", "cover", "cover.png", "magenta"), ("character", "character-2", "two.png", "green"),
+                                      ("scene", "scene-2", "scene-two.png", "purple")):
             Image.new("RGB", (300, 300), color).save(self.job / name)
+            contract_fixtures.bind_final(self.job, name, slot)
             self.review([name])
-            self.call("project.py", "final", self.job, "--role", role, "--path", name)
+            self.call("project.py", "final", self.job, "--role", role, "--slot", slot, "--path", name)
+        data = project.load_project(self.job)
+        paths = [final["path"] for final in package_post.ordered_finals(data)]
+        contract_fixtures.review(self.job, paths)
         copy = {"title": "一群好朋友", "body": "云和雨的设计效果图，材质以打样为准。", "tags": ["#原创IP", "#天气", "#毛绒玩具"]}
         (self.job / "copy.json").write_text(json.dumps(copy, ensure_ascii=False))
         self.call("package_post.py", self.job, "--dry-run")
@@ -250,8 +312,9 @@ class WorkflowTests(unittest.TestCase):
     def test_grid_requires_nine_actual_finals(self):
         self.init()
         self.known(delivery="grid-9")
+        contract_fixtures.bind_final(self.job, "inputs/original.png", "cover")
         self.review(["inputs/original.png"])
-        self.call("project.py", "final", self.job, "--role", "cover", "--path", "inputs/original.png")
+        self.call("project.py", "final", self.job, "--role", "cover", "--slot", "cover", "--path", "inputs/original.png")
         (self.job / "copy.json").write_text(json.dumps({"title": "测试", "body": "测试效果图", "tags": ["#一", "#二", "#三"]}))
         self.call("package_post.py", self.job, "--dry-run", code=2)
 

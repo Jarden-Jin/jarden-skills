@@ -28,7 +28,7 @@ from typing import Any
 
 import physics_review
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 STAGES = ("concept", "material", "cutout", "scene", "package", "done")
 PER_SUBJECT_STAGES = ("concept", "material")
 ASK_ORDER = ("product_form", "subject_scope", "note_type", "concept_count", "delivery")
@@ -232,10 +232,10 @@ def load_project(root: Path, writable: bool = False) -> dict[str, Any]:
     if not path.is_file():
         raise ProjectError(f"{root.as_posix()} 里没有 project.json；先运行 init")
     project = read_json(path)
-    if project.get("schema_version") not in (1, SCHEMA_VERSION):
+    if project.get("schema_version") not in (1, 2, SCHEMA_VERSION):
         raise ProjectError("不支持的 project schema；保留文件，不能降级覆盖")
     if writable and project.get("schema_version") != SCHEMA_VERSION:
-        raise ProjectError("migration_required：schema 1 只读；先用 migrate_project.py 预览并明确执行迁移")
+        raise ProjectError("migration_required：schema 1/2 只读；先用 migrate_project.py 预览并明确执行迁移")
     return project
 
 
@@ -265,6 +265,34 @@ def require_physics(root: Path, project: dict[str, Any], paths: list[str]) -> li
         raise ProjectError(str(error)) from error
 
 
+def review_mappings(root: Path, project: dict[str, Any], paths: list[str], stage: str) -> list[dict[str, Any]]:
+    if stage in ("package", "done"):
+        import package_post
+        return package_post.actual_output_slots(root, project, paths)
+    mappings = []
+    for relative in paths:
+        slot_id = next((final.get("slot") for final in project.get("finals") or [] if final.get("path") == relative), None)
+        if slot_id is None:
+            for entry in reversed(project.get("rounds") or []):
+                if entry.get("stage") != "scene":
+                    continue
+                declared = entry.get("review_paths") or {}
+                slot_id = next((identifier for identifier, value in declared.items() if value == relative), None)
+                round_file = project_path(root, entry["dir"] + "/round.json")
+                data = read_json(round_file) if round_file.is_file() else {}
+                actual = [item for item in data.get("items") or [] if entry["dir"] + "/" + item.get("image", "") == relative]
+                if len(actual) > 1:
+                    raise ProjectError("实际轮次图片重复绑定多个图位：" + relative)
+                if actual:
+                    slot_id = actual[0].get("review_slot_id") or actual[0].get("slot_id") or actual[0].get("id")
+                if slot_id is not None:
+                    break
+        if slot_id is None:
+            raise ProjectError("图片尚未绑定实际图位，先登记镜头或轮次：" + relative)
+        mappings.append({"slot_id": slot_id, "path": relative, "source": relative})
+    return mappings
+
+
 def require_reviews(root: Path, project: dict[str, Any], paths: list[str], stage: str, copy_path: Path | None = None) -> None:
     import review_checks
     try:
@@ -273,6 +301,18 @@ def require_reviews(root: Path, project: dict[str, Any], paths: list[str], stage
         raise ProjectError(str(error)) from error
     if result.get("blocking"):
         raise ProjectError("分类审查仍有阻断问题：" + json.dumps(result["findings"], ensure_ascii=False))
+    require_generation_paths(root, project, paths)
+    if project.get("schema_version") == SCHEMA_VERSION and stage in ("scene", "package", "done") and paths:
+        import contract_review
+        import product_contract
+        missing = product_contract.missing_requirements(project, stage)
+        if missing:
+            raise ProjectError("当前产品约定未完成：" + json.dumps(missing, ensure_ascii=False))
+        try:
+            mappings = review_mappings(root, project, paths, stage)
+            contract_review.require(root, project, paths, stage=stage, ordered_slots=mappings)
+        except contract_review.ContractReviewError as error:
+            raise ProjectError(str(error)) from error
     if result.get("not_assessed"):
         project.setdefault("review_not_assessed", {})
         for finding in result["not_assessed"]:
@@ -282,7 +322,7 @@ def require_reviews(root: Path, project: dict[str, Any], paths: list[str], stage
 
 def new_project(name: str, inputs: list[dict[str, str]]) -> dict[str, Any]:
     stamp = now()
-    return {
+    project = {
         "schema_version": SCHEMA_VERSION,
         "project_id": uuid.uuid4().hex,
         "revision": 0,
@@ -305,6 +345,33 @@ def new_project(name: str, inputs: list[dict[str, str]]) -> dict[str, Any]:
         "decision_receipts": {},
         "feedback": [],
     }
+    import product_contract
+    product_contract.initialize(project, enabled=True)
+    return project
+
+
+def require_generation_item(root: Path, project: dict[str, Any], entry: dict[str, Any], item: dict[str, Any]) -> dict[str, Any] | None:
+    if entry.get("generation_required") is not True:
+        return None
+    import generation_provenance
+    try:
+        return generation_provenance.verify_generated(root.resolve(), project, entry, item)
+    except generation_provenance.ProvenanceError as error:
+        raise ProjectError("生成来源待核对，不要重新发送调用：" + str(error)) from error
+
+
+def require_generation_paths(root: Path, project: dict[str, Any], paths: list[str]) -> None:
+    wanted = set(paths)
+    for entry in project.get("rounds") or []:
+        if entry.get("generation_required") is not True:
+            continue
+        prefix = entry["dir"] + "/"
+        if not any(path.startswith(prefix) for path in wanted):
+            continue
+        data = read_json(project_path(root, prefix + "round.json"))
+        for item in data.get("items") or []:
+            if prefix + item["image"] in wanted:
+                require_generation_item(root, project, entry, item)
 
 
 def subjects_of(project: dict[str, Any]) -> list[str]:
@@ -414,7 +481,7 @@ def ask_action(project: dict[str, Any], field: str) -> dict[str, Any]:
     return action
 
 
-def scene_slots(project: dict[str, Any]) -> list[dict[str, str]]:
+def legacy_scene_slots(project: dict[str, Any]) -> list[dict[str, str]]:
     answers = project.get("answers") or {}
     note_type = answers.get("note_type")
     subjects = subjects_of(project)
@@ -445,6 +512,13 @@ def scene_slots(project: dict[str, Any]) -> list[dict[str, str]]:
     return slots
 
 
+def scene_slots(project: dict[str, Any]) -> list[dict[str, Any]]:
+    if project.get("schema_version") == SCHEMA_VERSION and project.get("scene_plan"):
+        import scene_plan
+        return scene_plan.validate_plan(project["scene_plan"], project)["slots"]
+    return legacy_scene_slots(project)
+
+
 def mapped_scene_finals(project: dict[str, Any]) -> list[dict[str, Any]]:
     required = scene_slots(project)
     finals = [dict(final) for final in project.get("finals") or []]
@@ -463,11 +537,11 @@ def mapped_scene_finals(project: dict[str, Any]) -> list[dict[str, Any]]:
 
 def missing_scene_slots(project: dict[str, Any]) -> list[str]:
     required = scene_slots(project)
-    available = {final.get("slot") for final in mapped_scene_finals(project)}
+    available = {final.get("slot") for final in mapped_scene_finals(project) if not final.get("pending_change")}
     return [slot["id"] for slot in required if slot["id"] not in available]
 
 
-def requirement_signature(project: dict[str, Any], stage: str | None = None) -> str:
+def requirement_signature(project: dict[str, Any], stage: str | None = None, subject: str | None = None) -> str:
     answers = project.get("answers") or {}
     brief = project.get("brief") or {}
     data = {
@@ -480,7 +554,21 @@ def requirement_signature(project: dict[str, Any], stage: str | None = None) -> 
     if stage is None or stage == "scene":
         data.update(note_type=answers.get("note_type"), delivery=answers.get("delivery"))
     if stage is None:
-        data["revision"] = project.get("requirements_revision", 0) if project.get("schema_version") == 2 else project.get("revision", 0)
+        data["revision"] = project.get("requirements_revision", 0) if project.get("schema_version") in (2, SCHEMA_VERSION) else project.get("revision", 0)
+    if project.get("schema_version") == SCHEMA_VERSION:
+        import product_contract
+        if stage in PER_SUBJECT_STAGES and subject:
+            data["subjects"] = [subject]
+            data.pop("subject_scope", None)
+            data.pop("concept_count", None)
+        contract = product_contract.projection(project, subject)
+        if stage in ("concept", "material", "cutout"):
+            contract.pop("view_assets", None)
+            for specification in (contract.get("specs") or {}).values():
+                specification.pop("size", None)
+        data["product_contract"] = contract
+        if stage is None or stage == "scene":
+            data["scene_plan"] = project.get("scene_plan")
     return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
@@ -511,22 +599,46 @@ def stage_action(project: dict[str, Any]) -> dict[str, Any]:
             action["say"] = "只重出用户没通过的几张"
         return action
     if stage == "package":
-        return {"action": "package", "say": "写 copy.json，默认不在图上加字；先 dry-run，再 --prepare-review 审查排版后的实际输出，最后正式打包"}
+        return {"action": "package", "say": "写 copy.json；范围已授权可直接 --prepare-review（内含预检），实际排版输出完成独立合同验收与物理盲审后再正式打包；只诊断或预览时用 dry-run"}
     return {"action": "done", "say": "交付发帖目录和对比页，提醒合规事项，列出接下来可以做"}
 
 
 def next_action(project: dict[str, Any], root: Path | None = None) -> dict[str, Any]:
     answers = project.get("answers") or {}
-    for field in ASK_ORDER:
+    if project.get("schema_version") != SCHEMA_VERSION:
+        return {"action": "migration", "say": "旧项目只读；先预览显式迁移，保留原图、旧报告和未知规格"}
+    for field in ("product_form", "subject_scope", "concept_count"):
         if answers.get(field) in (None, "", []):
             return ask_action(project, field)
+    import product_contract
+    contract_missing = product_contract.missing_requirements(project, project.get("stage") or "concept")
+    if contract_missing:
+        missing = contract_missing[0]
+        field = missing.get("field")
+        if field in ("usage", "size"):
+            identifier = product_contract.subject_id(project, missing["subject"])
+            return {"action": "ask", "field": "product." + field + ":" + identifier,
+                    "subject": missing["subject"], "label": "主要怎么用" if field == "usage" else "设计尺度",
+                    "intro": missing["reason"], "options": [], "free_text": True,
+                    "say": "已说明的信息直接保存，只问当前缺项；可直接输入用途或本体/含扣件的设计大小，不代表量产实测"}
+        return {"action": "contract", "missing": contract_missing, "say": "先补当前产品约定，保留未知状态和已有图片"}
+    if project.get("stage") in ("scene", "package", "done"):
+        for field in ("note_type", "delivery"):
+            if answers.get(field) in (None, "", []):
+                return ask_action(project, field)
+        if not project.get("scene_plan"):
+            return {"action": "scene-plan", "say": "按当前笔记用途建立逐图镜头计划；保留正面并分配需要的新角度，不要求用户填写工程参数"}
     if answers.get("delivery") == "grid-9" and answers.get("note_type") == "series-collection" and len(subjects_of(project)) > 7:
         action = ask_action(project, "delivery")
         action["say"] = "九宫格放不下每只角色和必要场景。只问这一冲突：改整套发帖（推荐），或先减少/分组角色后仍做九宫格；不要开始生成或删掉角色图"
         action["issue"] = "grid-capacity"
         return action
     if not (project.get("image_backend") or {}).get("kind"):
-        return {"action": "backend", "say": "按 SKILL.md 的顺序选定生图能力并写入 image_backend.kind；宿主自带或已连接的能力可用时不问用户"}
+        return {"action": "backend", "say": "选择宿主原生生图并写入 image_backend.kind；不可用时保留待生成，不自动改用其他供应商"}
+    intent = next((item for item in project.get("pending_intents") or [] if item.get("status") == "pending"), None)
+    if intent:
+        return {"action": "resolve-intent", "intent": intent,
+                "say": "先读取用户补图/返修意向，解释为明确图位的增量计划；意向登记本身不等于生成或收费授权"}
     entry = open_round(project)
     if entry and entry.get("status") == "planned":
         if root is not None:
@@ -535,10 +647,21 @@ def next_action(project: dict[str, Any], root: Path | None = None) -> dict[str, 
             paths = [entry["dir"] + "/" + item["image"] for item in data.get("items") or []]
             if paths and all(project_path(root, path).is_file() for path in paths):
                 if entry.get("stage") == "scene":
+                    import contract_review
+                    contract_status = contract_review.status(root, project, paths, stage="scene",
+                                                             ordered_slots=review_mappings(root, project, paths, "scene"))
+                    if contract_status.get("blocking"):
+                        return {"action": "review", "round": entry["id"], "category": "contract", "paths": paths,
+                                "say": "图片已保存；先按当前产品、尺度和镜头约定完成独立实际图验收，不重复生成"}
                     pending = [physics_review.status(root, project, path) for path in paths]
                     if any(item["verdict"] != "pass" for item in pending):
                         return {"action": "review", "round": entry["id"], "category": "physics", "paths": paths,
                                 "say": "本轮图片已保存，先恢复已有独立物理审查；只修不通过项，不重复生成整轮"}
+                try:
+                    require_generation_paths(root, project, paths)
+                except ProjectError as error:
+                    return {"action": "reconcile-task", "round": entry["id"], "paths": paths,
+                            "say": "已有图片先核对当前生成来源与回执，不重新生图：" + str(error)}
                 return {"action": "record-round", "round": entry["id"], "paths": paths,
                         "say": "本轮图片已保存；先检查并登记已有图片，不重复调用生图"}
         return {
@@ -557,6 +680,7 @@ def next_action(project: dict[str, Any], root: Path | None = None) -> dict[str, 
         }
     if root is not None and project.get("stage") == "done":
         import review_checks
+        import contract_review
         root = root.resolve()
         paths = [item["path"] for item in project.get("finals") or []]
         result = review_checks.blocking_findings(root, project, paths, "scene")
@@ -569,6 +693,14 @@ def next_action(project: dict[str, Any], root: Path | None = None) -> dict[str, 
             return {"action": "package", "say": "已有历史状态但当前发布包不完整；先核对定稿、文案和实际输出，不重新生成未受影响图"}
         manifest = read_json(manifest_file)
         published = [(post.get("path") or "post") + "/" + item["file"] for item in manifest.get("images") or []]
+        try:
+            contract_gate = contract_review.status(root, project, published, "package",
+                                                   review_mappings(root, project, published, "package"))
+        except (ProjectError, OSError):
+            contract_gate = {"blocking": True}
+        if contract_gate.get("blocking"):
+            return {"action": "review", "stage": "package", "category": "contract", "paths": published,
+                    "say": "实际发布集合的尺度、结构或镜头覆盖尚未通过当前合同验收；保留旧包并补对应审查"}
         result = review_checks.blocking_findings(root, project, published, "package")
         if result.get("blocking"):
             return {"action": "review", "stage": "package", "findings": result["findings"],
@@ -612,6 +744,8 @@ def status_payload(project: dict[str, Any], note: str = "", root: Path | None = 
         "answers": project.get("answers"),
         "brief": project.get("brief"),
         "image_backend": project.get("image_backend"),
+        "product_contract": project.get("product_contract"),
+        "scene_plan": project.get("scene_plan"),
         "subjects": subjects_of(project),
         "rounds": [
             {key: entry.get(key) for key in ("id", "stage", "subject", "kind", "status", "pick")}
@@ -709,6 +843,7 @@ def cmd_set(args: argparse.Namespace) -> int:
     root = Path(args.project)
     project = load_project(root)
     old_answers = dict(project.get("answers") or {})
+    previous_subjects = subjects_of(project)
     old_detail = (project.get("brief") or {}).get("product_detail")
     changed = set()
     for pair in args.pairs:
@@ -733,6 +868,8 @@ def cmd_set(args: argparse.Namespace) -> int:
     if answers.get("subject_scope") in ("all", "selected") and len(answers.get("subjects") or []) > 1 \
             and not answers.get("concept_count"):
         answers["concept_count"] = len(answers["subjects"])
+    import product_contract
+    product_contract.initialize(project)
     restart = None
     for field, stage in (("product_form", "concept"), ("subjects", "concept"), ("concept_count", "concept"), ("note_type", "scene"), ("delivery", "scene")):
         if field in old_answers and old_answers.get(field) != answers.get(field):
@@ -742,11 +879,180 @@ def cmd_set(args: argparse.Namespace) -> int:
     if old_detail != (project.get("brief") or {}).get("product_detail"):
         restart = "concept"
     if restart and (project.get("rounds") or project.get("selections") or project.get("finals")):
-        invalidate_from(project, restart)
-        reset_note = f"；需求有变化，已回到 {restart}，旧图片仍保留但不再视为当前定稿"
+        inventory_only = restart == "concept" and old_answers.get("product_form") == answers.get("product_form") \
+            and old_detail == (project.get("brief") or {}).get("product_detail") \
+            and old_answers.get("note_type") == answers.get("note_type") \
+            and old_answers.get("delivery") == answers.get("delivery")
+        if inventory_only:
+            current_subjects = subjects_of(project)
+            affected_subjects = set(previous_subjects) ^ set(current_subjects)
+            invalidate_subjects(project, "concept", affected_subjects)
+            reset_note = "；主体名单已更新，保留未受影响角色与图片，相关组合待补"
+        else:
+            invalidate_from(project, restart)
+            reset_note = f"；需求有变化，已回到 {restart}，旧图片仍保留但不再视为当前定稿"
     advance(project)
     save_project(root, project)
     return emit(status_payload(project, note="已写入" + reset_note, root=root))
+
+
+def cmd_product(args: argparse.Namespace) -> int:
+    import product_contract
+    root = Path(args.project).resolve()
+    project = load_project(root, writable=True)
+    identifier = product_contract.subject_id(project, args.subject)
+    name = project["product_contract"]["subjects"][identifier]["name"]
+    values = read_json(Path(args.file))
+    previous = product_contract.signature(project, args.subject)
+    result = product_contract.set_spec(project, args.subject, values, args.spec)
+    if previous != product_contract.signature(project, args.subject):
+        project.pop("post", None)
+        project.setdefault("contract_changes", []).append({"subject": args.subject, "spec_id": result["spec_id"],
+            "before": previous, "after": result["signature"], "at": now()})
+        affected_slots = affected_scene_slots(project, {name, identifier})
+        for final in project.get("finals") or []:
+            if final.get("slot") in affected_slots:
+                final["pending_change"] = True
+        if "structure" in values:
+            invalidate_subjects(project, "material", {name})
+        elif project.get("stage") in ("scene", "package", "done"):
+            project["stage"] = "scene"
+    save_project(root, project)
+    return emit({**status_payload(project, note="已保存产品用途与设计尺度；未生成图片", root=root), "product": result})
+
+
+def cmd_view(args: argparse.Namespace) -> int:
+    import product_contract
+    root = Path(args.project).resolve()
+    project = load_project(root, writable=True)
+    if args.action == "record":
+        if not all((args.subject, args.view, args.path)):
+            raise ProjectError("view record 需要 --subject、--view 与 --path")
+        asset = product_contract.record_view(root, project, args.subject, args.view, args.path, args.origin, args.spec)
+    else:
+        if not args.asset or not args.evidence.strip():
+            raise ProjectError("view confirm 需要 --asset 与非空 --evidence")
+        asset = product_contract.confirm_view(root, project, args.asset, args.origin, args.evidence)
+    save_project(root, project)
+    return emit({"ok": True, "view_asset": asset, "revision": project["revision"], "next": next_action(project, root)})
+
+
+def cmd_scene_plan(args: argparse.Namespace) -> int:
+    import scene_plan
+    root = Path(args.project).resolve()
+    project = load_project(root, writable=True)
+    if project.get("scene_plan"):
+        if args.file:
+            raise ProjectError("已有镜头计划须用 scene-patch 增量修改，不能整组覆盖")
+        return emit({"ok": True, "scene_plan": project["scene_plan"], "signature": scene_plan.plan_hash(project["scene_plan"])})
+    if not (project.get("answers") or {}).get("note_type") or not (project.get("answers") or {}).get("delivery"):
+        raise ProjectError("先确认笔记类型和交付形式，再规划实际图位")
+    plan = scene_plan.validate_plan(read_json(Path(args.file)), project) if args.file else scene_plan.default_plan(project, legacy_scene_slots(project))
+    if not scene_plan.coverage_status(plan)["complete"]:
+        raise ProjectError("镜头计划缺少约定的视角覆盖，先补计划")
+    project["scene_plan"] = plan
+    save_project(root, project)
+    return emit({"ok": True, "scene_plan": plan, "signature": scene_plan.plan_hash(plan), "revision": project["revision"]})
+
+
+def cmd_scene_patch(args: argparse.Namespace) -> int:
+    import scene_plan
+    root = Path(args.project).resolve()
+    project = load_project(root, writable=True)
+    patch = read_json(Path(args.file))
+    patch_fingerprint = hashlib.sha256(json.dumps(patch, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    for change in reversed(project.get("scene_changes") or []):
+        if patch.get("request_id") and (change.get("patch") or {}).get("request_id") == patch["request_id"] \
+                and change.get("patch_fingerprint") != patch_fingerprint:
+            raise ProjectError("镜头补丁 request_id 冲突，同一请求不能修改内容或授权范围")
+        if change.get("patch_fingerprint") == patch_fingerprint:
+            if scene_plan.plan_hash(project["scene_plan"]) != change["impact"]["after_hash"]:
+                raise ProjectError("镜头补丁已经执行，后续计划已变化；保留原回执并重新规划，不能重放")
+            return emit({"ok": True, "unchanged": True, "committed": True, "request_id": patch.get("request_id"), "impact": change["impact"],
+                         "scene_plan": project["scene_plan"], "revision": project["revision"], "next": next_action(project, root)})
+    hashes = {final["slot"]: hashlib.sha256(project_path(root, final["path"]).read_bytes()).hexdigest()
+              for final in project.get("finals") or [] if final.get("slot")}
+    updated, impact = scene_plan.apply_patch(project, patch, baseline_hashes=hashes)
+    changed = set(impact["invalidated_slots"])
+    for final in updated.get("finals") or []:
+        if final.get("slot") in changed:
+            final["pending_change"] = True
+    updated.setdefault("scene_changes", []).append({"patch": patch, "patch_fingerprint": patch_fingerprint, "impact": impact, "at": now()})
+    updated.pop("post", None)
+    if updated.get("stage") in ("package", "done"):
+        updated["stage"] = "scene"
+    save_project(root, updated)
+    return emit({"ok": True, "committed": True, "request_id": patch.get("request_id"), "impact": impact, "scene_plan": updated["scene_plan"], "revision": updated["revision"], "next": next_action(updated, root)})
+
+
+def compile_scene(root: Path, project: dict[str, Any], slot_id: str) -> dict[str, Any]:
+    import product_contract
+    import scene_plan
+    missing = product_contract.missing_requirements(project, "scene")
+    if missing:
+        raise ProjectError("场景前产品约定待补：" + json.dumps(missing, ensure_ascii=False))
+    compiled = scene_plan.compile_slot(project, slot_id)
+    slot = next(item for item in scene_slots(project) if item["id"] == slot_id)
+    for pointer in ([slot["spec_ref"]] if slot.get("spec_ref") else []) + slot.get("spec_refs", []):
+        if pointer.startswith("/product_contract/specs/"):
+            spec_id = pointer.split("/")[3].replace("~1", "/").replace("~0", "~")
+            spec = project["product_contract"]["specs"][spec_id]
+            if spec["usage"].get("status") != "confirmed" or not spec["usage"].get("text", "").strip() \
+                    or spec["size"].get("status") != "confirmed" or spec["size"].get("mode") == "unknown":
+                raise ProjectError("本图位引用的款式用途或设计尺度未确认：" + spec_id)
+    for binding in compiled["bindings"]:
+        path = project_path(root, binding["path"])
+        if not path.is_file():
+            raise ProjectError("实际参考图缺失：" + binding["path"])
+        digest_value = hashlib.sha256(path.read_bytes()).hexdigest()
+        if binding.get("sha256") and binding["sha256"] != digest_value:
+            raise ProjectError("参考图已变化：" + binding["path"])
+        binding["sha256"] = digest_value
+    compiled["signature"] = hashlib.sha256(json.dumps({key: value for key, value in compiled.items() if key != "signature"}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    return compiled
+
+
+def cmd_compile(args: argparse.Namespace) -> int:
+    root = Path(args.project).resolve()
+    project = load_project(root)
+    return emit({"ok": True, "compiled": compile_scene(root, project, args.slot)})
+
+
+def cmd_task(args: argparse.Namespace) -> int:
+    import generation_tasks
+    root = Path(args.project).resolve()
+    project = load_project(root, writable=True)
+    if args.action == "prepare":
+        if not args.slot or not args.intent:
+            raise ProjectError("task prepare 需要 --slot 与 --intent")
+        compiled = read_json(Path(args.file)) if args.file else compile_scene(root, project, args.slot)
+        plan = generation_tasks.prepare(root, project, args.slot, args.intent, compiled,
+            {"kind": "builtin", "tool": "image_gen.imagegen"}, {"approved": args.authorized})
+        write_json(root / "generation-plans" / (plan["task_id"] + ".json"), plan)
+        return emit({"ok": True, "plan": plan, "plan_file": "generation-plans/" + plan["task_id"] + ".json"})
+    if args.action == "begin":
+        if not args.plan:
+            raise ProjectError("task begin 需要 --plan")
+        return emit({"ok": True, **generation_tasks.begin(root, read_json(project_path(root, args.plan)), authorization={"approved": args.authorized}, retry=args.retry)})
+    if not args.task_id:
+        raise ProjectError("task complete/unknown/status 需要 --task-id")
+    if args.action == "complete":
+        if not args.output:
+            raise ProjectError("task complete 需要至少一个 --output")
+        request = args.tool_request
+        metadata = None
+        if not request:
+            digests = [hashlib.sha256(project_path(root, relative).read_bytes()).hexdigest() for relative in args.output]
+            artifact_digest = digests[0] if len(digests) == 1 else hashlib.sha256(json.dumps(sorted(digests)).encode()).hexdigest()
+            request = "local-artifact:" + artifact_digest
+            metadata = {"receipt_kind": "local-artifact", "server_request_id": None,
+                        "claim_boundary": "本地输出摘要不是服务端请求标识"}
+        return emit({"ok": True, **generation_tasks.complete(root, args.task_id, args.output, claim_id=args.claim, tool_request_id=request, metadata=metadata)})
+    if args.action == "unknown":
+        return emit({"ok": True, **generation_tasks.unknown(root, args.task_id, args.reason, claim_id=args.claim)})
+    if args.action == "failed":
+        return emit({"ok": True, **generation_tasks.failed(root, args.task_id, args.reason, claim_id=args.claim, retryable=args.retryable)})
+    return emit({"ok": True, **generation_tasks.resume_status(root, args.task_id)})
 
 
 def invalidate_from(project: dict[str, Any], stage: str) -> None:
@@ -764,6 +1070,37 @@ def invalidate_from(project: dict[str, Any], stage: str) -> None:
     project["stage"] = STAGES[min(STAGES.index(current), STAGES.index(stage))]
 
 
+def affected_scene_slots(project: dict[str, Any], subjects: set[str]) -> set[str]:
+    contract_subjects = (project.get("product_contract") or {}).get("subjects") or {}
+    identifiers = subjects | {identifier for identifier, value in contract_subjects.items() if value.get("name") in subjects}
+    affected = set()
+    for slot in scene_slots(project):
+        names = set(slot.get("subjects") or ([slot["subject"]] if slot.get("subject") else []))
+        if not names or names & identifiers:
+            affected.add(slot["id"])
+    return affected
+
+
+def invalidate_subjects(project: dict[str, Any], stage: str, subjects: set[str]) -> None:
+    if not subjects:
+        return
+    affected_stages = set(STAGES[STAGES.index(stage):])
+    chosen = project.setdefault("selections", {})
+    for affected_stage in affected_stages & {"concept", "material", "cutout"}:
+        for subject in subjects:
+            (chosen.get(affected_stage) or {}).pop(subject, None)
+    affected_slots = affected_scene_slots(project, subjects)
+    for final in project.get("finals") or []:
+        if final.get("slot") in affected_slots:
+            final["pending_change"] = True
+    for entry in project.get("rounds") or []:
+        if entry.get("stage") in affected_stages and entry.get("subject") in subjects:
+            entry["status"] = "superseded"
+    project.pop("post", None)
+    current = project.get("stage") or "concept"
+    project["stage"] = STAGES[min(STAGES.index(current), STAGES.index(stage))]
+
+
 def cmd_accept_input(args: argparse.Namespace) -> int:
     root = Path(args.project).resolve()
     project = load_project(root)
@@ -776,18 +1113,53 @@ def cmd_accept_input(args: argparse.Namespace) -> int:
     for prerequisite in STAGES[:STAGES.index(args.stage)]:
         if not stage_complete(project, prerequisite):
             raise ProjectError(f"先完成 {prerequisite}，再登记 {args.stage}；不能跳过已要求的确认")
-    invalidate_from(project, STAGES[STAGES.index(args.stage) + 1])
+    if args.stage == "cutout":
+        evidence = getattr(args, "evidence", "").strip()
+        if not evidence:
+            raise ProjectError("采用已有透明资产需要非空 --evidence，说明真实批准或用户授权模拟决策的依据；--origin 必须如实声明")
+        import check_images
+        checks = argparse.Namespace(alpha=True, ratio=None, tolerance=0.02, min_side=0)
+        if not check_images.inspect(path, checks)["ok"]:
+            raise ProjectError("已认可透明资产仍须通过真 alpha 检查")
+        import review_checks
+        relative = path.relative_to(root).as_posix()
+        try:
+            identity = review_checks.status(root, project, "identity", [relative])
+        except review_checks.ReviewError as error:
+            raise ProjectError(str(error)) from error
+        if identity.get("verdict") != "pass":
+            raise ProjectError("已有透明资产需要逐图覆盖当前参考的独立 identity 审查通过：" + json.dumps(identity, ensure_ascii=False))
+        require_reviews(root, project, [relative], "cutout")
+    if args.stage == "scene":
+        if not project.get("scene_plan"):
+            raise ProjectError("先确认镜头计划，才能采用已有场景基准")
+        cover = next((slot for slot in scene_slots(project) if slot.get("role") == "cover"), None)
+        if cover is None:
+            raise ProjectError("场景基准缺少封面图位")
+        require_physics(root, project, [args.path])
+        import contract_review
+        contract_review.require(root, project, [args.path], stage="scene",
+                                ordered_slots=[{"slot_id": cover["id"], "path": args.path, "source": args.path}])
+        selections(project, "scene")["_"] = {"round": "input", "item": "accepted", "image": args.path, "origin": args.origin}
+        project["stage"] = "scene"
+        save_project(root, project)
+        return emit(status_payload(project, note="已采用经过审查的真实场景基准；没有生成新图", root=root))
+    first = subjects_of(project)[0]
+    downstream_subjects = set(subjects_of(project)) if subject == first and subject in selections(project, args.stage) else {subject}
+    invalidate_subjects(project, STAGES[STAGES.index(args.stage) + 1], downstream_subjects)
     chosen = selections(project, args.stage)
     if subject in chosen and subject == subjects_of(project)[0]:
         chosen.clear()
     for entry in project.get("rounds") or []:
         if entry.get("stage") == args.stage and (entry.get("subject") == subject or not chosen):
             entry["status"] = "superseded"
-    selections(project, args.stage)[subject] = {"round": "input", "item": "accepted", "image": path.relative_to(root).as_posix()}
+    selections(project, args.stage)[subject] = {"round": "input", "item": "accepted", "image": path.relative_to(root).as_posix(), "origin": args.origin}
+    if args.stage == "cutout":
+        selections(project, args.stage)[subject]["evidence"] = evidence
     project["stage"] = args.stage
     advance(project)
     save_project(root, project)
-    return emit(status_payload(project, note="已登记用户明确确认的输入图；没有调用生图", root=root))
+    return emit(status_payload(project, note="已按声明来源登记输入图；没有调用生图", root=root))
 
 
 def stage_refs(project: dict[str, Any], stage: str, subject: str | None) -> dict[str, list[str]]:
@@ -829,6 +1201,12 @@ def cmd_new_round(args: argparse.Namespace) -> int:
     stage = args.stage
     if stage not in STAGES[:4]:
         raise ProjectError("--stage 只能是 concept、material、cutout、scene")
+    import product_contract
+    missing = product_contract.missing_requirements(project, stage, args.subject)
+    if missing:
+        raise ProjectError("当前阶段产品约定待补：" + json.dumps(missing, ensure_ascii=False))
+    if stage == "scene" and not project.get("scene_plan"):
+        raise ProjectError("先运行 scene-plan 确认逐图镜头、用途与覆盖，再生成场景")
     subjects = subjects_of(project)
     subject = args.subject
     if stage in PER_SUBJECT_STAGES:
@@ -870,6 +1248,12 @@ def cmd_new_round(args: argparse.Namespace) -> int:
                 slots = [slot for slot in slots if slot["subject"] not in chosen] or slots
         else:
             slots = scene_slots(project)
+            if not args.slots:
+                pending = set(missing_scene_slots(project))
+                if pending:
+                    slots = [slot for slot in slots if slot["id"] in pending]
+                elif project.get("finals"):
+                    raise ProjectError("已有整套定稿；请先用 scene-patch 声明追加或具体修改范围")
         if args.slots:
             wanted = [value.strip() for value in args.slots.split(",") if value.strip()]
             known = {slot["id"]: slot for slot in slots}
@@ -882,6 +1266,16 @@ def cmd_new_round(args: argparse.Namespace) -> int:
             if slot.get("subject"):
                 item["refs"] = subject_ref(project, slot["subject"])
             items.append(item)
+    if stage == "scene":
+        if kind == "alternatives":
+            cover = next((slot for slot in scene_slots(project) if slot.get("role") == "cover"), scene_slots(project)[0])
+            compiled = compile_scene(root.resolve(), project, cover["id"])
+            for item in items:
+                item.update(slot_id=cover["id"], compiled=compiled, reference_bindings=compiled["bindings"])
+        else:
+            for item in items:
+                compiled = compile_scene(root.resolve(), project, item["id"])
+                item.update(prompt=compiled["prompt"], compiled=compiled, reference_bindings=compiled["bindings"])
     rounds = project.setdefault("rounds", [])
     suffix = f"-s{subjects.index(subject) + 1}" if stage in PER_SUBJECT_STAGES and subject else ""
     if stage == "scene" and kind == "set":
@@ -894,7 +1288,8 @@ def cmd_new_round(args: argparse.Namespace) -> int:
         chosen = selections(project, stage)
         replacing = subject in chosen
         if replacing:
-            invalidate_from(project, STAGES[STAGES.index(stage) + 1])
+            affected_subjects = set(subjects) if subject == subjects[0] else {subject}
+            invalidate_subjects(project, STAGES[STAGES.index(stage) + 1], affected_subjects)
             chosen = selections(project, stage)
             if subject == subjects[0]:
                 chosen.clear()
@@ -906,15 +1301,16 @@ def cmd_new_round(args: argparse.Namespace) -> int:
     elif stage == "cutout":
         chosen = selections(project, "cutout")
         if any(item["subject"] in chosen for item in items):
-            invalidate_from(project, "scene")
+            invalidate_subjects(project, "scene", {item["subject"] for item in items})
             for item in items:
                 chosen.pop(item["subject"], None)
     elif stage == "scene":
         if kind == "alternatives":
-            invalidate_from(project, "scene")
+            if project.get("finals"):
+                raise ProjectError("已确认场景后不重置全组风格；用 scene-patch 修改明确范围")
         else:
             wanted = {item["id"] for item in items}
-            project["finals"] = [final for final in mapped_scene_finals(project) if final.get("slot") not in wanted]
+            project["finals"] = [dict(final, pending_change=True) if final.get("slot") in wanted else final for final in mapped_scene_finals(project)]
             project.pop("post", None)
     for entry in rounds:
         if entry.get("status") in ("planned", "recorded"):
@@ -929,11 +1325,26 @@ def cmd_new_round(args: argparse.Namespace) -> int:
         "note": args.note or "",
         "created_at": now(),
         "refs": refs,
-        "requirements": requirement_signature(project, stage),
+        "requirements": requirement_signature(project, stage, subject),
         "items": items,
     }
     write_json(round_dir / "round.json", data)
-    rounds.append({"id": round_id, "stage": stage, "subject": subject, "kind": kind, "dir": f"rounds/{round_id}", "status": "planned"})
+    entry = {"id": round_id, "stage": stage, "subject": subject, "kind": kind, "dir": f"rounds/{round_id}", "status": "planned", "generation_required": True}
+    if stage == "scene":
+        review_slots = []
+        review_paths = {}
+        for item in items:
+            if kind == "alternatives":
+                reviewed = copy.deepcopy(cover)
+                reviewed["id"] = round_id + "-" + item["id"]
+                review_slots.append(reviewed)
+                item["review_slot_id"] = reviewed["id"]
+            else:
+                item["review_slot_id"] = item["id"]
+            review_paths[item["review_slot_id"]] = f"rounds/{round_id}/" + item["image"]
+        entry.update(review_slots=review_slots, review_paths=review_paths)
+        write_json(round_dir / "round.json", data)
+    rounds.append(entry)
     project["stage"] = stage
     save_project(root, project)
     return emit({
@@ -950,7 +1361,8 @@ def cmd_new_round(args: argparse.Namespace) -> int:
 
 def is_image(path: Path) -> bool:
     try:
-        head = path.read_bytes()[:12]
+        with path.open("rb") as stream:
+            head = stream.read(12)
     except OSError:
         return False
     return head.startswith(IMAGE_MAGIC[:2]) or (head.startswith(b"RIFF") and head[8:12] == b"WEBP")
@@ -965,8 +1377,16 @@ def project_path(root: Path, relative: str) -> Path:
 
 def round_eligibility(root: Path, project: dict[str, Any], entry: dict[str, Any]) -> dict[str, dict[str, Any]]:
     data = read_json(project_path(root, entry["dir"] + "/round.json"))
-    stale = bool(data.get("requirements") and data["requirements"] != requirement_signature(project, entry["stage"]))
+    stale = bool(data.get("requirements") and data["requirements"] != requirement_signature(project, entry["stage"], entry.get("subject")))
     results = {}
+    contract_blocked = False
+    if entry.get("stage") == "scene":
+        import contract_review
+        paths = [entry["dir"] + "/" + item["image"] for item in data.get("items") or []
+                 if project_path(root, entry["dir"] + "/" + item["image"]).is_file()]
+        if paths:
+            gate = contract_review.status(root, project, paths, "scene", review_mappings(root, project, paths, "scene"))
+            contract_blocked = gate.get("blocking", False)
     for item in data.get("items") or []:
         relative = entry["dir"] + "/" + item.get("image", "")
         reason = ""
@@ -977,6 +1397,7 @@ def round_eligibility(root: Path, project: dict[str, Any], entry: dict[str, Any]
                 reason = "图片缺失或不可读取"
             else:
                 digest_value = hashlib.sha256(path.read_bytes()).hexdigest()
+                require_generation_item(root, project, entry, item)
                 if entry["stage"] == "scene":
                     require_physics(root, project, [relative])
                 if entry["stage"] == "cutout":
@@ -995,6 +1416,8 @@ def round_eligibility(root: Path, project: dict[str, Any], entry: dict[str, Any]
             reason = str(error)
         if stale:
             reason = "需求已变化，本轮已失效"
+        if contract_blocked:
+            reason = "当前整批实际图片的产品合同验收未通过或已失效"
         if entry.get("status") != "recorded":
             reason = "本轮尚未登记或已选定/失效"
         results[item["id"]] = {"selectable": not reason, "disabled_reason": reason, "image_sha256": digest_value}
@@ -1013,7 +1436,7 @@ def cmd_record_round(args: argparse.Namespace) -> int:
         raise ProjectError("这轮已通过或已失效；重做请建新轮，不能重新激活旧轮")
     round_file = root / entry["dir"] / "round.json"
     data = read_json(round_file)
-    if data.get("requirements") and data["requirements"] != requirement_signature(project, entry["stage"]):
+    if data.get("requirements") and data["requirements"] != requirement_signature(project, entry["stage"], entry.get("subject")):
         raise ProjectError("这轮需求已变化；先建立当前需求的新轮")
     items = data.get("items") or []
     problems = []
@@ -1045,6 +1468,9 @@ def cmd_record_round(args: argparse.Namespace) -> int:
         if path.is_file():
             if not is_image(path):
                 raise ProjectError(f"{item['image']} 不是 PNG、JPEG 或 WEBP 图片")
+            provenance = require_generation_item(root, project, entry, item)
+            if provenance is not None:
+                item["provenance"] = provenance
             if entry["stage"] == "scene":
                 require_physics(root, project, [f"{entry['dir']}/{item['image']}"])
             item["status"] = "generated"
@@ -1070,10 +1496,15 @@ def cmd_select(args: argparse.Namespace) -> int:
     if entry.get("status") != "recorded":
         raise ProjectError("先运行 record-round 校验这一轮；旧轮或尚未登记的轮次不能直接选定")
     data = read_json(root / entry["dir"] / "round.json")
-    if data.get("requirements") and data["requirements"] != requirement_signature(project, entry["stage"]):
+    if data.get("requirements") and data["requirements"] != requirement_signature(project, entry["stage"], entry.get("subject")):
         raise ProjectError("这轮对应的需求已变化，不能采用旧图")
     items = {item["id"]: item for item in data.get("items") or []}
     stage = entry["stage"]
+    require_generation_paths(root, project, [f"{entry['dir']}/{item['image']}" for item in items.values()
+                                            if project_path(root, f"{entry['dir']}/{item['image']}").is_file()])
+    if stage == "scene":
+        require_reviews(root, project, [f"{entry['dir']}/{item['image']}" for item in items.values()
+                                       if project_path(root, f"{entry['dir']}/{item['image']}").is_file()], "scene")
     eligibility = round_eligibility(root, project, entry)
     origin = getattr(args, "origin", "user-confirmed")
     if origin not in {"user-confirmed", "agent-inferred", "reference-derived"}:
@@ -1151,8 +1582,10 @@ def cmd_final(args: argparse.Namespace) -> int:
     project = load_project(root)
     if not project_path(root, args.path).is_file():
         raise ProjectError(f"{args.path} 不存在；路径相对于项目目录")
+    if not args.slot or args.slot not in {slot["id"] for slot in scene_slots(project)}:
+        raise ProjectError("手动定稿必须指定镜头计划中真实存在的 --slot")
+    require_generation_paths(root, project, [args.path])
     require_physics(root, project, [args.path])
-    require_reviews(root, project, [args.path], "scene")
     record = {"role": args.role, "path": Path(args.path).as_posix()}
     if args.subject:
         record["subject"] = args.subject
@@ -1164,6 +1597,7 @@ def cmd_final(args: argparse.Namespace) -> int:
     project["finals"] = finals
     finals[:] = [item for item in finals if item.get("path") != record["path"] and not (args.slot and item.get("slot") == args.slot)]
     finals.append(record)
+    require_reviews(root, project, [args.path], "scene")
     project.pop("post", None)
     if (project.get("answers") or {}).get("note_type"):
         project["stage"] = "package" if not missing_scene_slots(project) else "scene"
@@ -1229,7 +1663,21 @@ def submit_decision(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
             field = payload.get("field")
             if next_step.get("action") != "ask" or next_step.get("field") != field or payload.get("round_id"):
                 raise ProjectError("stale_question：只能回答当前唯一缺失问题")
-            _invoke(cmd_set, argparse.Namespace(project=str(root), pairs=[field + "=" + json.dumps(payload.get("value"), ensure_ascii=False)]))
+            if field.startswith("product."):
+                import product_contract
+                kind, _, identifier = field.removeprefix("product.").partition(":")
+                value = payload.get("value")
+                if not isinstance(value, str) or not value.strip():
+                    raise ProjectError("请填写用途或设计尺度")
+                if kind == "usage":
+                    values = {"usage": {"text": value.strip(), "status": "confirmed", "origin": origin}}
+                else:
+                    size = product_contract.size_from_text(value)
+                    values = {"size": {**size, "status": "confirmed", "origin": origin, "evidence_kind": "design_target"}}
+                product_contract.set_spec(project, identifier, values)
+                save_project(root, project)
+            else:
+                _invoke(cmd_set, argparse.Namespace(project=str(root), pairs=[field + "=" + json.dumps(payload.get("value"), ensure_ascii=False)]))
         else:
             entry = open_round(project)
             if not entry or entry["id"] != payload.get("round_id") or manifest.get("round_id") != entry["id"]:
@@ -1324,17 +1772,17 @@ def migration_plan(root: Path) -> dict[str, Any]:
     root = root.resolve()
     project = load_project(root)
     digest_value = hashlib.sha256((root / "project.json").read_bytes()).hexdigest()
-    return {"schema_version": 1, "project": str(root), "from_schema": project["schema_version"], "to_schema": 2, "project_sha256": digest_value, "already_migrated": project["schema_version"] == 2, "changes": [] if project["schema_version"] == 2 else ["增加稳定项目ID与业务revision", "保留旧需求签名和全部未知字段", "新增空交付索引与回执；不伪造历史展示"], "backup": "backups/migrations/" + digest_value + "/project.json"}
+    return {"schema_version": 1, "project": str(root), "from_schema": project["schema_version"], "to_schema": SCHEMA_VERSION, "project_sha256": digest_value, "already_migrated": project["schema_version"] == SCHEMA_VERSION, "changes": [] if project["schema_version"] == SCHEMA_VERSION else ["增加稳定主体、产品约定与增量镜头计划", "保留旧需求签名、图片、确认来源和全部未知字段", "用途、尺寸和隐藏面缺项保持未知；旧报告不自动取得新合同资格"], "backup": "backups/migrations/" + digest_value + "/project.json"}
 
 
 def apply_migration(root: Path, plan: dict[str, Any]) -> dict[str, Any]:
     root = root.resolve()
     with project_lock(root):
         project = load_project(root)
-        if plan.get("schema_version") != 1 or plan.get("project") != str(root) or plan.get("to_schema") != 2:
+        if plan.get("schema_version") != 1 or plan.get("project") != str(root) or plan.get("to_schema") != SCHEMA_VERSION:
             raise ProjectError("invalid_migration_plan：计划目标不正确")
-        if project["schema_version"] == 2:
-            return {"ok": True, "unchanged": True, "schema_version": 2}
+        if project["schema_version"] == SCHEMA_VERSION:
+            return {"ok": True, "unchanged": True, "schema_version": SCHEMA_VERSION}
         digest_value = hashlib.sha256((root / "project.json").read_bytes()).hexdigest()
         if digest_value != plan.get("project_sha256") or plan != migration_plan(root):
             raise ProjectError("stale_migration_plan：项目或计划已变化")
@@ -1344,7 +1792,8 @@ def apply_migration(root: Path, plan: dict[str, Any]) -> dict[str, Any]:
             raise ProjectError("迁移备份冲突，拒绝覆盖")
         if not backup.exists():
             shutil.copyfile(root / "project.json", backup)
-        project["schema_version"] = 2
+        previous_schema = project["schema_version"]
+        project["schema_version"] = SCHEMA_VERSION
         project["requirements_revision"] = project.get("revision", 0)
         project.setdefault("project_id", uuid.uuid4().hex)
         project.setdefault("revision", 0)
@@ -1354,9 +1803,11 @@ def apply_migration(root: Path, plan: dict[str, Any]) -> dict[str, Any]:
         project.setdefault("pending_intents", [])
         project.setdefault("feedback", [])
         project.setdefault("brief", {}).setdefault("decisions", [])
-        project["migration"] = {"from_schema": 1, "at": now(), "backup": plan["backup"], "source_sha256": digest_value}
+        import product_contract
+        product_contract.initialize(project, enabled=True)
+        project["migration"] = {"from_schema": previous_schema, "at": now(), "backup": plan["backup"], "source_sha256": digest_value}
         write_json(root / "project.json", project)
-        return {"ok": True, "schema_version": 2, "backup": str(backup), "unchanged_images": True}
+        return {"ok": True, "schema_version": SCHEMA_VERSION, "backup": str(backup), "unchanged_images": True}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1376,11 +1827,58 @@ def build_parser() -> argparse.ArgumentParser:
     setter.add_argument("project")
     setter.add_argument("pairs", nargs="+")
     setter.set_defaults(func=cmd_set)
-    accept = sub.add_parser("accept-input", help="登记用户已明确确认的概念或材质输入图，不调用生图")
+    product = sub.add_parser("product", help="保存用户已给出的自由用途、尺度目标与结构")
+    product.add_argument("project")
+    product.add_argument("--subject", required=True)
+    product.add_argument("--spec")
+    product.add_argument("--file", required=True)
+    product.set_defaults(func=cmd_product)
+    view = sub.add_parser("view", help="登记或明确确认已有视图；来源不因确认而改写")
+    view.add_argument("project")
+    view.add_argument("action", choices=("record", "confirm"))
+    view.add_argument("--subject")
+    view.add_argument("--spec")
+    view.add_argument("--view", choices=("front", "three-quarter", "left", "right", "back", "detail"))
+    view.add_argument("--path")
+    view.add_argument("--asset")
+    view.add_argument("--origin", required=True, choices=("user-confirmed", "agent-inferred", "reference-derived"))
+    view.add_argument("--evidence", default="")
+    view.set_defaults(func=cmd_view)
+    planner = sub.add_parser("scene-plan", help="建立或查看实际逐图镜头计划")
+    planner.add_argument("project")
+    planner.add_argument("--file")
+    planner.set_defaults(func=cmd_scene_plan)
+    patcher = sub.add_parser("scene-patch", help="以明确范围追加、编辑、替换或重排，不覆盖无关图位")
+    patcher.add_argument("project")
+    patcher.add_argument("--file", required=True)
+    patcher.set_defaults(func=cmd_scene_patch)
+    compiler = sub.add_parser("compile", help="查看某图位独立提示词与真实参考绑定")
+    compiler.add_argument("project")
+    compiler.add_argument("--slot", required=True)
+    compiler.set_defaults(func=cmd_compile)
+    task = sub.add_parser("task", help="在调用原生生图前登记任务并安全恢复")
+    task.add_argument("project")
+    task.add_argument("action", choices=("prepare", "begin", "complete", "unknown", "failed", "status"))
+    task.add_argument("--slot")
+    task.add_argument("--intent")
+    task.add_argument("--file")
+    task.add_argument("--plan")
+    task.add_argument("--task-id")
+    task.add_argument("--authorized", action="store_true")
+    task.add_argument("--retry", action="store_true")
+    task.add_argument("--retryable", action="store_true")
+    task.add_argument("--claim")
+    task.add_argument("--output", action="append")
+    task.add_argument("--tool-request")
+    task.add_argument("--reason", default="调用结果未确认，请核对工具回执")
+    task.set_defaults(func=cmd_task)
+    accept = sub.add_parser("accept-input", help="登记已有明确认可的真实资产；透明/场景仍检查必要门槛")
     accept.add_argument("project")
-    accept.add_argument("--stage", required=True, choices=PER_SUBJECT_STAGES)
+    accept.add_argument("--stage", required=True, choices=("concept", "material", "cutout", "scene"))
     accept.add_argument("--subject")
     accept.add_argument("--path", required=True, help="项目内的图片路径")
+    accept.add_argument("--origin", choices=("user-confirmed", "agent-inferred", "reference-derived"), default="user-confirmed", help="如实声明来源；用户授权的模拟或推断决策用 agent-inferred，不得冒充真人批准")
+    accept.add_argument("--evidence", default="", help="cutout 必填：真实批准或用户授权模拟决策的依据；不能代替独立身份审查")
     accept.set_defaults(func=cmd_accept_input)
     new = sub.add_parser("new-round", help="开新一轮")
     new.add_argument("project")

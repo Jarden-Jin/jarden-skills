@@ -1,3 +1,5 @@
+"""Synthetic delivery fixtures exercise protocols without actual visual acceptance."""
+
 from __future__ import annotations
 
 import hashlib
@@ -22,6 +24,7 @@ import present_round
 import project
 import runtime_activity
 import update_runtime
+import contract_fixtures
 
 
 class DeliveryTests(unittest.TestCase):
@@ -33,9 +36,9 @@ class DeliveryTests(unittest.TestCase):
         picture = Image.new("RGB", (180, 240), (238, 226, 195))
         ImageDraw.Draw(picture).ellipse((38, 30, 142, 190), fill=(245, 241, 223), outline=(117, 92, 69), width=3)
         picture.save(self.image)
-        self.make_v2()
+        self.make_current()
 
-    def make_v2(self):
+    def make_current(self):
         (self.root / "inputs").mkdir(parents=True)
         shutil.copyfile(self.image, self.root / "inputs" / "source.png")
         directory = self.root / "rounds" / "01-concept-s1"
@@ -43,7 +46,7 @@ class DeliveryTests(unittest.TestCase):
         for identifier in ("A", "B", "C"):
             shutil.copyfile(self.image, directory / f"{identifier}.png")
         project_state = {
-            "schema_version": 2,
+            "schema_version": project.SCHEMA_VERSION,
             "project_id": "project-delivery-fixture",
             "revision": 9,
             "requirements_revision": 9,
@@ -67,8 +70,11 @@ class DeliveryTests(unittest.TestCase):
             "decision_receipts": {},
             "feedback": [],
         }
+        project.atomic_json(self.root / "project.json", project_state)
+        contract_fixtures.configure(self.root)
+        project_state = self.data()
         round_data = {
-            "schema_version": 1,
+            "schema_version": project.SCHEMA_VERSION,
             "id": "01-concept-s1",
             "stage": "concept",
             "subject": "小米团",
@@ -76,7 +82,7 @@ class DeliveryTests(unittest.TestCase):
             "based_on": "",
             "note": "只调整毛感，保留圆眼睛与左耳缺口",
             "created_at": "2026-11-08T10:01:00+08:00",
-            "requirements": project.requirement_signature(project_state, "concept"),
+            "requirements": project.requirement_signature(project_state, "concept", "小米团"),
             "items": [
                 {"id": identifier, "title": title, "idea": idea, "prompt": prompt, "image": f"{identifier}.png", "status": "generated"}
                 for identifier, title, idea, prompt in (
@@ -86,8 +92,25 @@ class DeliveryTests(unittest.TestCase):
                 )
             ],
         }
-        project.atomic_json(self.root / "project.json", project_state)
         project.atomic_json(directory / "round.json", round_data)
+
+    def make_legacy(self, schema):
+        state = self.data()
+        state["schema_version"] = schema
+        state["revision"] = 0
+        state.pop("product_contract", None)
+        state.pop("scene_plan", None)
+        if schema == 1:
+            state.pop("project_id", None)
+        else:
+            state.setdefault("project_id", "project-delivery-fixture")
+        project.atomic_json(self.root / "project.json", state)
+        entry = state["rounds"][0]
+        round_file = self.root / entry["dir"] / "round.json"
+        data = project.read_json(round_file)
+        data["schema_version"] = schema
+        data["requirements"] = project.requirement_signature(state, entry["stage"], entry.get("subject"))
+        project.atomic_json(round_file, data)
 
     def data(self):
         return project.load_project(self.root, writable=False)
@@ -99,14 +122,19 @@ class DeliveryTests(unittest.TestCase):
                 mock.patch.object(update_runtime.Source, "_request", side_effect=AssertionError("页面不能联网")):
             self.assertEqual(build_gallery.maintenance_summary()["status"], "unchecked")
             self.assertFalse(update_directory.exists())
+            current = update_runtime.installed_version(update_runtime.real_root())
+            major, minor, patch = update_runtime.version_key(current)
+            latest = f"{major}.{minor}.{patch + 1}"
+            self.assertGreater(update_runtime.version_key(latest), update_runtime.version_key(current))
             update_runtime.atomic_json(update_runtime.check_state_path(), {
-                "current": update_runtime.installed_version(update_runtime.real_root()),
-                "latest": "0.3.0", "checked_at": time.time(), "update": True,
+                "current": current,
+                "latest": latest, "checked_at": time.time(), "update": True,
             })
             result = present_round.present_round(self.root, open_browser=False)
             manifest = project.read_json(Path(result["manifest"]))
             self.assertEqual(manifest["view"]["maintenance"]["status"], "available")
-            self.assertEqual(manifest["view"]["maintenance"]["latest"], "0.3.0")
+            self.assertEqual(manifest["view"]["maintenance"]["current"], current)
+            self.assertEqual(manifest["view"]["maintenance"]["latest"], latest)
             update_runtime.atomic_json(update_runtime.failure_state_path(), {"last_failure_at": time.time() + 1})
             summary = build_gallery.maintenance_summary()
             self.assertEqual(summary["status"], "failed")
@@ -119,9 +147,11 @@ class DeliveryTests(unittest.TestCase):
 
     def test_stale_maintenance_cache_and_controls_cannot_install(self):
         with mock.patch.dict(os.environ, {"JARDEN_UPDATE_HOME": str(Path(self.temporary.name) / "maintenance")}):
+            current = update_runtime.installed_version(update_runtime.real_root())
+            major, minor, patch = update_runtime.version_key(current)
             update_runtime.atomic_json(update_runtime.check_state_path(), {
-                "current": update_runtime.installed_version(update_runtime.real_root()),
-                "latest": "0.3.0", "checked_at": time.time() - update_runtime.CHECK_TTL - 1,
+                "current": current,
+                "latest": f"{major}.{minor}.{patch + 1}", "checked_at": time.time() - update_runtime.CHECK_TTL - 1,
                 "update": True,
             })
             self.assertEqual(build_gallery.maintenance_summary()["status"], "stale")
@@ -138,11 +168,13 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return json.loads(result.stdout)
 
-    def question_page(self, answers, offer=None):
+    def question_page(self, answers, offer=None, stage="concept"):
         state = self.data()
         state["answers"] = answers
         state["rounds"] = []
+        state["stage"] = stage
         project.atomic_json(self.root / "project.json", state)
+        contract_fixtures.configure(self.root)
         if offer is None:
             result = present_round.present_round(self.root, open_browser=False)
         else:
@@ -263,17 +295,18 @@ const settle = async () => { for (let turn = 0; turn < 30; turn++) await Promise
 
     def test_generated_questions_use_field_copy_instead_of_agent_instructions(self):
         cases = (
-            ({}, "answers.product_form", "这次想把 IP 做成哪种周边"),
-            ({"product_form": "plush"}, "answers.subject_scope", "这次想做参考图里的哪些角色"),
-            ({"product_form": "plush", "subject_scope": "single"}, "answers.note_type", "这次想怎样展示作品"),
-            ({"product_form": "plush", "subject_scope": "single", "note_type": "single-multiview"},
+            ({}, "concept", "answers.product_form", "这次想把 IP 做成哪种周边"),
+            ({"product_form": "plush"}, "concept", "answers.subject_scope", "这次想做参考图里的哪些角色"),
+            ({"product_form": "plush", "subject_scope": "single"}, "concept",
              "answers.concept_count", "这次一共想做几个角色或设计"),
-            ({"product_form": "plush", "subject_scope": "single", "note_type": "single-multiview", "concept_count": 1},
-             "answers.delivery", "最后希望拿到哪种图片组合"),
+            ({"product_form": "plush", "subject_scope": "single", "subjects": ["小米团"], "concept_count": 1}, "scene",
+             "answers.note_type", "这次想怎样展示作品"),
+            ({"product_form": "plush", "subject_scope": "single", "subjects": ["小米团"], "note_type": "single-multiview", "concept_count": 1},
+             "scene", "answers.delivery", "最后希望拿到哪种图片组合"),
         )
-        for answers, field, question in cases:
+        for answers, stage, field, question in cases:
             with self.subTest(field=field):
-                page = self.question_page(answers)
+                page = self.question_page(answers, stage=stage)
                 rendered = self.run_page(page)
                 self.assertIn(question, rendered["initial"]["text"])
                 self.assertNotRegex(rendered["initial"]["text"], r"answers\.|先\s*set|直接\s*set|写入|intro|single|all|selected")
@@ -346,7 +379,7 @@ const settle = async () => { for (let turn = 0; turn < 30; turn++) await Promise
         self.assertEqual(rendered["posts"], [])
         self.assertEqual(rendered["inputs"][0]["type"], "number")
         self.assertIn("概念数量必须是整数", rendered["text"])
-        page = self.question_page({"product_form": "figure", "subject_scope": "single"})
+        page = self.question_page({"product_form": "figure", "subject_scope": "single", "subjects": ["小米团"], "concept_count": 1}, stage="scene")
         rendered = self.run_page(page)
         self.assertEqual(rendered["initial"]["selected"], ["design-manuscript"])
         self.assertIn("建议，可改选", rendered["initial"]["text"])
@@ -465,27 +498,25 @@ const settle = async () => { for (let turn = 0; turn < 30; turn++) await Promise
         self.assertEqual(history["previous_delivery"], None)
 
     def test_legacy_schema_is_read_only_and_old_build_data_surface_remains(self):
-        project_state = self.data()
-        project_state["schema_version"] = 1
-        project_state["revision"] = 0
-        project_state.pop("project_id")
-        project.atomic_json(self.root / "project.json", project_state)
-        before = (self.root / "project.json").read_bytes()
-        output = self.root / "legacy.html"
-        data = build_gallery.build_gallery(self.root, output)
-        self.assertTrue(data["readonly"])
-        self.assertIn("current", data)
-        self.assertIn("history", data)
-        self.assertIn("picks", data)
-        self.assertIn("post", data)
-        self.assertEqual(data["current"]["items"][0]["method"], "AI 生成")
-        self.assertEqual(data["current"]["items"][0]["prompt_label"], "生图提示词")
-        self.assertTrue(all("旧项目只读" in item["disabled_reason"] for item in data["current"]["items"]))
-        self.assertEqual(before, (self.root / "project.json").read_bytes())
-        self.assertFalse((self.root / "deliveries").exists())
-        html = output.read_text(encoding="utf-8")
-        self.assertIn("旧项目只读", html)
-        self.assertIn('"readonly": true', html)
+        for schema in (1, 2):
+            with self.subTest(schema=schema):
+                self.make_legacy(schema)
+                before = (self.root / "project.json").read_bytes()
+                output = self.root / f"legacy-{schema}.html"
+                data = build_gallery.build_gallery(self.root, output)
+                self.assertTrue(data["readonly"])
+                self.assertIn("current", data)
+                self.assertIn("history", data)
+                self.assertIn("picks", data)
+                self.assertIn("post", data)
+                self.assertEqual(data["current"]["items"][0]["method"], "AI 生成")
+                self.assertEqual(data["current"]["items"][0]["prompt_label"], "生图提示词")
+                self.assertTrue(all("旧项目只读" in item["disabled_reason"] for item in data["current"]["items"]))
+                self.assertEqual(before, (self.root / "project.json").read_bytes())
+                self.assertFalse((self.root / "deliveries").exists())
+                html = output.read_text(encoding="utf-8")
+                self.assertIn("旧项目只读", html)
+                self.assertIn('"readonly": true', html)
 
     def test_open_receipts_never_infer_verified_and_delivery_ids_stay_monotonic(self):
         first = present_round.present_round(self.root, open_browser=False)
@@ -615,18 +646,19 @@ const settle = async () => { for (let turn = 0; turn < 30; turn++) await Promise
     def test_real_cli_summary_snapshot_is_local_scene_baseline_after_source_replacement(self):
         source = self.root / "rounds/09-scene-set"
         source.mkdir()
-        slots = [slot["id"] for slot in project.scene_slots(self.data())]
+        slots = project.scene_slots(self.data())
         for slot in slots:
-            shutil.copyfile(self.image, source / f"{slot}.png")
+            shutil.copyfile(self.image, source / f"{slot['id']}.png")
         state = self.data()
         state["stage"] = "done"
         state["rounds"] = [{"id": "09-scene-set", "stage": "scene", "subject": None, "kind": "set", "dir": "rounds/09-scene-set", "status": "approved", "missing": []}]
         state["selections"] = {stage: {"小米团": {"round": "input", "item": "accepted", "image": "inputs/source.png"}} for stage in ("concept", "material", "cutout")}
         state["selections"]["scene"] = {"_": {"round": "08-scene", "item": "A", "image": "inputs/source.png"}}
-        state["finals"] = [{"slot": slot, "role": slot, "path": f"rounds/09-scene-set/{slot}.png"} for slot in slots]
+        state["finals"] = [{"slot": slot["id"], "role": slot["role"], "subject": slot.get("subject"),
+                            "path": f"rounds/09-scene-set/{slot['id']}.png"} for slot in slots]
         project.atomic_json(self.root / "project.json", state)
-        project.atomic_json(source / "round.json", {"schema_version": 2, "id": "09-scene-set", "stage": "scene", "subject": None,
-                            "kind": "set", "items": [{"id": slot, "role": slot, "image": f"{slot}.png", "title": slot, "status": "generated"} for slot in slots]})
+        project.atomic_json(source / "round.json", {"schema_version": project.SCHEMA_VERSION, "id": "09-scene-set", "stage": "scene", "subject": None,
+                            "kind": "set", "items": [{**slot, "image": f"{slot['id']}.png", "title": slot["id"], "status": "generated"} for slot in slots]})
         self.cli("present_round.py", self.root, "--no-open")
         old_file = self.root / "deliveries/D0001/manifest.json"
         old_bytes = old_file.read_bytes()

@@ -50,11 +50,11 @@
 
 只有 `pass` 才能 `record-round`、`select`、手动 `final` 和正式打包。`uncertain` 不等于可交付。失败只编辑或重生对应图位，保留其他图，换新包再盲审，直到通过；不能用 caption 解释错误。缺图可以 `--allow-missing` 留档，但已有图片不能用这个开关逃避审查。
 
-最后整理的两段流程：
+最后整理：范围已授权可直接 prepare-review（已内含预检），只诊断时单独 dry-run。用不同执行者完成 G1 和 G2：
 
 ```text
-<python> <skill>/scripts/package_post.py <项目> --dry-run
 <python> <skill>/scripts/package_post.py <项目> --prepare-review
+<python> <skill>/scripts/contract_review.py prepare <项目> --producer <制图执行者ID> --stage package --images <每张待发布图> --ordered-slots <项目>/<返回的映射文件>
 <python> <skill>/scripts/physics_review.py prepare <项目> --producer <制图执行者ID> --images <上一步列出的每张待发布图>
 ```
 

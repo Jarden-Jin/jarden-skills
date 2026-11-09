@@ -52,6 +52,16 @@ main { max-width: 1520px; margin: auto; padding: 0 32px 48px; }
 .agreements summary::after { content: "详情 +"; color: var(--muted); margin-left: auto; font-size: 12px; }
 .agreements[open] summary::after { content: "收起 −"; }
 .agreements .rules { display: flex; flex-wrap: wrap; gap: 6px 22px; font-size: 13px; }
+.contract > p { margin-top: 10px; }
+.contract-subject { padding-top: 14px; }
+.contract-spec { margin-top: 8px; font-size: 13px; }
+.plan-row { display: flex; align-items: flex-start; gap: 16px; padding: 14px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+.plan-row > div { min-width: 0; }
+.plan-row .image-frame { width: 96px; flex: 0 0 96px; border-radius: 6px; }
+.asset-path { display: block; overflow-wrap: anywhere; }
+.review-group { margin-top: 12px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
+.review-group > summary { font-size: 13px; font-weight: 600; }
+.review-detail { margin-top: 10px; }
 .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 292px; align-items: start; gap: 26px; }
 .workarea, .sidebar, .candidate, .candidate-body { min-width: 0; }
 .sectionhead { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin: 0 0 14px; }

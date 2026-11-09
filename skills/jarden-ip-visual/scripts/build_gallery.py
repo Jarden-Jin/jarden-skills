@@ -17,7 +17,10 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import project as state  # noqa: E402
+import contract_review
 import physics_review
+import product_contract
+import scene_plan
 import update_runtime
 
 TEMPLATE = Path(__file__).resolve().parent.parent / "assets" / "gallery.html"
@@ -49,6 +52,174 @@ CHOICES = {
         "重新生成：整组重来，可以附上想改的地方",
     ],
 }
+VIEW_ERRORS = (state.ProjectError, contract_review.ContractReviewError, OSError, ValueError, KeyError, TypeError, AttributeError)
+
+
+def display_text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def contract_image(root: Path, relative: Any) -> dict[str, Any]:
+    image = {"original_path": display_text(relative), "exists": False}
+    try:
+        if not image["original_path"]:
+            raise state.ProjectError("尚未绑定图片")
+        source = project_path(root, image["original_path"])
+        if not source.is_file():
+            raise state.ProjectError("图片待补")
+        image.update(path=image["original_path"], exists=True, image_sha256=file_sha256(source))
+    except VIEW_ERRORS:
+        image["disabled_reason"] = "图片待补或路径不可用；未用其他图片替代"
+    return image
+
+
+def product_view(root: Path, project: dict[str, Any]) -> dict[str, Any] | None:
+    contract = project.get("product_contract")
+    if not isinstance(contract, dict):
+        return None
+    subjects = contract.get("subjects")
+    specs = contract.get("specs")
+    assets = contract.get("view_assets")
+    if not all(isinstance(value, dict) for value in (subjects, specs, assets)):
+        return {"subjects": [], "reason": "产品约定记录不完整，待补"}
+    rows = []
+    for identifier, subject in subjects.items():
+        if not isinstance(subject, dict) or not subject.get("active", True):
+            continue
+        row = {"id": identifier, "name": display_text(subject.get("name")) or "主体名称待补", "specs": [], "views": []}
+        for spec_id, spec in specs.items():
+            if not isinstance(spec, dict) or spec.get("subject_id") != identifier:
+                continue
+            usage = spec.get("usage") if isinstance(spec.get("usage"), dict) else {}
+            size = spec.get("size") if isinstance(spec.get("size"), dict) else {}
+            dimensions = []
+            for field, label in (("height", "高"), ("width", "宽"), ("depth", "深"), ("total_length", "总长")):
+                number = size.get(field)
+                if type(number) in (int, float):
+                    dimensions.append(f"{label} {number:g}")
+                elif isinstance(number, list) and len(number) == 2 and all(type(bound) in (int, float) for bound in number):
+                    dimensions.append(f"{label} {number[0]:g}–{number[1]:g}")
+            description = display_text(size.get("description")) if size.get("mode") == "qualitative" else (
+                "、".join(dimensions) + " " + display_text(size.get("unit")) if dimensions and size.get("mode") in ("numeric", "range") else "")
+            row["specs"].append({
+                "id": spec_id, "name": display_text(spec.get("name")),
+                "usage": {key: display_text(usage.get(key)) for key in ("text", "origin", "status")},
+                "size": {**{key: display_text(size.get(key)) for key in ("origin", "status", "evidence_kind", "measurement_basis")},
+                         "description": description.strip()},
+            })
+        try:
+            confirmed = {asset["id"] for asset in product_contract.view_assets(project, identifier)}
+        except VIEW_ERRORS:
+            confirmed = set()
+        for asset_id, asset in assets.items():
+            if not isinstance(asset, dict) or asset.get("subject_id") != identifier:
+                continue
+            confirmation = asset.get("confirmation") if isinstance(asset.get("confirmation"), dict) else {}
+            image = contract_image(root, asset.get("path"))
+            intact = image.get("image_sha256") == asset.get("sha256") and image["exists"]
+            status = display_text(confirmation.get("status")) or "unknown"
+            if not intact or status == "confirmed" and asset_id not in confirmed:
+                status = "stale"
+            row["views"].append({
+                "view": display_text(asset.get("view")), "origin": display_text(asset.get("origin")),
+                "status": status, "confirmation_origin": display_text(confirmation.get("origin")),
+                "evidence": display_text(confirmation.get("evidence")), "image": image,
+            })
+        rows.append(row)
+    return {"subjects": rows, "reason": "" if contract.get("enabled") is True else "产品约定未启用，待补"}
+
+
+def plan_view(root: Path, project: dict[str, Any]) -> dict[str, Any] | None:
+    if not project.get("scene_plan"):
+        return None
+    try:
+        plan = scene_plan.validate_plan(project["scene_plan"], project)
+        coverage = scene_plan.coverage_status(plan)
+    except VIEW_ERRORS:
+        return {"slots": [], "reason": "视角计划记录不完整，待补；不能作为实际图像证据", "visual_verified": False}
+    rows = []
+    subjects = (project.get("product_contract") or {}).get("subjects") or {}
+    preserved = set(coverage["preserve_slots"])
+    for change in project.get("scene_changes") or []:
+        patch = change.get("patch") if isinstance(change, dict) else None
+        if isinstance(patch, dict) and isinstance(patch.get("preserve_slots"), list):
+            preserved.update(identifier for identifier in patch["preserve_slots"] if isinstance(identifier, str))
+    def subject_name(identifier: Any) -> Any:
+        subject = subjects.get(identifier) if isinstance(subjects, dict) and isinstance(identifier, str) else None
+        return (subject.get("name") or identifier) if isinstance(subject, dict) else identifier
+    for slot in plan["slots"]:
+        finals = [final for final in project.get("finals") or [] if isinstance(final, dict) and final.get("slot") == slot["id"]]
+        final = finals[0] if len(finals) == 1 else None
+        rows.append({
+            "id": slot["id"], "role": slot["role"], "subject": subject_name(slot.get("subject")),
+            "subjects": [subject_name(identifier) for identifier in slot.get("subjects") or []], "view": slot["view"], "pose": slot["pose"], "framing": slot["framing"],
+            "keep": slot["keep"], "preserve": slot["id"] in preserved,
+            "image": contract_image(root, final.get("path")) if final else None,
+            "image_state": "pending_change" if final and final.get("pending_change") else "retained" if final else "pending",
+        })
+    return {"slots": rows, "required_views": plan["coverage"]["required_views"], "missing_views": coverage["missing_views"],
+            "visual_verified": False, "reason": "G0 仅记录计划；视面、尺度和保持结果须由 G1 实际看图验收"}
+
+
+def g1_result(result: dict[str, Any], project: dict[str, Any], *, original: str = "", slot_id: str | None = None) -> dict[str, Any]:
+    verdict = result.get("verdict", "not_assessed")
+    status = {"not_assessed": "needs_review", "invalid": "invalid", "pass": "pass",
+              "uncertain": "uncertain", "needs_revision": "needs_revision"}.get(verdict, "pending")
+    previous = [entry.get("scope") or {} for entry in (project.get("contract_reviews") or {}).values() if isinstance(entry, dict)]
+    if status == "needs_review" and original and any(
+        any(isinstance(image, dict) and image.get("path") == original and image.get("slot_id") == slot_id
+            for image in scope.get("images") or []) for scope in previous if isinstance(scope, dict)
+    ):
+        status = "stale"
+    checks = result.get("checks") if isinstance(result.get("checks"), dict) else {}
+    return {"status": status, "reason": "此前报告不适用于当前原图或约定，需重新验收" if status == "stale" else display_text(result.get("reason")),
+            "checks": [{"name": name, "verdict": display_text(check.get("verdict")), "reason": display_text(check.get("evidence"))}
+                       for name, check in checks.items() if isinstance(check, dict) and name in contract_review.CHECKS + contract_review.SEQUENCE_CHECKS]}
+
+
+def g1_view(root: Path, project: dict[str, Any], paths: list[str], stage: str, label: str) -> dict[str, Any]:
+    group = {"label": label, "stage": stage, "items": [], "sequence": {"status": "needs_review", "reason": "实际集合待补，尚未验收", "checks": []}}
+    try:
+        mappings = state.review_mappings(root, project, paths, stage) if paths else []
+        if not mappings:
+            return group
+        result = contract_review.status(root, project, paths, stage, ordered_slots=mappings)
+        if not result.get("applicable"):
+            group["sequence"] = {"status": "pending", "reason": "当前范围未启用 G1，待补约定", "checks": []}
+        else:
+            group["sequence"] = g1_result(result.get("sequence") or {}, project)
+        for mapping in mappings:
+            relative, slot_id = mapping["path"], mapping["slot_id"]
+            reviewed = next((row for row in result.get("paths") or [] if row.get("path") == relative and row.get("slot_id") == slot_id), None)
+            row = g1_result(reviewed, project, original=relative, slot_id=slot_id) if reviewed else {
+                "status": "pending", "reason": group["sequence"]["reason"] or "G1 范围待补", "checks": []}
+            group["items"].append({"original_path": relative, "source_path": mapping.get("source"), "slot_id": slot_id, **row})
+        if group["sequence"]["status"] == "needs_review" and any(
+            any(image.get("path") in paths for image in (entry.get("scope") or {}).get("images") or [])
+            for entry in (project.get("contract_reviews") or {}).values() if isinstance(entry, dict)
+        ):
+            group["sequence"].update(status="stale", reason="当前整套覆盖或实际排列已变化，原整套报告不适用，需重新验收")
+    except VIEW_ERRORS:
+        group["sequence"] = {"status": "pending", "reason": "实际图位绑定或 G1 记录不可用，待补；未猜测验收范围", "checks": []}
+        group["items"] = [{"original_path": relative, "slot_id": None, "status": "pending",
+                           "reason": "实际图位或审查资料待补", "checks": []} for relative in paths]
+    return group
+
+
+def gallery_next(root: Path, project: dict[str, Any]) -> dict[str, Any]:
+    try:
+        action = state.next_action(copy.deepcopy(project), root)
+        field = action.get("field") or ""
+        if action.get("action") == "ask" and field.startswith(("product.usage:", "product.size:")):
+            domain, identifier = field.removeprefix("product.").split(":", 1)
+            _, spec = product_contract.spec_for(project, identifier)
+            value = spec.get(domain) or {}
+            known = display_text(value.get("text")) if domain == "usage" else value.get("mode") in ("numeric", "range", "qualitative")
+            if known:
+                return {"action": "confirm-contract", "say": "已有用途或尺度已记录，见产品约定；来源与确认状态仍待核对，可在聊天里确认，无需重复填写"}
+        return action
+    except VIEW_ERRORS:
+        return {"action": "review", "say": "产品约定、实际图位或审查记录待补；保留已有图片，补齐后重新交付"}
 
 
 def maintenance_summary() -> dict[str, Any]:
@@ -102,7 +273,10 @@ def chips(project: dict[str, Any]) -> list[str]:
 
 def round_items(root: Path, entry: dict[str, Any], data: dict[str, Any], project: dict[str, Any]) -> list[dict[str, Any]]:
     items = []
-    eligibility = state.round_eligibility(root, project, entry)
+    try:
+        eligibility = state.round_eligibility(root, project, entry)
+    except VIEW_ERRORS:
+        eligibility = {item.get("id"): {"selectable": False, "disabled_reason": "图位绑定或审查记录待补，暂不可采用"} for item in data.get("items") or []}
     for item in data.get("items") or []:
         path = f"{entry['dir']}/{item.get('image', '')}"
         image_path = project_path(root, path)
@@ -116,7 +290,7 @@ def round_items(root: Path, entry: dict[str, Any], data: dict[str, Any], project
             prompt_state = "提示词已保存" if str(item.get("prompt") or "").strip() else "提示词尚未填写"
             missing_reason = f"{'图片尚未生成' if item.get('status') == 'planned' or entry.get('status') == 'planned' else '图片文件缺失'}；{detail}；{prompt_state}"
         reason = missing_reason or permitted.get("disabled_reason") or ""
-        if project.get("schema_version") == 1:
+        if project.get("schema_version") != state.SCHEMA_VERSION:
             reason = "旧项目只读；明确迁移后才能提交"
         badge = item.get("id") if data.get("kind") == "alternatives" else item.get("slot_label") or item.get("id")
         method = item.get("method", "generate")
@@ -219,18 +393,21 @@ def build_data(root: Path, project: dict[str, Any], *, prefer_latest: bool = Tru
     post_dir = post_record.get("path") or "post"
     manifest = root / post_dir / "manifest.json"
     if post_record and project.get("stage") == "done" and manifest.is_file():
-        info = state.read_json(manifest)
-        paths = [final["path"] for final in project.get("finals") or []] + [f"{post_dir}/{image['file']}" for image in info.get("images") or []]
-        physics_valid = bool(paths) and all(physics_review.status(root, project, path)["verdict"] == "pass" for path in paths)
-        if physics_valid and info.get("signature") == post_record.get("signature") and info.get("requirements") == state.requirement_signature(project):
-            post = {
-                "images": [{"path": f"{post_dir}/{image['file']}", "role": image.get("role", ""), "label": image.get("label", "")} for image in info.get("images", [])],
-                "title": info.get("title", ""),
-                "body": info.get("body", ""),
-                "tags": info.get("tags", []),
-                "hint": "按发布顺序排列，左右滑动查看",
-                "notes": "；".join(info.get("checklist", [])),
-            }
+        try:
+            info = state.read_json(manifest)
+            paths = [final["path"] for final in project.get("finals") or []] + [f"{post_dir}/{image['file']}" for image in info.get("images") or []]
+            physics_valid = bool(paths) and all(physics_review.status(root, project, path)["verdict"] == "pass" for path in paths)
+            if physics_valid and info.get("signature") == post_record.get("signature") and info.get("requirements") == state.requirement_signature(project):
+                post = {
+                    "images": [{"path": f"{post_dir}/{image['file']}", "role": image.get("role", ""), "label": image.get("label", "")} for image in info.get("images", [])],
+                    "title": info.get("title", ""),
+                    "body": info.get("body", ""),
+                    "tags": info.get("tags", []),
+                    "hint": "按发布顺序排列，左右滑动查看",
+                    "notes": "；".join(info.get("checklist", [])),
+                }
+        except VIEW_ERRORS:
+            post = None
     if not post and project.get("finals"):
         for final in project["finals"]:
             picks.append({
@@ -247,6 +424,20 @@ def build_data(root: Path, project: dict[str, Any], *, prefer_latest: bool = Tru
                 "physics": physics_review.status(root, project, final["path"]),
             })
     kind = "missing" if missing else (current or {}).get("kind") or "alternatives"
+    g1 = []
+    if project.get("schema_version") == state.SCHEMA_VERSION:
+        for group in ([current] if current else []) + history:
+            if group.get("stage") == "scene":
+                paths = [item["original_path"] for item in group["items"]]
+                g1.append(g1_view(root, project, paths, "scene", group["heading"]))
+        if project.get("finals"):
+            g1.append(g1_view(root, project, [final["path"] for final in project["finals"]], "scene", "已保留场景图"))
+        if post_record and manifest.is_file():
+            try:
+                info = state.read_json(manifest)
+                g1.append(g1_view(root, project, [f"{post_dir}/{image['file']}" for image in info.get("images") or []], "package", "实际发布集合"))
+            except VIEW_ERRORS:
+                g1.append(g1_view(root, project, [], "package", "实际发布集合待补"))
     return {
         "title": ((project.get("brief") or {}).get("ip_name") or project.get("project") or "IP 项目") + " · 视觉对比页",
         "subtitle": f"项目 {project.get('project')} · 更新于 {project.get('updated_at')}",
@@ -261,8 +452,11 @@ def build_data(root: Path, project: dict[str, Any], *, prefer_latest: bool = Tru
         "project_revision": project.get("revision", 0),
         "stage": project.get("stage"),
         "snapshot_at": state.now(),
-        "readonly": project.get("schema_version") != 2,
-        "next": state.next_action(copy.deepcopy(project), root),
+        "readonly": project.get("schema_version") != state.SCHEMA_VERSION,
+        "next": gallery_next(root, project),
+        "product_contract": product_view(root, project),
+        "scene_plan": plan_view(root, project),
+        "g1": g1,
         "answers": project.get("answers") or {},
         "decisions": (project.get("brief") or {}).get("decisions") or [],
         "bible": (project.get("brief") or {}).get("bible") or {},
@@ -393,10 +587,24 @@ def delivery_data(root: Path, project: dict[str, Any], manifest: dict[str, Any])
     data.update({key: copy.deepcopy(manifest.get(key)) for key in
                  ("project_id", "delivery_id", "project_revision", "stage", "subject", "round_id", "kind", "next", "decisions", "feedback")})
     data["snapshot_at"] = manifest.get("created_at")
-    data["readonly"] = project.get("schema_version") != 2
+    data["readonly"] = project.get("schema_version") != state.SCHEMA_VERSION
     data["stale"] = project.get("revision", 0) != manifest.get("project_revision") or (project.get("presentations") or {}).get("latest_delivery_id", manifest["delivery_id"]) != manifest["delivery_id"]
     data["live_revision"] = project.get("revision", 0)
     data["receipts"] = decision_receipts(root, manifest["delivery_id"])
+    def verify_projection(value: Any) -> Any:
+        if isinstance(value, list):
+            return [verify_projection(child) for child in value]
+        if not isinstance(value, dict):
+            return value
+        if "display_path" in value:
+            try:
+                return verify_frozen_item(root, value)
+            except VIEW_ERRORS:
+                return {**value, "path": None, "exists": False, "disabled_reason": "冻结图片待补；未用当前图片替代"}
+        return {key: verify_projection(child) for key, child in value.items()}
+    for key in ("product_contract", "scene_plan"):
+        if key in data:
+            data[key] = verify_projection(data[key])
     verified = delivery_summary(root, manifest)
     if data.get("current"):
         for item, frozen in zip(data["current"]["items"], verified["items"]):

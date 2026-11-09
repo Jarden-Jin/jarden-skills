@@ -22,6 +22,8 @@ import project
 import review_checks
 import runtime_activity
 import test_workflow
+import contract_fixtures
+import package_post
 
 
 class ReviewChecksTests(unittest.TestCase):
@@ -54,6 +56,7 @@ class ReviewChecksTests(unittest.TestCase):
             "answers.note_type=single-multiview", "answers.delivery=full-post",
             "image_backend.kind=builtin",
         )
+        contract_fixtures.configure(self.job)
 
     def packet(self, category, *images, producer="producer-maker"):
         args = ["prepare", self.job, "--category", category, "--producer", producer]
@@ -140,11 +143,17 @@ class ReviewChecksTests(unittest.TestCase):
 
     def register_all_finals(self):
         data = project.load_project(self.job)
-        data["finals"] = [
-            {"role": slot["role"], "slot": slot["id"], "path": "inputs/original.png"}
-            for slot in project.scene_slots(data)
-        ]
+        data["finals"] = []
+        for slot in project.scene_slots(data):
+            relative = "inputs/original.png" if slot["id"] == "cover" else f"inputs/{slot['id']}.png"
+            if relative != "inputs/original.png":
+                (self.job / relative).write_bytes((self.job / "inputs/original.png").read_bytes())
+            data["finals"].append({"role": slot["role"], "slot": slot["id"], "path": relative})
         project.save_project(self.job, data)
+
+    def review_sources(self):
+        current = project.load_project(self.job)
+        test_workflow.WorkflowTests.review(self, [final["path"] for final in current["finals"]])
 
     def write_copy(self):
         project.write_json(self.job / "copy.json", {
@@ -618,7 +627,7 @@ class ReviewChecksTests(unittest.TestCase):
     def test_packaging_cannot_bypass_valid_copy_failure_report(self):
         self.write_copy()
         self.register_all_finals()
-        test_workflow.WorkflowTests.review(self, ["inputs/original.png"])
+        self.review_sources()
         self.review_category("copy", "needs_revision")
         before = (self.job / "project.json").read_bytes()
         result = self.call("package_post.py", self.job, "--dry-run", code=2)
@@ -629,7 +638,7 @@ class ReviewChecksTests(unittest.TestCase):
     def test_packaging_cannot_bypass_valid_identity_failure_report(self):
         self.write_copy()
         self.register_all_finals()
-        test_workflow.WorkflowTests.review(self, ["inputs/original.png"])
+        self.review_sources()
         self.review_category("identity", "needs_revision")
         before = (self.job / "project.json").read_bytes()
         result = self.call("package_post.py", self.job, "--dry-run", code=2)
@@ -640,7 +649,7 @@ class ReviewChecksTests(unittest.TestCase):
     def test_prepared_output_failures_bind_by_content_not_staging_directory(self):
         self.write_copy()
         self.register_all_finals()
-        test_workflow.WorkflowTests.review(self, ["inputs/original.png"])
+        self.review_sources()
         prepared = self.call("package_post.py", self.job, "--prepare-review")
         test_workflow.WorkflowTests.review(self, prepared["images"])
         for category in ("identity", "copy"):
@@ -652,13 +661,15 @@ class ReviewChecksTests(unittest.TestCase):
                 self.assertFalse((self.job / "post").exists())
                 self.assertEqual(before, (self.job / "project.json").read_bytes())
                 self.review_category(category, "pass", *prepared["images"])
+        contract_fixtures.review(self.job, prepared["images"], "package",
+                                 package_post.actual_output_slots(self.job, project.load_project(self.job), prepared["images"]))
         completed = self.call("package_post.py", self.job)
         self.assertTrue(completed["ok"])
 
     def test_alternate_copy_uses_actual_content_for_inspection_and_review(self):
         self.write_copy()
         self.register_all_finals()
-        test_workflow.WorkflowTests.review(self, ["inputs/original.png"])
+        self.review_sources()
         self.review_category("copy", "needs_revision")
         alternate = self.job / "alternate-copy.json"
         alternate.write_bytes((self.job / "copy.json").read_bytes())

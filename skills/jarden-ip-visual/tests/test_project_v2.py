@@ -154,7 +154,7 @@ class ProjectV2Tests(unittest.TestCase):
         self.call("project.py", "set", self.job, "brief.ip_name=wrong", code=2)
         result = self.call("migrate_project.py", self.job, "--apply", "--plan", plan_file)
         after = project.load_project(self.job)
-        self.assertEqual(after["schema_version"], 2)
+        self.assertEqual(after["schema_version"], project.SCHEMA_VERSION)
         self.assertEqual(after["requirements_revision"], 7)
         self.assertEqual(after["custom"], {"unknown": "preserved"})
         self.assertEqual(Path(result["backup"]).read_bytes(), before)
@@ -217,8 +217,11 @@ class ProjectV2Tests(unittest.TestCase):
         self.known()
         current = project.load_project(self.job)
         current["stage"] = "done"
-        current["finals"] = [{"path": "inputs/original.png", "slot": slot["id"], "role": slot["role"]}
-                             for slot in project.scene_slots(current)]
+        current["finals"] = []
+        for slot in project.scene_slots(current):
+            relative = f"{slot['id']}.png"
+            (self.job / relative).write_bytes((self.job / "inputs/original.png").read_bytes())
+            current["finals"].append({"path": relative, "slot": slot["id"], "role": slot["role"]})
         project.save_project(self.job, current)
         before = (self.job / "project.json").read_bytes()
         restored = self.call("project.py", "show", self.job)
@@ -226,7 +229,7 @@ class ProjectV2Tests(unittest.TestCase):
         self.assertEqual(restored["next"]["action"], "review")
         self.assertTrue(any(item.get("category") == "physics" for item in restored["next"]["findings"]))
         self.assertEqual(before, (self.job / "project.json").read_bytes())
-        self.review(["inputs/original.png"])
+        self.review([final["path"] for final in current["finals"]])
         restored = self.call("project.py", "show", self.job)
         self.assertEqual(restored["next"]["action"], "package")
 

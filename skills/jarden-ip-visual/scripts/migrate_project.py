@@ -10,7 +10,7 @@ import project as state
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="预览或明确执行 schema 1 到 2 迁移")
+    parser = argparse.ArgumentParser(description="预览或明确执行旧项目到当前 schema 的迁移")
     parser.add_argument("project")
     parser.add_argument("--out")
     parser.add_argument("--plan")

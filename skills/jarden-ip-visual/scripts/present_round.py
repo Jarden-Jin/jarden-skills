@@ -83,7 +83,6 @@ def comparable_baseline(root: Path, current: dict[str, Any] | None, before: str 
     if not current:
         return None
     base_round, _, base_item = (current.get("based_on") or "").partition(":")
-    candidates = []
     directories = sorted((root / "deliveries").glob("D*"), key=lambda path: int(path.name[1:]) if path.name[1:].isdigit() else -1, reverse=True)
     for directory in directories:
         if not directory.name[1:].isdigit() or (before is not None and int(directory.name[1:]) >= int(before[1:])):
@@ -110,11 +109,11 @@ def comparable_baseline(root: Path, current: dict[str, Any] | None, before: str 
                     matches.append({"item_id": item["id"], "baseline_item_id": match["id"], "baseline_round_id": match.get("round_id"),
                                     "baseline_snapshot_source": match["snapshot_source"], "image_sha256": match["image_sha256"]})
             if matches:
-                candidates.append({"delivery_id": manifest["delivery_id"], "round_id": matches[0]["baseline_round_id"], "stage": current.get("stage"), "subject": current.get("subject"),
-                                   "reason": "明确的 based-on" if explicit else "同主体、同阶段、同图位的最近有效交付", "matches": matches, "explicit": explicit})
+                return {"delivery_id": manifest["delivery_id"], "round_id": matches[0]["baseline_round_id"], "stage": current.get("stage"), "subject": current.get("subject"),
+                        "reason": "明确的 based-on" if explicit else "同主体、同阶段、同图位的最近有效交付", "matches": matches, "explicit": explicit}
         except (OSError, state.ProjectError):
             continue
-    return next((item for item in candidates if item["explicit"]), candidates[0] if candidates else None)
+    return None
 
 
 def record_open_result(root: Path, delivery_id: str, status: str, *, target: str = "", error: str = "", evidence: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -166,12 +165,12 @@ def present_round(root: Path, *, open_browser: bool = True, output: Path | None 
     if output.suffix.lower() not in {".html", ".htm"}:
         raise state.ProjectError("交付输出必须是 HTML，不能覆盖源图片或 JSON")
     initial = state.load_project(root, writable=False)
-    if initial.get("schema_version") != 2:
-        raise state.ProjectError("schema 1 项目只读；先明确迁移，再创建交付。可用 build_gallery 只读查看")
+    if initial.get("schema_version") != state.SCHEMA_VERSION:
+        raise state.ProjectError("旧项目只读；先明确迁移，再创建交付。可用 build_gallery 只读查看")
     with state.project_lock(root):
         project = state.load_project(root, writable=False)
         if not project.get("project_id"):
-            raise state.ProjectError("schema 2 项目缺少 project_id")
+            raise state.ProjectError("当前项目缺少 project_id")
         started = fingerprint(project)
     view, hashes = freeze_view(root, gallery.build_data(root, copy.deepcopy(project), prefer_latest=False))
     baseline = comparable_baseline(root, view.get("current"))
