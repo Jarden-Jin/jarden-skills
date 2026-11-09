@@ -66,6 +66,10 @@
 
 `coverage.required_views` 是本套需要的视面，`coverage.preserve_slots` 是保持图位。G0 只能证明计划格式与计划覆盖，不能证明图片真的有该角度。`compile` 按图位生成提示词和分工参考：身份、产品、视图、环境、风格、基线。环境或风格参考不能携带机位与姿态指令。生产编译会验证真实参考文件和摘要；明确侧背镜头缺少当前已确认资料时停止。
 
+slot 可选 `constraint_policy`，映射仅限 `framing/yaw/elevation/pose/scale_anchor/description`，每项必须包含 `level:required|advisory`、`origin:user-confirmed|agent-inferred|reference-derived` 和非空文本 `evidence`。只有 `agent-inferred` 可标 `advisory`；用户要求、参考来源、身份、产品规格与尺寸、role、view、keep、coverage 不可降为建议。Agent 自设的占比、留白、道具位置须先核对明确出处，再通过显式 `scope` 补丁附证据校准；不得改写用户要求。旧计划不补造 policy，未标字段保持旧行为，不自动降级。
+
+`compile_slot` 仅在 slot 显式带 policy 时返回其副本，提示词逐字段区分硬合同和非硬合同建议。建议值可调整，但实际认脸完整性、目标视角、职责所需信息量和尺度相容性仍须满足；尺度锚点建议不能改变产品尺寸，也不能替代实际尺度证据。
+
 ## 追加和局部回改
 
 ```text
@@ -105,6 +109,10 @@
 需要保护已定稿图时用 `preserve_slots`，并在 `baseline_hashes` 声明相应实际摘要；编辑/替换已定稿目标也必须声明当前摘要。程序核对最后时刻文件。默认追加不会删正面；满九宫格拒绝新增，先解决改整套、明确替换或拆组的冲突。不能静默覆盖或重生成整套。
 
 补丁返回 `impact`，包括新增、失效、保留及字节摘要。已有定稿保留历史，受影响项标待改；重新生成只指定缺项/待改项。追加或重排后，旧单图适用审查可复用，但完整集合的覆盖与顺序必须重新审。
+
+保护图位允许 `edit` 的 `changes` **仅含** `constraint_policy`；不能夹带其他属性或用 `replace` 绕过保护。有 final 时仍须核对并声明当前 baseline hash。此时 `changed_slots` 包含目标，`invalidated_slots:[]`，目标仍计入 `preserved_slots/preserved_hashes`，`sequence_changed:true`、`requires_visual_review:true`；只更新审查约定，保留图片。已有 `required` 的用户或参考来源 policy 不能删除、降级或改标来源。
+
+旧约定先明确审查出处并保留证据，再以新 `request_id` 提交局部校准补丁（`changes.constraint_policy` 是完整映射，保留其中已有的受保护项）。修改后的图位与编译签名会变化，须创建新的独立 G1 request 按当前约定看实际图片；不得重放旧请求、删旧负评或把旧失败改为 pass。本规则适用于所有满足这些条件的图位，不为特定图片豁免。
 
 ## 原生生图前登记任务
 

@@ -23,8 +23,10 @@ BINDING_KINDS = ("identity", "product", "view", "environment", "style", "baselin
 SLOT_FIELDS = {
     "id", "role", "subject", "subjects", "spec_ref", "spec_refs", "view", "yaw",
     "elevation", "pose", "framing", "reference_bindings", "scale_anchor", "keep",
-    "description", "refs",
+    "description", "refs", "constraint_policy",
 }
+CONSTRAINT_FIELDS = {"framing", "yaw", "elevation", "pose", "scale_anchor", "description"}
+CONSTRAINT_ORIGINS = ("user-confirmed", "agent-inferred", "reference-derived")
 REFERENCE_ASPECTS = {
     "identity": ["identity", "color_regions", "signature_accessories"],
     "product": ["shape", "material", "connections"],
@@ -155,6 +157,18 @@ def _slot(value: Any) -> dict[str, Any]:
     result.setdefault("scale_anchor", None)
     _require(result["scale_anchor"] is None or isinstance(result["scale_anchor"], (str, dict)),
              "invalid_scale_anchor: expected text, an object, or null")
+    if "constraint_policy" in result:
+        policy = result["constraint_policy"]
+        _require(isinstance(policy, dict) and not set(policy) - CONSTRAINT_FIELDS,
+                 "invalid_constraint_policy: unsupported fields")
+        for rule in policy.values():
+            _require(isinstance(rule, dict) and set(rule) == {"level", "origin", "evidence"},
+                     "invalid_constraint_policy_rule")
+            _require(rule["level"] in ("required", "advisory"), "invalid_constraint_policy_level")
+            _require(rule["origin"] in CONSTRAINT_ORIGINS, "invalid_constraint_policy_origin")
+            _text(rule["evidence"], "constraint_policy_evidence")
+            _require(rule["level"] != "advisory" or rule["origin"] == "agent-inferred",
+                     "invalid_constraint_policy_advisory_origin")
     _hash(result)
     return result
 
@@ -322,7 +336,8 @@ def apply_patch(project: dict[str, Any], patch: dict[str, Any], expected_revisio
 
     append uses slots=[...]; edit uses slot_id and changes={...}; replace uses
     slot_id and slot={...}; reorder uses order=[all IDs]. Every operation requires
-    scope.slots to name exactly its targets. preserve_slots adds immutable slots.
+    scope.slots to name exactly its targets. preserve_slots protects image content;
+    an edit of constraint_policy alone may recalibrate its review contract.
     baseline_hashes in patch declares expected bytes for finalized targets and
     protected finals; the keyword argument supplies current digests from the host.
     """
@@ -353,6 +368,7 @@ def apply_patch(project: dict[str, Any], patch: dict[str, Any], expected_revisio
         _require(_digest(signature) == before_hash, "stale_plan_hash")
     current = {slot["id"]: slot for slot in plan["slots"]}
     candidate = copy.deepcopy(plan)
+    policy_only = False
     if operation == "append":
         _require(isinstance(patch.get("slots"), list) and bool(patch["slots"]), "missing_append_slots")
         additions = [_slot(slot) for slot in patch["slots"]]
@@ -367,10 +383,16 @@ def apply_patch(project: dict[str, Any], patch: dict[str, Any], expected_revisio
             changes = patch.get("changes")
             _require(isinstance(changes, dict) and bool(changes) and "id" not in changes, "invalid_slot_changes")
             replacement = _slot({**current[identifier], **copy.deepcopy(changes)})
+            policy_only = set(changes) == {"constraint_policy"}
         else:
             replacement = _slot(patch.get("slot"))
             _require(replacement["id"] == identifier, "immutable_slot_id")
         _require(set(current[identifier]["keep"]) <= set(replacement["keep"]), "keep_conflict")
+        for field, rule in current[identifier].get("constraint_policy", {}).items():
+            if rule["level"] == "required" and rule["origin"] in {"user-confirmed", "reference-derived"}:
+                retained = replacement.get("constraint_policy", {}).get(field, {})
+                _require(retained.get("level") == "required" and retained.get("origin") == rule["origin"],
+                         "constraint_policy_provenance_conflict: cannot weaken, remove, or relabel required sources")
         candidate["slots"] = [replacement if slot["id"] == identifier else slot for slot in candidate["slots"]]
     else:
         targets = _strings(patch.get("order"), "order")
@@ -391,7 +413,7 @@ def apply_patch(project: dict[str, Any], patch: dict[str, Any], expected_revisio
     protected = set(plan["coverage"]["preserve_slots"])
     protected.update(_strings(patch.get("preserve_slots", []), "preserve_slots"))
     _require(protected <= set(current), "unknown_preserved_slot")
-    _require(operation == "reorder" or not protected & set(targets), "preserved_slot_conflict")
+    _require(operation == "reorder" or policy_only or not protected & set(targets), "preserved_slot_conflict")
     hashes, finalized = _baseline_snapshot(project, set(current), baseline_hashes)
     declared = patch.get("baseline_hashes", {})
     _require(isinstance(declared, dict) and set(declared) <= set(current), "invalid_baseline_declaration")
@@ -407,11 +429,12 @@ def apply_patch(project: dict[str, Any], patch: dict[str, Any], expected_revisio
     _require(missing <= previous_missing, "coverage_regression: cannot remove required planned views")
     added = targets if operation == "append" else []
     changed = targets if operation in {"edit", "replace"} else []
-    unchanged = [identifier for identifier in current if identifier not in changed]
+    invalidated = [] if policy_only else changed
+    unchanged = [identifier for identifier in current if identifier not in invalidated]
     updated = copy.deepcopy(project)
     updated["scene_plan"] = candidate
     impact = {"op": operation, "added_slots": list(added), "changed_slots": list(changed),
-              "invalidated_slots": list(changed), "preserved_slots": unchanged,
+              "invalidated_slots": list(invalidated), "preserved_slots": unchanged,
               "sequence_changed": True,
               "old_revision": plan["revision"], "new_revision": candidate["revision"],
               "before_hash": before_hash, "after_hash": plan_hash(candidate),
@@ -602,19 +625,36 @@ def compile_slot(project: dict[str, Any], slot_id: str, refs: Any = None) -> dic
     contract_hashes = {pointer: _hash(value) for pointer, value in contracts.items()}
     feedback = _scoped_feedback(project, slot, subjects)
     display = lambda value: json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    policy = slot.get("constraint_policy", {})
+
+    def instruction(field: str, text: str) -> str:
+        rule = policy.get(field)
+        if rule is None:
+            return text
+        label = "建议（advisory，非硬合同）" if rule["level"] == "advisory" else "硬合同（required）"
+        return f"【{field}：{label}；来源={rule['origin']}；依据={rule['evidence']}】{text}"
+
     lines = [f"任务：生成图位 {slot_id} 的独立商业产品场景图；图位作用：{slot['role']}。",
              f"产品形态：{(project.get('answers') or {}).get('product_form') or '沿用已确认产品'}。",
              f"出场主体：{display(subjects)}；仅这些主体出场，不融合角色、不随机新增角色。",
-             f"目标观察方向：{VIEW_LABELS[slot['view']]}（view={slot['view']}）；此为生成目标，不是图像验收结论。",
-             f"产品姿态：{slot['pose']}。构图与景别：{slot['framing']}。"]
+             f"目标观察方向：{VIEW_LABELS[slot['view']]}（view={slot['view']}）；此为生成目标，不是图像验收结论。"]
+    if policy:
+        lines.extend([instruction("pose", f"产品姿态：{slot['pose']}。"),
+                      instruction("framing", f"构图与景别：{slot['framing']}。")])
+        lines.append("仅显式标为 advisory 的字段值是建议，非硬合同；未标字段沿用原有硬约束。"
+                     "实际认脸完整性、目标视角、职责所需信息量、尺度相容性仍必须满足并独立看图验收；"
+                     "建议不能覆盖身份、产品规格与尺寸、role、view、keep、coverage 或用户要求。")
+    else:
+        lines.append(f"产品姿态：{slot['pose']}。构图与景别：{slot['framing']}。")
     if slot["yaw"] is not None:
-        lines.append(f"相对产品正面的水平观察角 yaw={slot['yaw']}°；0°为正面，正值向产品右侧，±180°为背面。")
+        lines.append(instruction("yaw", f"相对产品正面的水平观察角 yaw={slot['yaw']}°；0°为正面，正值向产品右侧，±180°为背面。"))
     if slot["elevation"] is not None:
-        lines.append(f"相机俯仰 elevation={slot['elevation']}°；正值从上往下，负值从下往上，与产品姿态分开。")
+        lines.append(instruction("elevation", f"相机俯仰 elevation={slot['elevation']}°；正值从上往下，负值从下往上，与产品姿态分开。"))
     if slot.get("description"):
-        lines.append("本图新信息：" + slot["description"])
+        lines.append(instruction("description", "本图新信息：" + slot["description"]))
     lines.append("适用设计合同与身份资料：" + display(contracts))
-    lines.append("尺度锚点：" + display(slot["scale_anchor"]) + "；手掌仅作定性参照，不由画面推算厘米；未知尺寸不编造。")
+    lines.append(instruction("scale_anchor", "尺度锚点：" + display(slot["scale_anchor"]))
+                 + "；手掌仅作定性参照，不由画面推算厘米；未知尺寸不编造。")
     lines.append("保持项：" + display(slot["keep"]))
     lines.append("仅本图位适用的反馈：" + display(feedback))
     for index, binding in enumerate(bindings, 1):
@@ -629,5 +669,7 @@ def compile_slot(project: dict[str, Any], slot_id: str, refs: Any = None) -> dic
               "contract_hashes": contract_hashes, "slot_sha256": slot_hash(slot),
               "unhashed_references": list(dict.fromkeys(binding["path"] for binding in bindings if "sha256" not in binding)),
               "evidence": "plan-only", "requires_visual_review": True}
+    if "constraint_policy" in slot:
+        result["constraint_policy"] = copy.deepcopy(slot["constraint_policy"])
     result["signature"] = _hash(result)
     return result

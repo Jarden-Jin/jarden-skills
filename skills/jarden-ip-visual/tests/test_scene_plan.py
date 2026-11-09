@@ -43,6 +43,190 @@ class ScenePlanTests(unittest.TestCase):
         preconditions.setdefault("expected_revision", self.project["scene_plan"]["revision"])
         return scene_plan.apply_patch(self.project, patch, **preconditions)
 
+    def policy(self, level="advisory", origin="agent-inferred"):
+        return {"level": level, "origin": origin, "evidence": "出处审查：此取景建议由 Agent 自设"}
+
+    def policy_patch(self, policy, identifier="cover", **values):
+        return self.patch("edit", slot_id=identifier, changes={"constraint_policy": policy},
+                          scope={"slots": [identifier]}, **values)
+
+    def test_legacy_defaults_and_compile_never_invent_constraint_policy(self):
+        before = copy.deepcopy(self.project)
+        signature = scene_plan.plan_hash(self.project["scene_plan"])
+        for slot in scene_plan.default_plan(self.project, self.base)["slots"]:
+            self.assertNotIn("constraint_policy", slot)
+        compiled = scene_plan.compile_slot(self.project, "cover", [])
+        self.assertNotIn("constraint_policy", compiled)
+        self.assertNotIn("advisory", compiled["prompt"])
+        self.assertIn("产品姿态：保持已确认的产品姿态。构图与景别：完整主体，避免裁切。", compiled["prompt"])
+        self.assertEqual(scene_plan.plan_hash(self.project["scene_plan"]), signature)
+        self.assertEqual(self.project, before)
+
+    def test_constraint_policy_accepts_only_six_fields_and_keeps_independent_evidence(self):
+        for level, origin in (("advisory", "agent-inferred"),
+                              ("required", "agent-inferred"), ("required", "user-confirmed"),
+                              ("required", "reference-derived")):
+            with self.subTest(level=level, origin=origin):
+                plan = copy.deepcopy(self.project["scene_plan"])
+                policy = {field: self.policy(level, origin) for field in
+                          ("framing", "yaw", "elevation", "pose", "scale_anchor", "description")}
+                plan["slots"][0]["constraint_policy"] = policy
+                normalized = scene_plan.validate_plan(plan)
+                self.assertEqual(normalized["slots"][0]["constraint_policy"], policy)
+                self.assertEqual(scene_plan.validate_plan(normalized), normalized)
+                normalized["slots"][0]["constraint_policy"]["framing"]["evidence"] = "另一次审查"
+                self.assertNotEqual(normalized["slots"][0]["constraint_policy"], policy)
+
+    def test_constraint_policy_rejects_malformed_rules_levels_origins_and_empty_evidence(self):
+        invalid = [None, [], "advisory", {"framing": None}, {"framing": {}},
+                   {"framing": {**self.policy(), "extra": True}}]
+        invalid.extend({"framing": {key: value for key, value in self.policy().items() if key != field}}
+                       for field in ("level", "origin", "evidence"))
+        invalid.extend({"framing": {**self.policy(), field: value}} for field, value in
+                       (("level", "optional"), ("level", []), ("origin", "unknown"), ("origin", {}),
+                        ("evidence", ""), ("evidence", " \n"), ("evidence", [])))
+        for policy in invalid:
+            with self.subTest(policy=policy):
+                plan = copy.deepcopy(self.project["scene_plan"])
+                plan["slots"][0]["constraint_policy"] = policy
+                with self.assertRaises(scene_plan.ScenePlanError):
+                    scene_plan.validate_plan(plan)
+
+    def test_constraint_policy_cannot_target_identity_specs_roles_views_keep_or_coverage(self):
+        for field in ("identity", "subject", "subjects", "spec_ref", "spec_refs", "size",
+                      "role", "view", "keep", "coverage", "reference_bindings"):
+            for level in ("required", "advisory"):
+                with self.subTest(field=field, level=level):
+                    with self.assertRaisesRegex(scene_plan.ScenePlanError, "invalid_constraint_policy"):
+                        self.apply(self.policy_patch({field: self.policy(level)}))
+
+    def test_user_and_reference_sources_cannot_be_advisory(self):
+        for origin in ("user-confirmed", "reference-derived"):
+            with self.subTest(origin=origin):
+                before = copy.deepcopy(self.project)
+                with self.assertRaisesRegex(scene_plan.ScenePlanError, "advisory_origin"):
+                    self.apply(self.policy_patch({"framing": self.policy(origin=origin)}))
+                self.assertEqual(self.project, before)
+
+    def test_policy_only_protected_cover_preserves_final_and_invalidates_review_signature(self):
+        self.project["scene_plan"]["coverage"]["preserve_slots"] = ["cover"]
+        self.project["finals"] = [{"slot": "cover", "path": "cover.png", "sha256": self.front_hash}]
+        self.project["feedback"] = [{"scope": {"slots": ["cover"]}, "changes": ["历史负评仍保留"]}]
+        before = copy.deepcopy(self.project)
+        compiled = scene_plan.compile_slot(self.project, "cover", [])
+        other = scene_plan.compile_slot(self.project, "angle", [])
+        updated, impact = self.apply(self.policy_patch({"framing": self.policy()},
+                                                      baseline_hashes={"cover": self.front_hash}))
+        self.assertEqual(self.project, before)
+        expected = copy.deepcopy(before["scene_plan"]["slots"][0])
+        expected["constraint_policy"] = {"framing": self.policy()}
+        self.assertEqual(updated["scene_plan"]["slots"][0], expected)
+        for field in ("finals", "feedback", "product_spec", "selections", "revision"):
+            self.assertEqual(updated[field], before[field])
+        self.assertEqual(impact["changed_slots"], ["cover"])
+        self.assertEqual(impact["invalidated_slots"], [])
+        self.assertIn("cover", impact["preserved_slots"])
+        self.assertEqual(impact["preserved_hashes"]["cover"], self.front_hash)
+        self.assertTrue(impact["sequence_changed"])
+        self.assertTrue(impact["requires_visual_review"])
+        self.assertEqual(impact["new_revision"], impact["old_revision"] + 1)
+        recompiled = scene_plan.compile_slot(updated, "cover", [])
+        self.assertNotEqual(recompiled["signature"], compiled["signature"])
+        self.assertNotEqual(recompiled["slot_sha256"], compiled["slot_sha256"])
+        self.assertEqual(scene_plan.compile_slot(updated, "angle", []), other)
+
+    def test_policy_only_edits_still_require_scope_preconditions_and_final_baseline(self):
+        self.project["scene_plan"]["coverage"]["preserve_slots"] = ["cover"]
+        self.project["finals"] = [{"slot": "cover", "path": "cover.png"}]
+        patch = self.policy_patch({"framing": self.policy()})
+        with self.assertRaisesRegex(scene_plan.ScenePlanError, "missing_precondition"):
+            scene_plan.apply_patch(self.project, patch)
+        with self.assertRaisesRegex(scene_plan.ScenePlanError, "missing_baseline_hash"):
+            self.apply(patch)
+        with self.assertRaisesRegex(scene_plan.ScenePlanError, "missing_baseline_declaration"):
+            self.apply(patch, baseline_hashes={"cover": self.front_hash})
+        patch["baseline_hashes"] = {"cover": "0" * 64}
+        with self.assertRaisesRegex(scene_plan.ScenePlanError, "stale_baseline_hash"):
+            self.apply(patch, baseline_hashes={"cover": self.front_hash})
+        patch["baseline_hashes"] = {"cover": self.front_hash}
+        for scope in ({}, {"slots": []}, {"slots": ["angle"]}):
+            with self.subTest(scope=scope):
+                with self.assertRaisesRegex(scene_plan.ScenePlanError, "scope"):
+                    self.apply({**patch, "scope": scope}, baseline_hashes={"cover": self.front_hash})
+        updated, impact = self.apply(patch, baseline_hashes={"cover": self.front_hash})
+        self.assertEqual(updated["finals"], self.project["finals"])
+        self.assertEqual(impact["invalidated_slots"], [])
+
+    def test_protected_policy_exception_rejects_mixed_edits_and_replace(self):
+        policy = {"framing": self.policy()}
+        patch = self.policy_patch(policy)
+        for protection in ("coverage", "patch"):
+            with self.subTest(protection=protection):
+                self.project["scene_plan"]["coverage"]["preserve_slots"] = ["cover"] if protection == "coverage" else []
+                protected_patch = {**patch, "preserve_slots": ["cover"]}
+                updated, impact = self.apply(protected_patch)
+                self.assertEqual(impact["invalidated_slots"], [])
+                for field, value in (("framing", "只拍半张脸"), ("view", "three-quarter"),
+                                     ("description", "替换信息"), ("pose", self.project["scene_plan"]["slots"][0]["pose"])):
+                    with self.subTest(field=field):
+                        mixed = {**protected_patch, "changes": {"constraint_policy": policy, field: value}}
+                        with self.assertRaisesRegex(scene_plan.ScenePlanError, "preserved_slot_conflict"):
+                            self.apply(mixed)
+                replacement = updated["scene_plan"]["slots"][0]
+                with self.assertRaisesRegex(scene_plan.ScenePlanError, "preserved_slot_conflict"):
+                    self.apply(self.patch("replace", slot_id="cover", slot=replacement,
+                                          scope={"slots": ["cover"]}, preserve_slots=["cover"]))
+
+    def test_required_user_and_reference_policies_cannot_be_removed_downgraded_or_relabeled(self):
+        for origin in ("user-confirmed", "reference-derived"):
+            self.project["scene_plan"]["slots"][3]["constraint_policy"] = {"framing": self.policy("required", origin)}
+            for policy in ({}, {"framing": self.policy()}, {"framing": self.policy("required")},
+                           {"framing": self.policy("advisory", origin)}):
+                for operation in ("edit", "replace"):
+                    with self.subTest(origin=origin, policy=policy, operation=operation):
+                        if operation == "edit":
+                            patch = self.policy_patch(policy, "angle")
+                        else:
+                            replacement = {**self.project["scene_plan"]["slots"][3], "constraint_policy": policy}
+                            patch = self.patch("replace", slot_id="angle", slot=replacement, scope={"slots": ["angle"]})
+                        before = copy.deepcopy(self.project)
+                        with self.assertRaises(scene_plan.ScenePlanError):
+                            self.apply(patch)
+                        self.assertEqual(self.project, before)
+            replacement = {key: value for key, value in self.project["scene_plan"]["slots"][3].items()
+                           if key != "constraint_policy"}
+            with self.assertRaisesRegex(scene_plan.ScenePlanError, "provenance_conflict"):
+                self.apply(self.patch("replace", slot_id="angle", slot=replacement, scope={"slots": ["angle"]}))
+
+    def test_agent_required_can_be_explicitly_calibrated_without_changing_values_or_specs(self):
+        slot = self.project["scene_plan"]["slots"][0]
+        slot["framing"] = "主体占画面70%，上方留白，道具靠左"
+        slot["constraint_policy"] = {"framing": self.policy("required")}
+        before = copy.deepcopy(self.project)
+        updated, impact = self.apply(self.policy_patch({"framing": self.policy()}))
+        self.assertEqual(updated["scene_plan"]["slots"][0]["framing"], slot["framing"])
+        self.assertEqual(updated["product_spec"], before["product_spec"])
+        self.assertEqual(impact["invalidated_slots"], [])
+        self.assertEqual(self.project, before)
+
+    def test_compile_marks_each_advisory_value_and_keeps_actual_visual_obligations(self):
+        slot = self.project["scene_plan"]["slots"][0]
+        slot.update(yaw=15, elevation=10, description="桌面道具靠右", scale_anchor="手掌在旁")
+        policy = {field: self.policy() for field in
+                  ("framing", "yaw", "elevation", "pose", "scale_anchor", "description")}
+        slot["constraint_policy"] = policy
+        compiled = scene_plan.compile_slot(self.project, "cover", [])
+        self.assertEqual(compiled["constraint_policy"], policy)
+        for field in policy:
+            self.assertIn(f"【{field}：建议（advisory，非硬合同）", compiled["prompt"])
+        for text in ("实际认脸完整性", "目标视角", "信息量", "尺度相容性", "view=front",
+                     "保持项", "不能覆盖身份", "用户要求", "手掌仅作定性参照", "出处审查"):
+            self.assertIn(text, compiled["prompt"])
+        compiled["constraint_policy"]["framing"]["evidence"] = "返回值副本"
+        self.assertNotEqual(compiled["constraint_policy"], slot["constraint_policy"])
+        slot["constraint_policy"]["framing"] = self.policy("required", "user-confirmed")
+        self.assertIn("【framing：硬合同（required）", scene_plan.compile_slot(self.project, "cover", [])["prompt"])
+
     def test_default_projects_old_slots_without_changing_inputs_or_requiring_three_views(self):
         original = copy.deepcopy(self.project)
         legacy = copy.deepcopy(self.project)
