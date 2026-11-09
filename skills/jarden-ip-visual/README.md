@@ -1,5 +1,10 @@
 # jarden-ip-visual
 
+<p align="center">
+  <img src="./assets/readme/hero.png" width="100%"
+       alt="jarden-ip-visual：把原创草图做成毛绒、拼图和手办等 IP 周边视觉，逐轮确认后交付图片、文案与 tag；右侧为同一长耳兔项目的 AI 设计效果图。">
+</p>
+
 把原创 IP 的线框图、灵感图或平面 AI 图，逐步做成毛绒、手办、拼图等实体周边的商业视觉。每轮用 HTML 工作台看图、比较和确认：当前候选、上次交付、改动与保持项放在一起，最后交付可以直接发小红书的顺序图片、标题、正文与 tag。
 
 ## 会得到什么
