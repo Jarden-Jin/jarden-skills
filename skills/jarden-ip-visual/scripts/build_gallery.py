@@ -154,6 +154,7 @@ def plan_view(root: Path, project: dict[str, Any]) -> dict[str, Any] | None:
             "id": slot["id"], "role": slot["role"], "subject": subject_name(slot.get("subject")),
             "subjects": [subject_name(identifier) for identifier in slot.get("subjects") or []], "view": slot["view"], "pose": slot["pose"], "framing": slot["framing"],
             "keep": slot["keep"], "preserve": slot["id"] in preserved,
+            "constraint_policy": copy.deepcopy(slot.get("constraint_policy") or {}),
             "image": contract_image(root, final.get("path")) if final else None,
             "image_state": "pending_change" if final and final.get("pending_change") else "retained" if final else "pending",
         })

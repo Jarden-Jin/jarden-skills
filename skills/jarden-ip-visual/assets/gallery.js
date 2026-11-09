@@ -503,6 +503,10 @@
           el("h3", { text: `${slot.id} · ${viewLabel(slot.view)}${slot.subject ? ` · ${slot.subject}` : slot.subjects?.length ? ` · ${slot.subjects.join("、")}` : ""}` }),
           el("p", { text: `姿态：${slot.pose || "待补"}` }),
           el("p", { text: `取景：${slot.framing || "待补"}` }),
+          ...Object.entries(slot.constraint_policy || {}).map(([field, rule]) => el("p", {
+            class: "meta",
+            text: `${({ framing: "取景", yaw: "方位", elevation: "相机高低", pose: "姿态", scale_anchor: "尺度表达", description: "图位说明" })[field] || field}：${rule.level === "advisory" ? "Agent 建议，非额外硬要求" : "必需约束"} · ${rule.origin === "agent-inferred" ? "设计推定" : rule.origin === "user-confirmed" ? "用户提供" : "参考来源"} · ${rule.evidence || "依据待补"}`
+          })),
           el("p", { class: "meta", text: `保持状态：${slot.preserve ? "要求保留原图；" : ""}${slot.image_state === "pending_change" ? "原图待修改" : slot.image_state === "retained" && slot.image?.exists ? "原图已保留，验收见 G1" : "图片待补"}${slot.keep?.length ? ` · 保持项：${slot.keep.join("、")}` : ""}` }),
           slot.image?.original_path ? el("small", { class: "asset-path", text: `原图：${slot.image.original_path}` }) : null
         ])

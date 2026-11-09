@@ -266,6 +266,19 @@ class ContractGalleryTests(unittest.TestCase):
         self.assertTrue(manifest["next"]["field"].startswith("product.size:"))
         self.assertTrue(self.run_page(page)["initial"]["text"])
 
+    def test_explicit_advisory_policy_is_visible_and_frozen_without_weakening_product_size(self):
+        current = self.current()
+        current["scene_plan"]["slots"][0]["constraint_policy"] = {
+            "framing": {"level": "advisory", "origin": "agent-inferred", "evidence": "原始用户需求未给画高百分比，这是设计建议"}
+        }
+        project.atomic_json(self.root / "project.json", current)
+        page, manifest = self.present()
+        visible = self.run_page(page)["text"]
+        self.assertIn("Agent 建议，非额外硬要求", visible)
+        self.assertIn("原始用户需求未给画高百分比", visible)
+        self.assertIn("高 12、宽 8 cm", visible)
+        self.assertEqual(manifest["view"]["scene_plan"]["slots"][0]["constraint_policy"]["framing"]["origin"], "agent-inferred")
+
     def test_append_angle_keeps_front_snapshot_and_view_provenance_after_move(self):
         self.approve_round()
         front = self.scene_set()[0]
