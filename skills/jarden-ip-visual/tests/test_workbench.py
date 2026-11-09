@@ -532,10 +532,10 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(first["open"]["status"], "unavailable")
 
     def test_child_has_bounded_ttl(self):
-        with mock.patch.object(workbench, "SERVER_TTL", 1), self.launch_spy():
+        with mock.patch.object(workbench, "SERVER_TTL", 4), self.launch_spy():
             result = self.run_workbench(serve=True)
         self.assertTrue(result["server"]["created"])
-        self.launched[0].wait(timeout=3)
+        self.launched[0].wait(timeout=8)
         self.assertEqual(self.launched[0].returncode, 0)
         self.assertFalse(workbench.healthy_server(self.root, self.current["project_id"], result["server"]))
 
@@ -550,7 +550,8 @@ class WorkbenchTests(unittest.TestCase):
             return child
 
         started = time.monotonic()
-        with mock.patch.object(workbench.subprocess, "Popen", side_effect=slow_launch):
+        with mock.patch.object(workbench, "SERVER_READY_TIMEOUT", 0.3), \
+                mock.patch.object(workbench.subprocess, "Popen", side_effect=slow_launch):
             result = self.run_workbench(serve=True)
         self.assertLess(time.monotonic() - started, 3)
         self.assertEqual(result["server"]["status"], "unavailable")

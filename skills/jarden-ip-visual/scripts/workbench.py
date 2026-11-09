@@ -26,9 +26,9 @@ import project as state
 import runtime_activity
 
 
-SERVER_READY_TIMEOUT = 2.0
+SERVER_READY_TIMEOUT = 8.0
 SERVER_TTL = 1800
-HEALTH_TIMEOUT = 0.25
+HEALTH_TIMEOUT = 1.5
 MAX_HEALTH_BYTES = 1024 * 1024
 
 

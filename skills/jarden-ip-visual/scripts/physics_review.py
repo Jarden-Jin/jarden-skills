@@ -26,6 +26,7 @@ contact_anatomy：人体结构、承托、压痕、遮挡、穿插与接触。
 lighting_perspective：光源、反射、接触影、平面透视及厚度。
 overall_realism：上述局部共同构成的物理可信度，不以漂亮或文案解释补救。
 明显缺陷判 needs_revision；决定真实性的关键关系看不清判 uncertain，不能当 pass。
+普通自然遮挡本身不是缺陷：衣领遮肩根、围巾交叠、微距裁出脚部，不能仅因未展示完整内部接缝自动 uncertain。须指出具体可见异常、不连续载荷路径，或该镜头承担的关键连接确因遮挡无法验证。微距只在实际可见范围判断 overall_realism，不据此宣称图外稳定或材料强度；仍不得为漂浮、穿模、断接脑补隐藏支架、胶粘或特殊刚度。
 纯二维说明页可在不适用项填 not_applicable 并解释，但不得用它豁免实际画出的产品或场景。
 这是视觉物理审查，不是刚体或数值物理仿真；不要宣称运行物理引擎。
 返回 JSON：schema_version=1、request_id、reviewer={id:实际Agent标识,zero_context:true,viewed_images:true}、results。

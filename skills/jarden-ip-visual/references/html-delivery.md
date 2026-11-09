@@ -33,7 +33,7 @@
 
 workbench 用 `.workbench/presentation.json` 比较业务版本、项目 fingerprint、源文件/round.json/审查摘要、实际 next、最近 manifest/index.html 与快照完整性。全部一致才 `presentation.reused=true` 并重建当前 gallery；否则调用 present_round 创建新 Dxxxx。直接反复调用 present_round 会创建新交付，不具备这项复用判断。
 
-服务记录在 `.workbench/server.json`，按真实项目、project_id、PID、URL、token 与 `/api/state` 健康响应核对；已有健康服务才 `server.reused=true`，否则受锁保护启动 serve_gallery。当前就绪等待预算为 2 秒，启动的服务时限为 1800 秒；不可用时返回静态入口与“新选择尚未提交”，不假装交互模式成功。旧 schema 不启动可写服务。
+服务记录在 `.workbench/server.json`，按真实项目、project_id、PID、URL、token 与 `/api/state` 健康响应核对；已有健康服务才 `server.reused=true`，否则受锁保护启动 serve_gallery。当前就绪等待预算为 8 秒，单次健康请求预算 1.5 秒，启动的服务时限为 1800 秒；冷启动或较慢机器不因过短探测反复启停。不可用时有界返回静态入口与“新选择尚未提交”，不假装交互模式成功。旧 schema 不启动可写服务。
 
 返回 JSON 包含 presentation、delivery_id、gallery、url、server、open、interaction、next/project_next、committed_receipt/receipts、generation_tasks。最后两项生成控制标记 automatic_generation 和 should_call 始终 false，工作台不会代宿主调用原生图片工具。
 
