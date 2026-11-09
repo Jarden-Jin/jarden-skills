@@ -5,10 +5,12 @@ import ast
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import copy
+import http.client
 import io
 import json
 import os
 from pathlib import Path
+import socket
 import stat
 import struct
 import subprocess
@@ -444,6 +446,41 @@ class WorkbenchTests(unittest.TestCase):
                 self.assertEqual(result["interaction"]["mode"], "static")
                 self.assertEqual(original, (self.root / "project.json").read_bytes())
                 self.assertFalse((self.root / "deliveries").exists())
+
+    def test_loopback_server_uses_numeric_identity_without_dns(self):
+        token = uuid.uuid4().hex
+        with mock.patch.object(socket, "getfqdn", side_effect=RuntimeError("reverse DNS unavailable")) as dns:
+            server = serve_gallery.server_for(self.root, token)
+            self.addCleanup(server.server_close)
+            self.assertEqual(server.server_name, "127.0.0.1")
+            self.assertGreater(server.server_port, 0)
+            self.assertEqual(server.socket.getsockname(), ("127.0.0.1", server.server_port))
+            worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
+            worker.start()
+
+            def close():
+                server.shutdown()
+                worker.join(timeout=2)
+
+            self.addCleanup(close)
+            authorized = {"Authorization": "Bearer " + token}
+            for headers, expected_status in (
+                (authorized, 200),
+                ({}, 403),
+                ({**authorized, "Host": "example.com"}, 403),
+                ({**authorized, "Origin": "http://example.com"}, 403),
+            ):
+                with self.subTest(headers=list(headers), expected_status=expected_status), contextlib.closing(
+                    http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+                ) as connection:
+                    connection.request("GET", "/api/state", headers=headers)
+                    response = connection.getresponse()
+                    payload = json.loads(response.read())
+                    self.assertEqual(response.status, expected_status)
+                    self.assertEqual(payload["ok"], expected_status == 200)
+                    if expected_status == 200:
+                        self.assertEqual(payload["project_id"], self.current["project_id"])
+            dns.assert_not_called()
 
     def test_health_checked_server_reuses_authenticated_same_project(self):
         info = self.live_server()

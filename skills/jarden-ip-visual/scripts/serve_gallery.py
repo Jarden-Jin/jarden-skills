@@ -14,9 +14,16 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 from urllib.parse import unquote, urlsplit
 
 import project as state
+
+
+class LoopbackHTTPServer(ThreadingHTTPServer):
+    def server_bind(self) -> None:
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 def resources(root: Path) -> set[str]:
@@ -139,7 +146,7 @@ def server_for(root: Path, token: str, port: int = 0) -> ThreadingHTTPServer:
             except (state.ProjectError, OSError, ValueError) as error:
                 self.json_response(409, {"ok": False, "committed": False, "error": str(error)})
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server = LoopbackHTTPServer(("127.0.0.1", port), Handler)
     server.daemon_threads = True
     return server
 
