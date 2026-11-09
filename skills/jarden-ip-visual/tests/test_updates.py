@@ -80,7 +80,7 @@ class FixtureMixin:
             payload = {"parse_error": result.stdout}
         return result, payload
 
-    def make_release_files(self, root: Path, version: str) -> tuple[Path, Path, dict]:
+    def make_release_files(self, root: Path, version: str, project_schema: dict | None = None) -> tuple[Path, Path, dict]:
         archive_path = self.temp / f"{root.name}-{version}.zip"
         files = []
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
@@ -117,7 +117,7 @@ class FixtureMixin:
                 "sha256": digest(archive_bytes),
             },
             "files": files,
-            "project_schema": {"read": [1, 2], "write": [2]},
+            "project_schema": project_schema if project_schema is not None else {"read": [1, 2], "write": [2]},
             "dependencies": {"python": ">=3.10", "pillow": "required-for-image-operations"},
             "change_type": "minor",
             "migration_notes": (
@@ -146,6 +146,7 @@ class FixtureMixin:
     def source_cli(
         self, root: Path, release_path: Path, archive_path: Path,
         *args: str, extra_env: dict[str, str] | None = None,
+        available_releases: list[dict] | None = None,
     ) -> tuple[subprocess.CompletedProcess, dict]:
         helper = """
 import json
@@ -161,6 +162,7 @@ index = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
 index = {key: value for key, value in index.items() if not key.startswith("_")}
 index_bytes = (json.dumps(index, sort_keys=True, ensure_ascii=False) + "\\n").encode("utf-8")
 archive = Path(sys.argv[3]).read_bytes()
+listing = json.loads(sys.argv[4])
 tag = index["tag"]
 base = update_runtime.RELEASE_DOWNLOAD_PREFIX + quote(tag, safe="") + "/"
 index_url = base + "release.json"
@@ -176,7 +178,7 @@ release = {
 def request(source, url, accept="application/vnd.github+json", limit=None):
     responses = {
         update_runtime.API_ROOT + "/releases/tags/" + quote(tag, safe=""): json.dumps(release).encode(),
-        update_runtime.API_ROOT + "/releases?per_page=100": json.dumps([release]).encode(),
+        update_runtime.API_ROOT + "/releases?per_page=100": json.dumps(listing if listing is not None else [release]).encode(),
         update_runtime.API_ROOT + "/releases/assets/1": index_bytes,
         update_runtime.API_ROOT + "/releases/assets/2": archive,
     }
@@ -185,13 +187,13 @@ def request(source, url, accept="application/vnd.github+json", limit=None):
     return responses[url]
 
 script = Path(sys.argv[1]) / "check_update.py"
-sys.argv = [str(script), *sys.argv[4:]]
+sys.argv = [str(script), *sys.argv[5:]]
 with mock.patch.object(update_runtime.Source, "_request", request):
     runpy.run_path(str(script), run_name="__main__")
 """
         result = self.run_command([
             sys.executable, "-c", helper, str(root / "scripts"),
-            str(release_path), str(archive_path), *args,
+            str(release_path), str(archive_path), json.dumps(available_releases), *args,
         ], extra_env=extra_env)
         payload = json.loads(result.stdout.strip().splitlines()[-1]) if result.stdout.strip() else {}
         return result, payload
@@ -662,6 +664,91 @@ with mock.patch.object(update_runtime, "Source", return_value=source) as constru
 
 
 class CheckStateTests(FixtureMixin, unittest.TestCase):
+    def test_release_and_plan_accept_only_supported_project_schema_declarations(self):
+        self.standard_fixture()
+        declarations = (
+            {"read": [1, 2], "write": [2]},
+            {"read": [1, 2, 3], "write": [3]},
+        )
+        for index, declaration in enumerate(declarations):
+            with self.subTest(declaration=declaration):
+                release_path, archive_path, public = self.make_release_files(self.new, "0.2.0", declaration)
+                self.assertIs(update_runtime.validate_release(public), public)
+                self.assertEqual(public["schema_version"], 1)
+                output = self.temp / f"schema-plan-{index}.json"
+                result, plan = self.source_cli(
+                    self.inst, release_path, archive_path,
+                    "plan", "--version", "0.2.0", "--out", str(output),
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(plan["compatibility"], declaration)
+                with mock.patch.object(update_runtime, "real_root", return_value=self.inst):
+                    self.assertEqual(update_runtime.validate_plan(plan), plan)
+
+    def test_invalid_project_schema_is_rejected_by_release_and_plan_validators(self):
+        self.standard_fixture()
+        plan = self.plan()
+        _, _, release = self.make_release_files(self.new, "0.2.0")
+        invalid = (
+            None, [], "3", {},
+            {"read": [1, 2, 3]},
+            {"read": [1, 2, 3], "write": [3], "future": True},
+            {"read": [1, 2, 3, 4], "write": [4]},
+            {"read": [1, 2, 3], "write": [2]},
+            {"read": [1, 2], "write": [3]},
+            {"read": [3], "write": [3]},
+            {"read": [1, 2, 3], "write": []},
+            {"read": [1, 2, 3], "write": [2, 3]},
+            {"read": [1, 2, 2, 3], "write": [3]},
+            {"read": [3, 2, 1], "write": [3]},
+            {"read": [True, 2], "write": [2]},
+            {"read": [1, 2.0, 3], "write": [3]},
+            {"read": [1, 2, 3], "write": [3.0]},
+            {"read": ["1", 2, 3], "write": [3]},
+            {"read": (1, 2), "write": [2]},
+        )
+        for declaration in invalid:
+            with self.subTest(declaration=declaration):
+                release["project_schema"] = declaration
+                with self.assertRaises(update_runtime.UpdateError) as error:
+                    update_runtime.validate_release(release)
+                self.assertEqual(error.exception.code, "incompatible_manifest")
+                changed = {**plan, "compatibility": declaration}
+                changed.pop("summary")
+                changed["summary"] = update_runtime.plan_bytes(changed)
+                with mock.patch.object(update_runtime, "real_root", return_value=self.inst):
+                    with self.assertRaises(update_runtime.UpdateError) as error:
+                        update_runtime.validate_plan(changed)
+                self.assertEqual(error.exception.code, "invalid_plan")
+
+    def test_invalid_project_schema_stops_real_plan_cli_without_install_changes(self):
+        self.standard_fixture()
+        release_path, archive_path, _ = self.make_release_files(
+            self.new, "0.2.0", {"read": [1, 2, 3], "write": [2, 3]},
+        )
+        output = self.temp / "invalid-schema-plan.json"
+        before = self.snapshot(self.inst)
+        result, payload = self.source_cli(
+            self.inst, release_path, archive_path,
+            "plan", "--version", "0.2.0", "--out", str(output),
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(payload["code"], "incompatible_manifest")
+        self.assertFalse(output.exists())
+        self.assertEqual(self.snapshot(self.inst), before)
+
+    def test_selfcheck_reports_updater_acceptance_without_claiming_project_migration(self):
+        self.write_skill(self.inst, "0.1.0")
+        before = (self.project / "project.json").read_bytes()
+        result, payload = self.cli(self.inst, "selfcheck", "--json")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(payload["release_index_schema"], 1)
+        self.assertEqual(payload["accepted_project_schemas"], [
+            {"read": [1, 2], "write": [2]},
+            {"read": [1, 2, 3], "write": [3]},
+        ])
+        self.assertEqual((self.project / "project.json").read_bytes(), before)
+
     def test_maintenance_subprocesses_never_read_or_inherit_image_credentials(self):
         values = {"HOME": str(self.temp), "PATH": "/usr/bin:/bin", "JARDEN_UPDATE_HOME": str(self.updates)}
         values.update(dict.fromkeys(("JARDEN_IP_VISUAL_IMAGE_API_KEY", "OPENAI_API_KEY"), "synthetic-not-a-credential"))
@@ -888,6 +975,77 @@ class ReleaseBuilderTests(unittest.TestCase):
             "--change-type", "minor", "--output-dir", str(self.root / name),
         ], text=True, capture_output=True, timeout=40)
 
+    def commit_project(self, source: str) -> Path:
+        path = self.repo / "skills" / "jarden-ip-visual" / "scripts" / "project.py"
+        path.write_text(source, encoding="utf-8")
+        self.git("add", "--", "skills/jarden-ip-visual/scripts/project.py")
+        self.git("commit", "-m", "project schema fixture")
+        self.commit = self.git("rev-parse", "HEAD").strip()
+        self.git("tag", "-f", "jarden-ip-visual/v0.2.0", self.commit)
+        return path
+
+    def test_missing_project_blob_uses_legacy_declaration_not_untracked_worktree(self):
+        path = self.repo / "skills" / "jarden-ip-visual" / "scripts" / "project.py"
+        path.write_text("SCHEMA_VERSION = 3\n", encoding="utf-8")
+        result = self.build("legacy-fixture")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        release = json.loads((self.root / "legacy-fixture/release.json").read_text(encoding="utf-8"))
+        self.assertEqual(release["project_schema"], {"read": [1, 2], "write": [2]})
+        self.assertEqual(release["schema_version"], 1)
+        with zipfile.ZipFile(self.root / "legacy-fixture/jarden-ip-visual-0.2.0.zip") as archive:
+            self.assertNotIn("jarden-ip-visual/scripts/project.py", archive.namelist())
+
+    def test_schema_three_comes_from_fixed_blob_without_executing_project(self):
+        marker = self.root / "project-executed"
+        source = f"from pathlib import Path\nSCHEMA_VERSION: int = 3\nPath({str(marker)!r}).write_text('executed')\n"
+        path = self.commit_project(source)
+        path.write_text("SCHEMA_VERSION = 2\n", encoding="utf-8")
+        result = self.build("schema-three")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        release = json.loads((self.root / "schema-three/release.json").read_text(encoding="utf-8"))
+        self.assertEqual(release["project_schema"], {"read": [1, 2, 3], "write": [3]})
+        self.assertEqual(release["schema_version"], 1)
+        update_runtime.validate_release(release, "0.2.0")
+        self.assertFalse(marker.exists())
+        with zipfile.ZipFile(self.root / "schema-three/jarden-ip-visual-0.2.0.zip") as archive:
+            self.assertEqual(archive.read("jarden-ip-visual/scripts/project.py"), source.encode())
+
+    def test_older_schema_blob_is_used_even_when_head_has_schema_three(self):
+        path = self.commit_project("SCHEMA_VERSION = 2\n")
+        pinned = self.commit
+        path.write_text("SCHEMA_VERSION = 3\n", encoding="utf-8")
+        self.git("add", "--", "skills/jarden-ip-visual/scripts/project.py")
+        self.git("commit", "-m", "newer schema fixture")
+        self.assertNotEqual(self.git("rev-parse", "HEAD").strip(), pinned)
+        result = self.build("pinned-old-schema")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        release = json.loads((self.root / "pinned-old-schema/release.json").read_text(encoding="utf-8"))
+        self.assertEqual(release["commit"], pinned)
+        self.assertEqual(release["project_schema"], {"read": [1, 2], "write": [2]})
+        with zipfile.ZipFile(self.root / "pinned-old-schema/jarden-ip-visual-0.2.0.zip") as archive:
+            self.assertEqual(archive.read("jarden-ip-visual/scripts/project.py"), b"SCHEMA_VERSION = 2\n")
+
+    def test_builder_rejects_unsupported_or_ambiguous_project_schema_blob(self):
+        sources = (
+            "SCHEMA_VERSION = 4\n",
+            "SCHEMA_VERSION = True\n",
+            "SCHEMA_VERSION = 3.0\n",
+            "SCHEMA_VERSION = '3'\n",
+            "SCHEMA_VERSION = 2 + 1\n",
+            "SCHEMA_VERSION = 2\nSCHEMA_VERSION = 3\n",
+            "def later():\n    SCHEMA_VERSION = 3\n",
+            "SCHEMA_VERSION: int\n",
+            "other = SCHEMA_VERSION = 3\n",
+            "SCHEMA_VERSION = 3\nSCHEMA_VERSION += 1\n",
+            "SCHEMA_VERSION =\n",
+        )
+        for index, source in enumerate(sources):
+            with self.subTest(source=source):
+                self.commit_project(source)
+                result = self.build(f"invalid-schema-{index}")
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertFalse((self.root / f"invalid-schema-{index}").exists())
+
     def test_deterministic_release_from_commit_excludes_evals_and_external_index(self):
         first = self.build("dist-a")
         second = self.build("dist-b")
@@ -902,6 +1060,7 @@ class ReleaseBuilderTests(unittest.TestCase):
         release = json.loads(index_a.read_text(encoding="utf-8"))
         self.assertEqual(release["tag"], "jarden-ip-visual/v0.2.0")
         self.assertEqual(release["commit"], self.commit)
+        self.assertEqual(release["project_schema"], {"read": [1, 2], "write": [2]})
         self.assertEqual(release["archive"]["sha256"], digest(zip_a.read_bytes()))
         with zipfile.ZipFile(zip_a) as archive:
             names = archive.namelist()
@@ -932,6 +1091,115 @@ class ReleaseBuilderTests(unittest.TestCase):
         again = self.build("stable")
         self.assertNotEqual(again.returncode, 0)
         self.assertIn("拒绝覆盖", again.stdout)
+
+
+@unittest.skipUnless((REPO / ".git").exists(), "真实旧版桥接测试只在源码仓库运行")
+class LegacyBridgeTests(FixtureMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_skill(self.inst, "0.1.0")
+        baseline = "b301c4957350f9e10f7b9bbf12003ff578bd3b50"
+        for name in ("update_runtime.py", "check_update.py", "runtime_activity.py"):
+            result = self.run_command([
+                "git", "-C", str(REPO), "show", f"{baseline}:skills/jarden-ip-visual/scripts/{name}",
+            ])
+            if result.returncode:
+                self.skipTest("源码仓库没有固定旧版 commit，无法验证真实旧更新器")
+            (self.inst / "scripts" / name).write_text(result.stdout, encoding="utf-8")
+        self.write_skill(self.new, "0.2.0")
+        (self.new / "scripts/project.py").write_text("SCHEMA_VERSION = 2\n", encoding="utf-8")
+        self.modern = self.temp / "schema-three"
+        self.write_skill(self.modern, "0.3.0")
+        (self.modern / "scripts/project.py").write_text("SCHEMA_VERSION = 3\n", encoding="utf-8")
+        self.bridge_release = self.make_release_files(self.new, "0.2.0")
+        self.modern_release = self.make_release_files(
+            self.modern, "0.3.0", {"read": [1, 2, 3], "write": [3]},
+        )
+        self.listing = [{"tag_name": release[2]["tag"], "draft": False, "prerelease": False}
+                        for release in (self.bridge_release, self.modern_release)]
+
+    def interrupt_install(self, plan_path: Path) -> None:
+        before = self.snapshot(self.inst)
+        version = self.version()
+        helper = """
+import os
+import runpy
+import shutil
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+original_copy = shutil.copy2
+def interrupted_copy(source, destination, *args, **kwargs):
+    if str(destination).endswith(".jarden-tmp"):
+        Path(destination).write_bytes(b"interrupted-bridge-candidate")
+        os._exit(97)
+    return original_copy(source, destination, *args, **kwargs)
+shutil.copy2 = interrupted_copy
+script = str(Path(sys.argv[1]) / "check_update.py")
+sys.argv = [script, "apply", "--plan", sys.argv[2], "--yes", "--json"]
+runpy.run_path(script, run_name="__main__")
+"""
+        result = self.run_command([
+            sys.executable, "-B", "-c", helper, str(self.inst / "scripts"), str(plan_path),
+        ])
+        self.assertEqual(result.returncode, 97, result.stdout + result.stderr)
+        result, payload = self.cli(self.inst, "status", "--recover", "--yes", "--json")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(payload["needs_recovery"])
+        self.assertEqual(payload["version"], version)
+        self.assertEqual(self.snapshot(self.inst), before)
+
+    def exercise_bridge(self, interrupt: bool = False) -> None:
+        project_before = (self.project / "project.json").read_bytes()
+        result, payload = self.source_cli(
+            self.inst, *self.modern_release[:2], "check", "--force", "--json",
+            available_releases=self.listing,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(payload["latest"], "0.3.0")
+        self.assertTrue(payload["update_available"])
+        before = self.snapshot(self.inst)
+        rejected = self.temp / "skipped-bridge-plan.json"
+        result, payload = self.source_cli(
+            self.inst, *self.modern_release[:2],
+            "plan", "--version", "0.3.0", "--out", str(rejected),
+            available_releases=self.listing,
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(payload["code"], "incompatible_manifest")
+        self.assertFalse(rejected.exists())
+        self.assertEqual(self.snapshot(self.inst), before)
+        for release_path, archive_path, public in (self.bridge_release, self.modern_release):
+            with self.subTest(version=public["version"], interrupt=interrupt):
+                plan_path = self.temp / f"bridge-step-{public['version']}.json"
+                result, plan = self.source_cli(
+                    self.inst, release_path, archive_path,
+                    "plan", "--version", public["version"], "--out", str(plan_path),
+                    available_releases=self.listing,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(plan["schema_version"], 1)
+                self.assertEqual(plan["compatibility"], public["project_schema"])
+                if interrupt:
+                    self.interrupt_install(plan_path)
+                result, payload = self.apply(plan_path)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(payload["phase"], "committed")
+                result, verified = self.cli(self.inst, "selfcheck", "--json")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(verified["version"], public["version"])
+                self.assertEqual(verified["release_index_schema"], 1)
+                self.assertIn({"read": [1, 2, 3], "write": [3]}, verified["accepted_project_schemas"])
+                receipt = json.loads((self.inst / ".jarden-install.json").read_text(encoding="utf-8"))
+                self.assertEqual(receipt["archive_sha256"], public["archive"]["sha256"])
+                self.assertEqual((self.project / "project.json").read_bytes(), project_before)
+        self.assertEqual(self.version(), "0.3.0")
+
+    def test_old_updater_requires_explicit_bridge_before_schema_three_release(self):
+        self.exercise_bridge()
+
+    def test_both_bridge_install_steps_recover_before_retry(self):
+        self.exercise_bridge(interrupt=True)
 
 
 class ReaderConcurrencyTests(FixtureMixin, unittest.TestCase):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import io
 import json
@@ -17,7 +18,10 @@ REPOSITORY = "Jarden-Jin/jarden-skills"
 SKILL_NAME = "jarden-ip-visual"
 SKILL_PATH = PurePosixPath("skills") / SKILL_NAME
 CHANNEL = "stable"
-PROJECT_SCHEMA = {"read": [1, 2], "write": [2]}
+PROJECT_SCHEMAS = {
+    2: {"read": [1, 2], "write": [2]},
+    3: {"read": [1, 2, 3], "write": [3]},
+}
 DEPENDENCIES = {"python": ">=3.10", "pillow": "required-for-image-operations"}
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 MAX_FILES = 2000
@@ -50,6 +54,28 @@ def version_of(source: str) -> str:
     if not re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", value):
         raise BuildError("metadata.version 不是 MAJOR.MINOR.PATCH")
     return value
+
+
+def project_schema_of(source: bytes | None) -> dict:
+    version = 2
+    if source is not None:
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError, UnicodeError) as error:
+            raise BuildError("固定 commit 中 project.py 无法解析") from error
+        bindings = [node for node in ast.walk(tree) if isinstance(node, ast.Name)
+                    and node.id == "SCHEMA_VERSION" and isinstance(node.ctx, ast.Store)]
+        declarations = [node.value for node in tree.body if
+                        isinstance(node, ast.Assign) and len(node.targets) == 1
+                        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "SCHEMA_VERSION"
+                        or isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+                        and node.target.id == "SCHEMA_VERSION"]
+        if len(bindings) != 1 or len(declarations) != 1 or not isinstance(declarations[0], ast.Constant):
+            raise BuildError("固定 commit 中 project.py 必须有唯一的顶层整数 SCHEMA_VERSION 声明")
+        version = declarations[0].value
+    if type(version) is not int or version not in PROJECT_SCHEMAS:
+        raise BuildError("固定 commit 中 project.py 的项目 schema 不受支持")
+    return {field: list(values) for field, values in PROJECT_SCHEMAS[version].items()}
 
 
 def excluded(path: str) -> bool:
@@ -109,6 +135,7 @@ def build(repo: Path, commit: str, version: str, change_type: str) -> tuple[byte
         raise BuildError("--version 与固定 commit 中 SKILL.md metadata.version 不一致")
     files = commit_files(repo, commit)
     manifest = []
+    project_schema = project_schema_of(None)
     archive_buffer = io.BytesIO()
     total = 0
     with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
@@ -120,6 +147,8 @@ def build(repo: Path, commit: str, version: str, change_type: str) -> tuple[byte
             total += len(blob)
             if total > MAX_ARCHIVE_BYTES:
                 raise BuildError("发行解压总大小超过限制")
+            if relative == "scripts/project.py":
+                project_schema = project_schema_of(blob)
             package_path = f"{SKILL_NAME}/{relative}"
             info = zipfile.ZipInfo(package_path, date_time=ZIP_TIME)
             info.compress_type = zipfile.ZIP_DEFLATED
@@ -155,7 +184,7 @@ def build(repo: Path, commit: str, version: str, change_type: str) -> tuple[byte
             "sha256": hashlib.sha256(archive_bytes).hexdigest(),
         },
         "files": manifest,
-        "project_schema": PROJECT_SCHEMA,
+        "project_schema": project_schema,
         "dependencies": DEPENDENCIES,
         "change_type": change_type,
         "migration_notes": migration_notes,

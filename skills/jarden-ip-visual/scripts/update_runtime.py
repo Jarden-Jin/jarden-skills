@@ -30,6 +30,10 @@ from runtime_activity import (
 
 
 SCHEMA_VERSION = 1
+ACCEPTED_PROJECT_SCHEMAS = (
+    {"read": [1, 2], "write": [2]},
+    {"read": [1, 2, 3], "write": [3]},
+)
 REPOSITORY = "Jarden-Jin/jarden-skills"
 SKILL_NAME = "jarden-ip-visual"
 SKILL_PATH = "skills/jarden-ip-visual"
@@ -202,6 +206,15 @@ def normalize_manifest_files(files: object, release: bool = True) -> list[dict]:
     return result
 
 
+def validate_project_schema(value: object, code: str = "incompatible_manifest") -> dict:
+    if not isinstance(value, dict) or set(value) != {"read", "write"}:
+        raise UpdateError("项目 schema 兼容声明无效", code)
+    if any(not isinstance(value[field], list) or any(type(version) is not int for version in value[field])
+           for field in ("read", "write")) or value not in ACCEPTED_PROJECT_SCHEMAS:
+        raise UpdateError("项目 schema 兼容声明不受支持", code)
+    return value
+
+
 def validate_release(value: dict, expected_version: str | None = None) -> dict:
     required = {
         "schema_version", "skill", "repository", "skill_path", "channel", "version",
@@ -230,8 +243,7 @@ def validate_release(value: dict, expected_version: str | None = None) -> dict:
     if not isinstance(archive["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", archive["sha256"]):
         raise UpdateError("归档摘要无效", "invalid_manifest")
     normalize_manifest_files(value["files"])
-    if value["project_schema"] != {"read": [1, 2], "write": [2]}:
-        raise UpdateError("项目 schema 兼容声明不匹配", "incompatible_manifest")
+    validate_project_schema(value["project_schema"])
     if value["dependencies"] != {"python": ">=3.10", "pillow": "required-for-image-operations"}:
         raise UpdateError("依赖声明不匹配", "incompatible_manifest")
     if not isinstance(value["change_type"], str) or value["change_type"] not in {"patch", "minor", "major"}:
@@ -681,7 +693,8 @@ def validate_plan(value: dict) -> dict:
         raise UpdateError("计划归档名称或大小无效", "invalid_plan")
     if not isinstance(archive["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", archive["sha256"]):
         raise UpdateError("计划归档摘要无效", "invalid_plan")
-    if value["compatibility"] != {"read": [1, 2], "write": [2]} or value["dependencies"] != {"python": ">=3.10", "pillow": "required-for-image-operations"}:
+    validate_project_schema(value["compatibility"], code="invalid_plan")
+    if value["dependencies"] != {"python": ">=3.10", "pillow": "required-for-image-operations"}:
         raise UpdateError("计划兼容性字段无效", "invalid_plan")
     if value["archive_path"] != str(instance_home(real_root()) / "downloads" / value["target_version"] / f"{SKILL_NAME}-{value['target_version']}.zip"):
         raise UpdateError("计划归档路径越界", "unsafe_path")

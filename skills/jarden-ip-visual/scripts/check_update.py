@@ -7,6 +7,8 @@ from pathlib import Path
 
 from runtime_activity import RuntimeBusyError
 from update_runtime import (
+    ACCEPTED_PROJECT_SCHEMAS,
+    SCHEMA_VERSION as RELEASE_INDEX_SCHEMA,
     UpdateError,
     check_update,
     emit,
@@ -27,11 +29,11 @@ def add_json(parser: argparse.ArgumentParser) -> None:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="jarden-ip-visual 受控检查、计划、安装、状态与回滚")
     commands = root.add_subparsers(dest="command", required=True)
-    check = commands.add_parser("check", help="短时检查固定仓库的 stable 发行")
+    check = commands.add_parser("check", help="检查最高 stable 版本；不会自动串联桥接安装")
     check.add_argument("--force", action="store_true", help="跳过 24 小时成功缓存和 1 小时失败冷却")
     add_json(check)
     plan = commands.add_parser("plan", help="下载并校验候选包，只写外部更新计划")
-    plan.add_argument("--version", required=True)
+    plan.add_argument("--version", required=True, help="明确指定目标版本；旧客户端先指定兼容桥接版，安装核验后再建新版计划")
     plan.add_argument("--out", required=True, type=Path)
     add_json(plan)
     apply = commands.add_parser("apply", help="应用已审批安装计划；必须显式 --yes")
@@ -71,7 +73,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "rollback":
             result = rollback(args.transaction, yes=args.yes)
         elif args.command == "selfcheck":
-            result = {"ok": True, "skill": "jarden-ip-visual", "version": installed_version(real_root()), "real_root": str(real_root())}
+            result = {"ok": True, "skill": "jarden-ip-visual", "version": installed_version(real_root()), "real_root": str(real_root()),
+                      "release_index_schema": RELEASE_INDEX_SCHEMA, "accepted_project_schemas": ACCEPTED_PROJECT_SCHEMAS}
         else:
             raise UpdateError("未知命令", "invalid_command")
         emit(result)
