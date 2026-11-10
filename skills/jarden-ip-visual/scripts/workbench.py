@@ -215,6 +215,17 @@ def healthy_server(root: Path, project_id: str, info: dict[str, Any], *,
             connection.close()
 
 
+def verify_workbench_link(root: Path, project_id: str, info: dict[str, Any]) -> dict[str, Any]:
+    """Verify the exact local-service link before it is exposed to the user."""
+    ok = healthy_server(root, project_id, info)
+    return {
+        "status": "ok" if ok else "unavailable",
+        "checked_at": state.now(),
+        "target": info.get("url") if ok else None,
+        "error": None if ok else "link_unreachable",
+    }
+
+
 @contextlib.contextmanager
 def server_lock(directory: Path):
     path = directory / "server.lock"
@@ -267,7 +278,7 @@ def ensure_server(root: Path, project_id: str) -> dict[str, Any]:
                     [sys.executable, str(Path(__file__).with_name("serve_gallery.py")), str(root),
                      "--ready-file", str(ready_file), "--idle-timeout", str(SERVER_TTL)],
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr,
-                    close_fds=True,
+                    close_fds=True, start_new_session=(os.name != "nt"),
                 )
             while time.monotonic() < deadline and process.poll() is None:
                 try:
@@ -336,14 +347,22 @@ def _run_workbench(root: Path, *, serve: bool, open_browser: bool, record_ready:
                      "say": "原生生图结果尚未确认；先核对现有工具回执和实际文件，不再次调用生图"}
     server = {"status": "not_requested", "reused": False, "created": False}
     target = presented["gallery"]
+    link_check = {"status": "static", "checked_at": state.now(),
+                  "target": target, "error": None}
     if serve and not legacy:
         try:
             server = ensure_server(root, current["project_id"])
+            link_check = verify_workbench_link(root, current["project_id"], server)
+            if link_check["status"] != "ok":
+                raise state.ProjectError("link_unreachable：工作台链接健康检查未通过")
             target = server["url"]
         except (state.ProjectError, OSError, ValueError) as error:
             server = {"status": "unavailable", "reused": False, "created": False,
                       "error": "server_unavailable：已保留静态工作台；新选择尚未提交",
                       "reason": redact_server_error(str(error))}
+            target = presented["gallery"]
+            link_check = {"status": "unavailable", "checked_at": state.now(),
+                          "target": None, "error": "link_unreachable"}
     elif serve:
         server["status"] = "readonly"
     opened = presentation.dispatch_open(target) if open_browser else {
@@ -362,10 +381,11 @@ def _run_workbench(root: Path, *, serve: bool, open_browser: bool, record_ready:
             "schema_version": current["schema_version"], "revision": current.get("revision", 0),
             "next": next_step, "project_next": project_next, "recorded": recorded,
             "presentation": presented, "delivery_id": presented.get("delivery_id"), "gallery": presented["gallery"],
-            "url": server.get("url"), "server": server, "open": {**opened, "target": target},
+            "url": server.get("url") if link_check["status"] == "ok" else None,
+            "link_check": link_check, "server": server, "open": {**opened, "target": target},
             "interaction": {"mode": "interactive" if interactive else "static",
                             "status": "ready" if interactive else "not_submitted",
-                            "say": "新选择需提交并读取 committed 回执" if interactive else "静态页面的新选择尚未提交；请回聊天明确确认"},
+                            "say": "工作台可辅助查看和提交；待确认事项以聊天正文为准" if interactive else "静态页面的新选择尚未提交；请在聊天正文明确确认"},
             "committed_receipt": last_receipt, "receipts": receipts,
             "generation_tasks": tasks, "automatic_generation": False, "should_call": False}
 

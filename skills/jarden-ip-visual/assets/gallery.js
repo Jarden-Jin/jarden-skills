@@ -540,7 +540,10 @@
   }
 
   function notices() {
-    const parts = [];
+    const parts = [el("div", { class: "notice" }, [
+      el("strong", { text: "沟通方式。" }),
+      el("span", { text: " 所有需要你确认或反馈的事项都会在聊天正文说明；这里的按钮仅作可选辅助提交。" })
+    ])];
     if (!interactive) parts.push(el("div", { class: "notice" }, [
       el("strong", { text: "只读快照。" }),
       el("span", { text: " 选择与备注只保存在本机草稿；不会写入项目。请在聊天里回复编号或明确指令继续。" })
@@ -618,7 +621,7 @@
         maxlength: 2000,
         disabled: state.submitting, oninput: event => { state.keep = event.target.value; state.requestId = null; state.requestPayload = ""; saveDraft(); updateSummary(); }
       })]),
-      el("div", { class: "hint", text: "提交后必须读回真实回执才显示「已采用」。页面不会调用生图或下一阶段。" }),
+      el("div", { class: "hint", text: "这里的提交为可选辅助；待确认事项以聊天正文为准。提交后必须读回真实回执才显示「已采用」，页面不会调用生图或下一阶段。" }),
       state.result || state.error ? el("div", { id: "result", class: "result" + (state.error ? " notice error" : ""), role: "status", "aria-live": "polite" }, [
         state.error ? el("span", { text: state.error }) : null,
         receiptLine(state.result)

@@ -488,10 +488,12 @@ class WorkbenchTests(unittest.TestCase):
         with mock.patch.object(workbench.subprocess, "Popen", side_effect=AssertionError("unneeded server")), \
                 mock.patch.object(workbench, "healthy_server", wraps=workbench.healthy_server) as health:
             result = self.run_workbench(serve=True)
-        health.assert_called_once()
+        self.assertEqual(health.call_count, 2)
         self.assertTrue(result["server"]["reused"])
         self.assertFalse(result["server"]["created"])
         self.assertEqual(result["url"], info["url"])
+        self.assertEqual(result["link_check"]["status"], "ok")
+        self.assertEqual(result["link_check"]["target"], info["url"])
         self.assertEqual(result["interaction"]["mode"], "interactive")
 
     def test_live_pid_alone_is_not_health_and_never_killed(self):
@@ -556,6 +558,8 @@ class WorkbenchTests(unittest.TestCase):
         self.assertTrue(second["server"]["reused"])
         self.assertEqual(first["url"], second["url"])
         self.assertIn("#token=", first["url"])
+        self.assertEqual(first["link_check"]["status"], "ok")
+        self.assertEqual(second["link_check"]["status"], "ok")
         cache = self.root / ".workbench/server.json"
         self.assertEqual(stat.S_IMODE(cache.stat().st_mode), 0o600)
         self.assertEqual(project.read_json(cache)["pid"], self.launched[0].pid)
@@ -565,6 +569,7 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(Path(command[1]), SCRIPTS / "serve_gallery.py")
         self.assertIn("--ready-file", command)
         self.assertIn("--idle-timeout", command)
+        self.assertTrue(launch.call_args.kwargs.get("start_new_session"))
         self.assertEqual(list(cache.parent.glob(".ready-*.json")), [])
         self.assertEqual(first["open"]["status"], "unavailable")
         stderr_log = Path(first["server"]["stderr_log"])
@@ -572,6 +577,18 @@ class WorkbenchTests(unittest.TestCase):
         diagnostics = stderr_log.read_text(encoding="utf-8")
         self.assertIn("startup: serving", diagnostics)
         self.assertNotIn(first["url"].split("#token=")[1], diagnostics)
+
+    def test_link_is_hidden_when_the_final_live_probe_fails(self):
+        info = self.live_server()
+        self.cache_server(info)
+        with mock.patch.object(workbench, "healthy_server", side_effect=[True, False]):
+            result = self.run_workbench(serve=True)
+        self.assertIsNone(result["url"])
+        self.assertEqual(result["link_check"]["status"], "unavailable")
+        self.assertIsNone(result["link_check"]["target"])
+        self.assertEqual(result["server"]["status"], "unavailable")
+        self.assertEqual(result["interaction"]["mode"], "static")
+        self.assertEqual(result["open"]["target"], result["gallery"])
 
     def test_child_has_bounded_ttl(self):
         with mock.patch.object(workbench, "SERVER_TTL", 4), self.launch_spy():

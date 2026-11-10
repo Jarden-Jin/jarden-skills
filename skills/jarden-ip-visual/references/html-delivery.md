@@ -1,6 +1,6 @@
 # HTML 交付与工作台
 
-每个新的用户可见轮次都通过 `present_round.py` 冻结交付；恢复已有项目可用 `workbench.py` 复用交付和回执。页面、manifest 和图片快照一起保存；聊天只给一句变化、页面入口和一个待做动作。
+每个新的用户可见轮次都通过 `present_round.py` 冻结交付；恢复已有项目可用 `workbench.py` 复用交付和回执。页面、manifest 和图片快照一起保存。聊天必须写清变化摘要、已核验可访问的页面入口，以及全部待确认问题和选项；工作台只辅助查看与可选提交，不是必需反馈入口。
 
 ## 生成与呈现
 
@@ -33,9 +33,11 @@
 
 workbench 用 `.workbench/presentation.json` 比较业务版本、项目 fingerprint、源文件/round.json/审查摘要、实际 next、最近 manifest/index.html 与快照完整性。全部一致才 `presentation.reused=true` 并重建当前 gallery；否则调用 present_round 创建新 Dxxxx。直接反复调用 present_round 会创建新交付，不具备这项复用判断。
 
-服务记录在 `.workbench/server.json`，按真实项目、project_id、PID、URL、token 与 `/api/state` 健康响应核对；已有健康服务才 `server.reused=true`，否则受锁保护启动 serve_gallery。当前就绪等待预算为 8 秒，单次健康请求预算 1.5 秒，启动的服务时限为 1800 秒；冷启动或较慢机器不因过短探测反复启停。不可用时有界返回静态入口与“新选择尚未提交”，不假装交互模式成功。旧 schema 不启动可写服务。
+服务记录在 `.workbench/server.json`，按真实项目、project_id、PID、URL、token 与 `/api/state` 健康响应核对；已有健康服务才 `server.reused=true`，否则受锁保护启动 serve_gallery。POSIX 上子服务以新会话启动，不能随一次 CLI 命令结束被回收。当前就绪等待预算为 8 秒，单次健康请求预算 1.5 秒，启动的服务时限为 1800 秒；冷启动或较慢机器不因过短探测反复启停。
 
-返回 JSON 包含 presentation、delivery_id、gallery、url、server、open、interaction、next/project_next、committed_receipt/receipts、generation_tasks。最后两项生成控制标记 automatic_generation 和 should_call 始终 false，工作台不会代宿主调用原生图片工具。
+分享链接前，`workbench.py --serve` 还必须对即将展示的准确 URL 再做一次真实健康检查，并返回 `link_check.status=ok`。只有 `server.status=ready`、`link_check.status=ok` 且 `url` 非空时才可在聊天里展示可点击入口；不得只凭 PID、缓存、`open` 返回或 HTML 文件存在宣称可访问。检查失败时有界返回静态入口与“新选择尚未提交”，不假装交互模式成功；旧 schema 不启动可写服务。若运行环境仍会回收子服务，改用持续运行的前台会话，或只给 `file://` 静态页并明确「尚未提交」。
+
+返回 JSON 包含 presentation、delivery_id、gallery、url、link_check、server、open、interaction、next/project_next、committed_receipt/receipts、generation_tasks。最后两项生成控制标记 automatic_generation 和 should_call 始终 false，工作台不会代宿主调用原生图片工具。
 
 恢复 requesting/unknown 或 output_invalid 任务，且项目原 next=generate 时，返回的 next 改为 reconcile-task，原动作保留在 project_next；先核对真实工具回执与文件。此覆盖目前只在 workbench 返回值中，尚未投影到冻结 HTML 的 next；页面仍可能显示“待制作”，Agent 必须以 ledger 和 workbench 结果阻止重复调用。生成任务和图片验收的细节见 [项目状态](project-state.md)。
 
@@ -70,6 +72,8 @@ CLI 的系统打开成功只能记录 open_dispatched；失败或未请求时按
 
 `file://` 页面不请求任何 API。选择、备注与保持项只进入浏览器草稿；页面明确显示“尚未提交”，并提供可复制的聊天回复。没有服务时不渲染假成功结果。
 
+页面按钮只是可选辅助。每个待回答字段、待选方向、待确认版本或待说明反馈，Agent 都必须在聊天正文复述；不能写“去工作台里选”，也不能把页面提交当作已经完成沟通。静态页没有服务时，聊天里的反馈就是唯一可执行入口。
+
 ## 动作与页面状态
 
 工作台调用 `next_action(project, root)` 检查当前源图与实际发布包。历史业务 `stage=done` 不代表当前交付可用；顶部以 `next.action` 为准，`review` 显示待审查、`package` 显示待整理，只有 `done` 显示已完成，不为展示修改业务阶段。
@@ -84,7 +88,7 @@ CLI 的系统打开成功只能记录 open_dispatched；失败或未请求时按
 
 用途与尺寸问题由 next 中的 `product.usage:<主体ID>`、`product.size:<主体ID>` 驱动，保留自由输入。页面尺寸保存只支持简单 mm/cm 数值转 height 或定性描述；范围、多维尺寸、实测依据等交回 Agent 用 product JSON 保存，见 [项目状态](project-state.md)。不让用户填写 yaw/elevation 等内部机位参数。
 
-已有 committed=true 回执必须读回并续作，不能再执行一次 select；request-* 的 committed 只说明意向已登记，不表示已批准生图。没有宿主事件回调时，用户在页面提交后回聊天说“继续”，再恢复状态。
+已有 committed=true 回执必须读回并续作，不能再执行一次 select；request-* 的 committed 只说明意向已登记，不表示已批准生图。页面提交不是必须步骤：用户直接在聊天里给出编号、修改意见或选择同样有效，Agent 应按聊天原话登记并继续。
 
 ## 实际图、合同与发布输出
 

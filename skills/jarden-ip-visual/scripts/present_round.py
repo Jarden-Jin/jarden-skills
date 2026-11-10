@@ -216,7 +216,7 @@ def present_round(root: Path, *, open_browser: bool = True, output: Path | None 
     receipt = record_open_result(root, delivery_id, opened["status"], target=str(output), error=opened.get("error", ""))
     return {"ok": True, "delivery_id": delivery_id, "project_revision": manifest["project_revision"], "gallery": str(output),
             "manifest": str(directory / "manifest.json"), "snapshot": str(directory / "index.html"), "open": receipt,
-            "missing_images": view["missing"], "say": "打开工作台核对本轮图片；页面确认后回聊天回复「继续」"}
+            "missing_images": view["missing"], "say": "打开工作台查看本轮图片；待确认事项必须同步写在聊天正文"}
 
 
 present = present_round

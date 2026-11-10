@@ -703,7 +703,7 @@ def main(argv: list[str] | None = None) -> int:
                 "has_post": data["post"] is not None,
                 "delivery_id": data.get("delivery_id"),
                 "readonly": data.get("readonly"),
-                "say": "把 gallery 路径发给用户，再按页面上的三种选择问一个问题" if current else "把 gallery 路径发给用户",
+                "say": "确认 gallery 链接可访问后，把链接与全部待确认选项一起写入聊天正文" if current else "确认 gallery 链接可访问后，把链接写入聊天正文",
             })
     except (state.ProjectError, OSError, ValueError) as error:
         return state.emit({"ok": False, "error": str(error)})
