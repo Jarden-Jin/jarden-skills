@@ -209,7 +209,11 @@ class ProjectV2Tests(unittest.TestCase):
             result = json.load(response)
         self.assertTrue(result["committed"])
         with urllib.request.urlopen(urllib.request.Request(base + "/api/receipt/request-001", headers=headers)) as response:
-            self.assertEqual(result, json.load(response))
+            self.assertEqual({key: value for key, value in result.items() if key != "workbench"}, json.load(response))
+        self.assertEqual(result["workbench"]["status"], "synced")
+        current = project.load_project(self.job)
+        latest = project.read_json(self.job / "deliveries" / current["presentations"]["latest_delivery_id"] / "manifest.json")
+        self.assertEqual(latest["project_revision"], current["revision"])
         self.assertEqual(project.load_project(self.job)["selections"]["concept"]["小云"]["item"], "A")
 
     def test_restored_done_routes_to_missing_reviews_without_rewriting_stage(self):

@@ -116,6 +116,14 @@ def snapshots_intact(root: Path, value: Any) -> bool:
     return all(snapshots_intact(root, child) for child in value.values())
 
 
+def renderer_signature() -> dict[str, str]:
+    import asset_plan
+    scripts = Path(__file__).resolve().parent
+    paths = [gallery.TEMPLATE, gallery.ASSETS / "gallery.js", gallery.ASSETS / "gallery.css",
+             asset_plan.CATALOG_PATH, *sorted(scripts.glob("*.py"))]
+    return {path.name: gallery.file_sha256(path) for path in paths}
+
+
 def ensure_presentation(root: Path) -> dict[str, Any]:
     with state.project_lock(root):
         project = state.load_project(root)
@@ -125,6 +133,7 @@ def ensure_presentation(root: Path) -> dict[str, Any]:
             raise state.ProjectError("unsafe_workbench：交付恢复记录不能是符号链接")
         fingerprint = presentation.fingerprint(project)
         sources = source_hashes(root, project)
+        renderer = renderer_signature()
         latest = (project.get("presentations") or {}).get("latest_delivery_id")
         reusable = False
         try:
@@ -140,6 +149,7 @@ def ensure_presentation(root: Path) -> dict[str, Any]:
                 and cached.get("project_revision") == manifest["project_revision"]
                 and cached.get("project_fingerprint") == fingerprint
                 and cached.get("source_hashes") == sources
+                and cached.get("renderer_signature") == renderer
                 and cached.get("manifest_sha256") == gallery.file_sha256(manifest_file)
                 and snapshot.is_file()
                 and cached.get("snapshot_sha256") == gallery.file_sha256(snapshot)
@@ -161,6 +171,7 @@ def ensure_presentation(root: Path) -> dict[str, Any]:
             "schema_version": 1, "project_id": current["project_id"], "delivery_id": result["delivery_id"],
             "project_revision": current.get("revision", 0), "project_fingerprint": fingerprint,
             "source_hashes": sources, "manifest_sha256": gallery.file_sha256(Path(result["manifest"])),
+            "renderer_signature": renderer,
             "snapshot_sha256": gallery.file_sha256(Path(result["snapshot"])),
         })
         return {**result, "reused": False}
@@ -397,18 +408,128 @@ def run_workbench(root: Path, *, serve: bool = False, open_browser: bool = True,
         return _run_workbench(Path(root), serve=serve, open_browser=open_browser, record_ready=record_ready)
 
 
+def turn_file(root: Path) -> Path:
+    path = workbench_directory(root) / "turn.json"
+    if path.is_symlink():
+        raise state.ProjectError("unsafe_workbench：对话展示记录不能是符号链接")
+    return path
+
+
+def turn_artifacts(root: Path, delivery_id: str | None) -> dict[str, str]:
+    paths = ["gallery.html"]
+    if delivery_id:
+        paths.extend([f"deliveries/{delivery_id}/manifest.json", f"deliveries/{delivery_id}/index.html"])
+    return {relative: gallery.file_sha256(state.project_path(root, relative)) for relative in paths}
+
+
+def start_turn(root: Path, *, open_browser: bool = True) -> dict[str, Any]:
+    result = _run_workbench(root, serve=True, open_browser=open_browser, record_ready=False)
+    with state.project_lock(root):
+        project = state.load_project(root)
+        presented = result["presentation"]
+        if presented.get("project_revision") not in (None, project.get("revision", 0)):
+            raise state.ProjectError("presentation_changed：工作台已变化，请重新同步本轮展示")
+        record = {
+            "schema_version": 1, "turn_id": uuid.uuid4().hex,
+            "project_id": project.get("project_id"), "delivery_id": result["delivery_id"],
+            "revision": project.get("revision", 0), "project_fingerprint": presentation.fingerprint(project),
+            "source_hashes": source_hashes(root, project), "status": "pending",
+            "renderer_signature": renderer_signature(),
+            "artifacts": turn_artifacts(root, result["delivery_id"]),
+            "started_at": state.now(), "target": result["open"]["target"],
+        }
+        state.write_json(turn_file(root), record)
+    result["foreground"] = {
+        "required": True, "status": "pending", "turn_id": record["turn_id"],
+        "delivery_id": record["delivery_id"], "target": record["target"],
+        "say": "请在宿主可见面板或浏览器前台展示并核对本轮；系统打开成功不等于前台已验证",
+    }
+    return result
+
+
+def current_turn(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    record = state.read_json(turn_file(root))
+    project = state.load_project(root)
+    latest = (project.get("presentations") or {}).get("latest_delivery_id")
+    if (record.get("project_id") != project.get("project_id")
+            or record.get("revision") != project.get("revision", 0)
+            or record.get("delivery_id") != latest
+            or record.get("project_fingerprint") != presentation.fingerprint(project)
+            or record.get("source_hashes") != source_hashes(root, project)
+            or record.get("renderer_signature") != renderer_signature()):
+        raise state.ProjectError("workbench_unsynced：本轮展示不再对应当前项目，请重新 --turn 并前台核验")
+    try:
+        if record.get("artifacts") != turn_artifacts(root, latest):
+            raise state.ProjectError("workbench_unsynced：本轮 HTML 或交付内容已变化，请重新同步并前台核验")
+    except OSError as error:
+        raise state.ProjectError("workbench_unsynced：本轮 HTML 或交付文件缺失，请恢复工作台") from error
+    if latest:
+        manifest = gallery.load_manifest(root, latest)
+        if (manifest.get("project_revision") != project.get("revision", 0)
+                or manifest.get("next") != gallery.gallery_next(root, copy.deepcopy(project))
+                or not snapshots_intact(root, manifest.get("view"))):
+            raise state.ProjectError("workbench_unsynced：当前交付损坏或落后，请先修复工作台")
+    return record, project
+
+
+def record_foreground(root: Path, evidence: dict[str, Any]) -> dict[str, Any]:
+    with state.project_lock(root):
+        record, project = current_turn(root)
+        if (not isinstance(evidence, dict)
+                or evidence.get("turn_id") != record["turn_id"]
+                or evidence.get("delivery_id") != record["delivery_id"]
+                or evidence.get("foreground") is not True
+                or evidence.get("images_decoded") is not True
+                or not isinstance(evidence.get("inspected_by"), str)
+                or not evidence["inspected_by"].strip()):
+            raise state.ProjectError("foreground_evidence_required：必须实际核对本轮 turn_id、delivery_id、前台显示和图片解码")
+        if record.get("delivery_id"):
+            presentation.record_open_result(
+                root, record["delivery_id"], "opened_verified", target=record["target"], evidence=evidence,
+            )
+        record.update(status="verified", verified_at=state.now(), evidence=copy.deepcopy(evidence))
+        state.write_json(turn_file(root), record)
+    return {"ok": True, "project_id": project.get("project_id"), "revision": record["revision"],
+            "delivery_id": record["delivery_id"],
+            "foreground": {"required": True, "status": "verified", "turn_id": record["turn_id"]}}
+
+
+def check_turn(root: Path) -> dict[str, Any]:
+    with state.project_lock(root):
+        record, project = current_turn(root)
+        verified = record.get("status") == "verified"
+    return {"ok": verified, "project_id": project.get("project_id"), "delivery_id": record["delivery_id"],
+            "revision": record["revision"], "foreground": {"required": True,
+                "status": "verified" if verified else "pending", "turn_id": record["turn_id"]},
+            **({} if verified else {"error": "foreground_pending：本轮尚未核验前台工作台，不能宣称展示完成"})}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="恢复已有工作台、交付与回执；不自动选择或生图")
     parser.add_argument("project")
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--no-open", action="store_true")
     parser.add_argument("--record-ready", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--turn", action="store_true", help="每次对话恢复、同步并打开工作台，等待宿主前台核验")
+    mode.add_argument("--record-foreground", type=Path, help="记录宿主实际前台检查的证据 JSON")
+    mode.add_argument("--check-turn", action="store_true", help="结束对话前检查本轮交付与前台核验")
     args = parser.parse_args(argv)
+    if (args.turn or args.record_foreground or args.check_turn) and args.record_ready:
+        parser.error("对话展示入口不能自动登记图片；请先显式完成业务登记")
     try:
         with runtime_activity.execution_lease():
             try:
-                result = _run_workbench(Path(args.project), serve=args.serve,
-                                        open_browser=not args.no_open, record_ready=args.record_ready)
+                root = Path(args.project).expanduser().resolve()
+                if args.turn:
+                    result = start_turn(root, open_browser=not args.no_open)
+                elif args.record_foreground:
+                    result = record_foreground(root, state.read_json(args.record_foreground))
+                elif args.check_turn:
+                    result = check_turn(root)
+                else:
+                    result = _run_workbench(root, serve=args.serve,
+                                            open_browser=not args.no_open, record_ready=args.record_ready)
             except (state.ProjectError, OSError, ValueError) as error:
                 result = {"ok": False, "error": str(error), "automatic_generation": False, "should_call": False}
             return state.emit(result)

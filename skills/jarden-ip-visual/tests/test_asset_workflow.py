@@ -592,6 +592,11 @@ class AssetWorkflowTests(unittest.TestCase):
             self.assertEqual(output.returncode, 0, output.stdout + output.stderr)
             result = json.loads(output.stdout)
             self.assertTrue(result.get("ok"), result)
+            if arguments[0] != "show":
+                current = state.load_project(root)
+                manifest = state.read_json(root / "deliveries" / current["presentations"]["latest_delivery_id"] / "manifest.json")
+                self.assertEqual(manifest["project_revision"], current["revision"])
+                self.assertEqual(result["workbench"]["status"], "synced")
             return result
 
         result = command("init", str(root), "--kind", "text", "--workflow", "assets")

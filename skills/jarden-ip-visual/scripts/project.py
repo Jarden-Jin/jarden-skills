@@ -26,6 +26,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+if __name__ == "__main__":
+    sys.modules["project"] = sys.modules[__name__]
+
 import physics_review
 
 SCHEMA_VERSION = 4
@@ -2045,6 +2048,112 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def command_changes_state(args: argparse.Namespace) -> bool:
+    if args.command in {"show", "compile"}:
+        return False
+    if args.command == "assets":
+        return args.action not in {"catalog", "status", "next"}
+    if args.command == "task":
+        return args.action != "status"
+    return True
+
+
+def command_needs_presentation(args: argparse.Namespace) -> bool:
+    if args.command == "assets":
+        return args.action in {"new", "approve", "export"}
+    if args.command == "task":
+        return args.action == "begin"
+    return args.command in {"new-round", "select", "accept-input", "final"}
+
+
+def require_current_presentation(root: Path) -> dict[str, Any]:
+    import workbench
+    presented = workbench.ensure_presentation(root)
+    project = load_project(root, writable=True)
+    delivery_id = (project.get("presentations") or {}).get("latest_delivery_id")
+    if presented.get("delivery_id") != delivery_id or presented.get("project_revision") != project.get("revision", 0):
+        raise ProjectError("presentation_required：工作台尚未同步；先恢复工作台，不推进业务")
+    return presented
+
+
+def execute_command(args: argparse.Namespace) -> int:
+    root = Path(args.project).expanduser().resolve()
+    if args.command == "assets" and args.action == "catalog":
+        return args.func(args)
+    changes_state = command_changes_state(args)
+    needs_presentation = command_needs_presentation(args)
+    native_claim = args.command == "task" and args.action == "begin"
+    if native_claim:
+        try:
+            require_current_presentation(root)
+        except (ProjectError, OSError, ValueError) as error:
+            return command_error(ProjectError("presentation_required：工作台同步失败，未领取生图任务：" + str(error)))
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        if args.command == "show" and not (root / ".state-transaction.json").exists():
+            code = args.func(args)
+        else:
+            with project_lock(root):
+                if args.command not in {"init", "show"}:
+                    current = load_project(root, writable=True)
+                    if native_claim:
+                        latest = (current.get("presentations") or {}).get("latest_delivery_id")
+                        manifest = read_json(project_path(root, f"deliveries/{latest}/manifest.json")) if latest else {}
+                        if manifest.get("project_revision") != current.get("revision", 0):
+                            raise ProjectError("presentation_required：领取生图任务前项目已变化；先恢复工作台")
+                code = args.func(args)
+                if needs_presentation and not native_claim and not code:
+                    pending = _TRANSACTION.get()["writes"]
+                    staged = copy.deepcopy(pending)
+                    pending.clear()
+                    try:
+                        require_current_presentation(root)
+                    except (ProjectError, OSError, ValueError) as error:
+                        raise ProjectError("presentation_required：工作台同步失败，未推进业务：" + str(error)) from error
+                    refreshed = load_project(root)
+                    for path, value in staged.items():
+                        if path == (root / "project.json").resolve():
+                            for key in ("deliveries", "presentations"):
+                                value[key] = copy.deepcopy(refreshed.get(key))
+                        write_json(path, value)
+    payload = json.loads(output.getvalue())
+    if code or not payload.get("ok", True) or not changes_state:
+        return emit(payload)
+    try:
+        presented = require_current_presentation(root)
+    except (ProjectError, OSError, ValueError) as error:
+        payload.update(ok=False, operation_committed=True, presentation_required=True,
+                       workbench={"status": "failed", "error": str(error)},
+                       error="workbench_sync_failed：业务操作已保存；只恢复工作台，不重放业务：" + str(error))
+        if native_claim and payload.get("claimed") is True and payload.get("should_call") is True:
+            import generation_tasks
+            try:
+                recovered = generation_tasks.failed(
+                    root, payload["task_id"], "workbench_sync_failed_before_dispatch：尚未交给宿主生图工具",
+                    retryable=True, claim_id=payload["claim_id"],
+                )
+                payload.update(recovered)
+                payload["error"] = "workbench_sync_failed：任务尚未发出，已保留可重试失败记录；恢复工作台后显式 --retry"
+            except (ProjectError, OSError, ValueError) as recovery_error:
+                payload["recovery_error"] = str(recovery_error)
+        if "should_call" in payload:
+            payload["should_call"] = False
+        return emit(payload)
+    if "presentations" in payload:
+        payload["presentations"] = load_project(root).get("presentations") or {}
+    if not payload.get("committed"):
+        payload.update(operation_committed=True, presentation_required=False,
+                       workbench={"status": "synced", **presented})
+    return emit(payload)
+
+
+def command_error(error: Exception) -> int:
+    payload = {"ok": False, "error": str(error)}
+    if str(error).startswith("presentation_required"):
+        payload.update(operation_committed=False, presentation_required=True)
+    return emit(payload)
+
+
 def main(argv: list[str] | None = None) -> int:
     if sys.version_info < (3, 10):
         print("需要 Python 3.10 或更高版本", file=sys.stderr)
@@ -2053,17 +2162,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from runtime_activity import execution_lease
         with execution_lease():
-            if args.command == "show":
-                if (Path(args.project) / ".state-transaction.json").exists():
-                    with project_lock(Path(args.project)):
-                        return args.func(args)
-                return args.func(args)
-            with project_lock(Path(args.project)):
-                if args.command != "init":
-                    load_project(Path(args.project), writable=True)
-                return args.func(args)
+            return execute_command(args)
     except (ProjectError, OSError, ValueError) as error:
-        return emit({"ok": False, "error": str(error)})
+        return command_error(error)
 
 
 if __name__ == "__main__":

@@ -51,32 +51,51 @@ function environment(input, options = {}) {
   const stored = options.storage || new Map();
   const posts = [];
   const requests = [];
+  const navigations = [];
+  const reloads = [];
+  const replacements = [];
+  const timers = new Map();
+  const documentListeners = new Map();
+  let timerSequence = 0;
+  let livePayload = options.livePayload || null;
+  let holdSubmission = null;
   let receipt = null;
   document = {
     activeElement: null,
+    hidden: false,
     createElement: tag => new Element(tag),
-    addEventListener() {},
+    addEventListener: (name, handler) => documentListeners.set(name, handler),
     getElementById: identifier => identifier === "gallery-data" ? { textContent: JSON.stringify(data) } : identifier === "app" ? app : walk(app).find(node => node.attributes.id === identifier),
     querySelector: selector => app.querySelector(selector),
     querySelectorAll: selector => app.querySelectorAll(selector),
   };
   const reply = (body, status = 200) => ({ ok: status < 400, status, json: async () => body });
+  const location = {
+    hash: options.interactive ? "#token=ui-fixture-token" : "",
+    protocol: options.interactive ? "http:" : "file:",
+    pathname: options.pathname || "/gallery.html",
+    replace: target => { replacements.push(target); navigations.push(target); },
+    reload: () => { const target = location.pathname + location.hash; reloads.push(target); navigations.push(target); }
+  };
   const context = {
     document, CSS: { escape: value => value },
-    location: { hash: options.interactive ? "#token=ui-fixture-token" : "", protocol: options.interactive ? "http:" : "file:" },
+    location,
     localStorage: { getItem: key => stored.get(key) || null, setItem: (key, value) => stored.set(key, value) },
-    URLSearchParams, Intl, Date, AbortController, setTimeout, clearTimeout,
+    URLSearchParams, Intl, Date, AbortController,
+    setTimeout: (callback, delay) => { const identifier = ++timerSequence; timers.set(identifier, { callback, delay }); return identifier; },
+    clearTimeout: identifier => timers.delete(identifier),
     requestAnimationFrame: callback => callback(),
     crypto: { randomUUID: () => `request-${posts.length}` },
     fetch: async (url, request) => {
       requests.push({ url, authorization: request?.headers?.Authorization });
       if (url === "/api/state") {
         if (options.syncFailure) throw new Error("状态不可读");
-        return reply({ project_id: data.project_id, revision: options.liveRevision ?? data.project_revision, manifest: data, receipts: {} });
+        return reply(livePayload || { project_id: data.project_id, revision: options.liveRevision ?? data.project_revision, manifest: data, receipts: {} });
       }
       if (url === "/api/decision") {
         const payload = JSON.parse(request.body);
         posts.push(payload);
+        if (options.deferSubmission) await new Promise(resolve => { holdSubmission = resolve; });
         if (options.submitFailure) return reply({ error: "拒绝写入" }, 409);
         receipt = { committed: true, action: payload.action, request_id: payload.request_id, delivery_id: payload.delivery_id, new_revision: data.project_revision + 1, selected: options.assetReceipt ? [] : payload.items.map(item => item.id), asset_result: options.assetReceipt ? { instance_id: payload.instance_id } : undefined };
         return reply(receipt);
@@ -88,7 +107,17 @@ function environment(input, options = {}) {
   context.window = context;
   vm.runInNewContext(source, context, { timeout: 2000 });
   return {
-    app, document, stored, posts, requests,
+    app, document, stored, posts, requests, timers, navigations, reloads, replacements, location,
+    setLive: value => { livePayload = value; },
+    releaseSubmission: () => holdSubmission?.(),
+    poll: async () => {
+      const timer = [...timers].find(([, value]) => value.delay === 2500);
+      assert.ok(timer, "missing live sync timer");
+      timers.delete(timer[0]);
+      await timer[1].callback();
+      await settle();
+    },
+    visibility: async hidden => { document.hidden = hidden; documentListeners.get("visibilitychange")?.(); await settle(); },
     nodes: selector => app.querySelectorAll(selector),
     text: () => content(app),
     button: label => walk(app).find(node => node.tagName === "BUTTON" && (content(node).trim() === label || node.children[0]?.textContent === label)),
@@ -134,6 +163,8 @@ async function run() {
   assert.equal(staticPage.nodes(".candidate").length, 2);
   assert.match(staticPage.text(), /山间小兔/);
   assert.equal(staticPage.nodes("[data-submit-action]").length, 0);
+  assert.equal(staticPage.requests.length, 0);
+  assert.equal(staticPage.timers.size, 0);
   assert.equal(staticPage.document.getElementById("technical-evidence").attributes.open, undefined);
   await staticPage.change('input[data-item-id="B"]', "B");
   staticPage.input("decision-note", "脸部再干净一些");
@@ -262,7 +293,146 @@ async function run() {
   assert.ok(incomplete.text());
   const malformedDraft = new Map([["jarden:draft:quiet-studio-fixture:D0042", JSON.stringify({ selected: "invalid", note: 5, keep: [], action: false })]]);
   assert.ok(environment(baseData(), { storage: malformedDraft }).text());
-  console.log("quiet-studio runtime: static drafts, receipts, locking, 21 assets, capability boundaries, and asset payloads passed");
+
+  const updatePayload = (revision = 9, manifestRevision = revision) => ({ project_id: "quiet-studio-fixture", revision, manifest: baseData({ delivery_id: "D0043", project_revision: manifestRevision }), receipts: {} });
+  const live = environment(baseData(), { interactive: true });
+  await settle();
+  const unchangedTree = live.app.children[0];
+  await live.poll();
+  assert.equal(live.app.children[0], unchangedTree, "unchanged polling must not rerender the workspace");
+  live.setLive(updatePayload());
+  await live.poll();
+  assert.deepEqual(live.navigations, ["/gallery.html#token=ui-fixture-token"]);
+  assert.deepEqual(live.reloads, ["/gallery.html#token=ui-fixture-token"], "same-URL updates must download the current HTML with reload");
+  assert.equal(live.replacements.length, 0, "replacing the identical URL does not reload Chromium");
+  assert.equal(live.location.hash, "#token=ui-fixture-token", "reload must preserve the authentication fragment");
+  assert.equal(live.posts.length, 0);
+  assert.ok(live.requests.every(request => request.authorization === "Bearer ui-fixture-token"));
+  assert.equal([...live.timers.values()].some(timer => timer.delay === 2500), false);
+
+  const rootAlias = environment(baseData(), { interactive: true, pathname: "/" });
+  await settle();
+  rootAlias.setLive(updatePayload());
+  await rootAlias.poll();
+  assert.deepEqual(rootAlias.reloads, ["/#token=ui-fixture-token"]);
+  assert.equal(rootAlias.replacements.length, 0);
+
+  const preparing = environment(baseData(), { interactive: true });
+  await settle();
+  preparing.setLive(updatePayload(10, 9));
+  await preparing.poll();
+  await preparing.poll();
+  assert.equal(preparing.navigations.length, 0, "a manifest behind the live revision is not ready to navigate");
+  assert.match(preparing.text(), /最新工作台正在准备/);
+  assert.ok(preparing.nodes("[data-submit-action]").every(button => button.disabled));
+  preparing.setLive(updatePayload(10));
+  await preparing.poll();
+  assert.equal(preparing.navigations.length, 1);
+
+  const drafting = environment(baseData(), { interactive: true });
+  await settle();
+  drafting.input("decision-note", "正在编辑的草稿不能丢");
+  const draftInput = drafting.document.getElementById("decision-note");
+  drafting.setLive(updatePayload());
+  await drafting.poll();
+  assert.equal(drafting.navigations.length, 0);
+  assert.equal(drafting.document.getElementById("decision-note"), draftInput, "focused text controls must remain mounted");
+  assert.equal(draftInput.value, "正在编辑的草稿不能丢");
+  assert.match(drafting.text(), /工作台有新版本/);
+  drafting.document.activeElement = null;
+  await drafting.poll();
+  assert.equal(drafting.navigations.length, 0, "unsent drafts prevent automatic navigation after blur");
+  await drafting.click(drafting.button("查看最新工作台"));
+  assert.equal(drafting.navigations.length, 1);
+  const preservedDraft = JSON.parse(drafting.stored.get("jarden:draft:quiet-studio-fixture:D0042"));
+  assert.equal(preservedDraft.note, "正在编辑的草稿不能丢");
+  assert.equal(preservedDraft.draftDirty, true);
+
+  const focused = environment(baseData(), { interactive: true });
+  await settle();
+  const focusInput = focused.document.getElementById("decision-note");
+  focusInput.focus();
+  focused.setLive(updatePayload());
+  await focused.poll();
+  assert.equal(focused.navigations.length, 0);
+  assert.equal(focused.document.getElementById("decision-note"), focusInput);
+  focused.document.activeElement = null;
+  await focused.poll();
+  assert.equal(focused.navigations.length, 1);
+
+  const dialogPage = environment(baseData(), { interactive: true });
+  await settle();
+  await dialogPage.click(dialogPage.button("导出回复草稿"));
+  const originalDialog = dialogPage.nodes("dialog")[0];
+  dialogPage.setLive(updatePayload());
+  await dialogPage.poll();
+  assert.equal(dialogPage.navigations.length, 0);
+  assert.equal(dialogPage.nodes("dialog")[0], originalDialog, "polling must not dismiss open dialogs");
+  originalDialog.close();
+  await dialogPage.poll();
+  assert.equal(dialogPage.navigations.length, 1);
+
+  const hidden = environment(baseData(), { interactive: true });
+  await settle();
+  const requestCount = hidden.requests.length;
+  await hidden.visibility(true);
+  assert.equal([...hidden.timers.values()].some(timer => timer.delay === 2500), false);
+  assert.equal(hidden.requests.length, requestCount);
+  hidden.setLive(updatePayload());
+  await hidden.visibility(false);
+  assert.equal(hidden.requests.length, requestCount + 1);
+  assert.equal(hidden.navigations.length, 1);
+
+  const archived = environment(baseData(), { interactive: true, pathname: "/deliveries/D0042/index.html", livePayload: updatePayload() });
+  await settle();
+  assert.equal(archived.navigations.length, 0);
+  assert.equal([...archived.timers.values()].some(timer => timer.delay === 2500), false);
+  await archived.click(archived.button("查看最新工作台"));
+  assert.deepEqual(archived.replacements, ["/gallery.html#token=ui-fixture-token"], "explicit history navigation must switch to the current entry");
+  assert.equal(archived.reloads.length, 0, "reloading history would leave the user on the historical delivery");
+
+  const historyView = environment(baseData(), { interactive: true });
+  await settle();
+  await historyView.click(historyView.button("创作记录"));
+  historyView.setLive(updatePayload());
+  await historyView.poll();
+  assert.equal(historyView.navigations.length, 0, "viewing history must not jump to the latest workspace");
+  assert.match(historyView.text(), /工作台有新版本/);
+
+  const selectedDraft = environment(baseData(), { interactive: true });
+  await settle();
+  await selectedDraft.change('input[data-item-id="B"]', "B");
+  selectedDraft.document.activeElement = null;
+  selectedDraft.setLive(updatePayload());
+  await selectedDraft.poll();
+  assert.equal(selectedDraft.navigations.length, 0, "an unsubmitted selection is also a draft");
+  const resumedDraft = environment(baseData(), { interactive: true, storage: selectedDraft.stored });
+  await settle();
+  resumedDraft.setLive(updatePayload());
+  await resumedDraft.poll();
+  assert.equal(resumedDraft.navigations.length, 0, "restored drafts remain protected");
+
+  const foreign = environment(baseData(), { interactive: true });
+  await settle();
+  foreign.setLive({ ...updatePayload(), manifest: baseData({ project_id: "different-project", delivery_id: "D0043", project_revision: 9 }) });
+  await foreign.poll();
+  assert.equal(foreign.navigations.length, 0);
+  assert.match(foreign.text(), /交付快照不属于本页项目/);
+
+  const sending = environment(baseData(), { interactive: true, deferSubmission: true });
+  await settle();
+  await sending.change('input[data-item-id="A"]', "A");
+  const submission = sending.click(sending.button("按 A 继续"));
+  await settle();
+  assert.equal(sending.posts.length, 1);
+  sending.setLive(updatePayload());
+  await sending.poll();
+  assert.equal(sending.navigations.length, 0, "an inflight submission cannot be interrupted");
+  assert.equal(sending.button("查看最新工作台").disabled, true);
+  sending.releaseSubmission();
+  await submission;
+
+  console.log("quiet-studio runtime: static drafts, receipts, locking, 21 assets, safe polling, live refresh, and draft/dialog/submission protection passed");
 }
 
 function serve() {

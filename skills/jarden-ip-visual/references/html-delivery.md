@@ -1,6 +1,17 @@
 # HTML 交付与工作台
 
-从 [主流程](../SKILL.md) 进入。每个新的用户可见轮次都通过 `present_round.py` 冻结交付；恢复已有项目可用 `workbench.py` 复用交付和回执。页面、manifest 和图片快照一起保存。聊天必须写清变化摘要、已核验可访问的页面入口，以及全部待确认问题和选项；工作台只辅助查看与可选提交，不是必需反馈入口。
+从 [主流程](../SKILL.md) 进入。每次项目对话开头恢复并前台展示工作台，结束前用 `--check-turn` 确认本次展示仍有效；用户可见状态改变后，先同步再生图、等待确认或宣称完成。统一用 `workbench.py <项目> --turn` 复用有效交付或调用 `present_round.py` 冻结新交付。页面、manifest 和图片快照一起保存；聊天必须写清变化、已核验入口及全部待确认事项。工作台展示必做，页面按钮提交可选，两者不可混淆。
+
+## 每回合同步与前台验收
+
+- 新设计项目 `init` 后立即运行 `--turn`，即使没有图片也展示真实目录、计划和待生成空态；不得为满足页面要求制造图片、批准或完成状态。仅维护 Skill 本身不创建虚假的创作项目；已有相关项目可恢复。
+- 已有项目每回合开头运行 `--turn` 并核验，回复结束前运行 `--check-turn`。确认范围、保存答案、用户选图、局部修改、审查及交付都适用；仅回答模型、解释或闲聊也复用当前页面，不擅自继续生成。若开头核验后项目、所有源文件和呈现资源均未变化，结束检查直接通过，无需重新打开；有变化则再次 `--turn`、前台核验和检查。
+- `--turn` 等价于请求同步、`--serve` 和打开，返回 `foreground.required=true`、`foreground.status=pending` 及唯一 `foreground.turn_id`，不等于宿主已把页面展示在用户前台。宿主提供可见网页面板时，Agent 必须使用该面板打开返回的已核验 URL；已有本项目标签页时复用并刷新，不反复新增标签页。`--turn --no-open` 只用于随后由宿主完成前台打开，以免系统重复开页；不能借此省略展示。先保存未提交草稿，不在用户输入或模态框操作中强制刷新。
+- 宿主实际核对当前 `turn_id`、`delivery_id`、页面内容及图片解码后，用 `--record-foreground <证据.json>` 记录 `opened_verified`。每次 `--turn` 都重新标记 pending，旧 `turn_id` 的证据不能复用；同一回合的已核验状态只在结束检查仍匹配时有效。没有图片的规划空态核对真实目录、范围与下一步。只有系统打开返回或链接健康检查，不能宣称「前台已验证」。无可见面板时保留入口并明确前台尚未验证。
+- 后台业务 mutation 默认只同步 HTML，不弹出页面；回合入口负责前台展示。不能为了不弹窗而跳过状态同步，也不必每个内部文件写入都新增标签页。
+- 同步失败阻断继续生图、业务推进和完成声明；保留图片、失败原因及恢复命令，不能用聊天裸图绕过。仅服务不可用时保留最新静态页并说明新选择「尚未提交」；聊天确认可登记，但仍须通过对应资格校验和同步。
+
+这些门槛要求 Agent 执行；脚本只能校验经本地入口登记的状态，不能拦截宿主直接调用原生生图工具。更新工作台本身不代表生图授权，也不要求每回合有新图。
 
 ## 工作流与页面路由
 
@@ -34,9 +45,13 @@
 <python> <skill>/scripts/workbench.py <项目> --serve
 <python> <skill>/scripts/workbench.py <项目> --serve --no-open
 <python> <skill>/scripts/workbench.py <项目> --no-open --record-ready
+<python> <skill>/scripts/workbench.py <项目> --turn
+<python> <skill>/scripts/workbench.py <项目> --turn --no-open
+<python> <skill>/scripts/workbench.py <项目> --record-foreground <证据.json>
+<python> <skill>/scripts/workbench.py <项目> --check-turn
 ```
 
-`--serve` 请求受控本机服务，不传时只给静态页；`--no-open` 不派发系统打开。`--record-ready` 仅当项目 next=record-round 时检查并登记已有图片，不负责生成、审查、选择或打包。CLI 无任意自动推进或自动生图参数。
+`--turn` 是项目对话默认入口：同步、请求受控服务并派发打开；宿主前台面板仍由 Agent 操作。`--serve` 只请求受控本机服务，不传时只给静态页；`--no-open` 不派发系统打开。`--record-foreground` 只登记宿主真实核验，不替它打开或看图；`--check-turn` 是最终回复前门禁，核对当前交付、源文件、呈现资源和本次前台证据。`--record-ready` 仅用于 legacy 的 next=record-round，检查并登记已有图片；资产模式须显式使用 `assets record`，不会由该选项登记或批准。CLI 不负责生成、独立审查、替用户选择或任意自动推进。
 
 workbench 用 `.workbench/presentation.json` 比较业务版本、项目 fingerprint、源文件/round.json/审查摘要、实际 next、最近 manifest/index.html 与快照完整性。全部一致才 `presentation.reused=true` 并重建当前 gallery；否则调用 present_round 创建新 Dxxxx。直接反复调用 present_round 会创建新交付，不具备这项复用判断。
 
@@ -59,7 +74,19 @@ workbench 用 `.workbench/presentation.json` 比较业务版本、项目 fingerp
 | `unavailable` | 没有图形界面或可用打开方式，HTML 路径仍保留 |
 | `open_failed` | 派发失败，保留错误与页面路径 |
 
-CLI 的系统打开成功只能记录 open_dispatched；失败或未请求时按实际返回 unavailable/open_failed。opened_verified 必须由能看到页面的宿主调用 `present_round.record_open_result`，提交匹配的 delivery_id、images_decoded=true 和 inspected_by；目前没有独立 CLI 参数可声明已验证。只用 open/xdg-open 成功返回不能升级成已验证，build_gallery 不写打开回执。
+CLI 的系统打开成功只能记录 open_dispatched；失败或未请求时按实际返回 unavailable/open_failed。`opened_verified` 必须由能看到页面的宿主核验后，运行 `workbench.py <项目> --record-foreground <证据.json>`；不能由 Agent 为满足门槛预先填写。证据包含：
+
+```json
+{
+  "turn_id": "本次 --turn 返回的 foreground.turn_id",
+  "delivery_id": "D0001",
+  "foreground": true,
+  "images_decoded": true,
+  "inspected_by": "实际核验的宿主执行者"
+}
+```
+
+`turn_id` 必须取自本次 `--turn` 的 `foreground.turn_id`，`delivery_id` 必须是该次展示的真实当前交付；不能复制旧证据。规划空态核对没有伪造图片、真实目录及下一步后才声明完成检查。该入口记录证据，不证明宿主实际看过；不能把健康检查、open/xdg-open 成功或脚本执行成功升级成前台验收。`build_gallery` 不写打开回执。
 
 ## 本机交互与静态回退
 
@@ -76,6 +103,8 @@ CLI 的系统打开成功只能记录 open_dispatched；失败或未请求时按
 - `GET /api/state`：页面打开后核对项目版本和当前 delivery；核对失败时保留画面、停用提交并保留草稿。
 - `POST /api/decision`：只发受控选择请求。浏览器不调用生图、不推进阶段。
 - `GET /api/receipt/<request_id>`：真实读回。网络超时后按同一 request ID 查询；只有 `committed: true` 的回执才显示“已采用”。
+
+本机工作台约每 2.5 秒查询状态，页面隐藏时暂停、重新可见时恢复。新交付就绪且没有草稿、输入、模态框或提交操作时可切到最新入口；否则保留当前画面与草稿，显示「查看最新工作台」供用户切换。只读历史和静态页不自动追随；轮询不代表前台已验收，也不代替 Agent 的 `--check-turn`。
 
 `file://` 页面不请求任何 API。选择、备注与保持项只进入浏览器草稿；页面明确显示“尚未提交”，并提供可复制的聊天回复。没有服务时不渲染假成功结果。
 
@@ -97,7 +126,7 @@ CLI 的系统打开成功只能记录 open_dispatched；失败或未请求时按
 
 legacy 商品用途与尺寸问题由 next 中的 `product.usage:<主体ID>`、`product.size:<主体ID>` 驱动，保留自由输入；资产模式不凭该问卷阻塞未选商品资产。页面简单尺寸输入与结构化 product JSON 的边界见 [项目状态](project-state.md)，多维尺寸和实测依据需由 Agent 如实保存。不让用户填写 yaw/elevation 等内部机位参数。
 
-已有 committed=true 回执必须读回并续作，不能再执行一次 select；request-* 的 committed 只说明意向已登记，不表示已批准生图。页面提交不是必须步骤：用户直接在聊天里给出编号、修改意见或选择同样有效，Agent 应按聊天原话登记并继续。
+已有 committed=true 回执必须读回并续作，不能再次提交；request-* 的 committed 只说明意向已登记，不表示已批准生图。页面提交不是必须步骤：用户在聊天里的编号、修改意见或选择同样有效，Agent 应按原话走对应入口登记，再同步页面。资产模式用 `assets new/record/approve`，legacy 用 `new-round/record-round/select`；聊天确认不豁免真实文件、来源、审查或当前交付资格，不能将禁用候选口头改成可选。
 
 ## 实际图、合同与发布输出
 

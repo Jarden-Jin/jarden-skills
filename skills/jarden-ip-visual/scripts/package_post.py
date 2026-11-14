@@ -454,6 +454,17 @@ def execute(root: Path, project: dict[str, Any], copy: dict[str, Any], plan: dic
             shutil.rmtree(staging)
 
 
+def emit_delivery(root: Path, result: dict[str, Any]) -> int:
+    import workbench
+    try:
+        presented = workbench.ensure_presentation(root)
+        result = {**result, "workbench": {"status": "synced", **presented}}
+    except (state.ProjectError, OSError, ValueError) as error:
+        result = {**result, "ok": False, "operation_committed": True, "presentation_required": True,
+                  "error": "workbench_sync_failed：发帖包已保存，只恢复工作台，不重做打包：" + str(error)}
+    return state.emit(result)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="按笔记类型整理发布图片、标题、正文和 tag")
     parser.add_argument("project")
@@ -495,10 +506,10 @@ def main(argv: list[str] | None = None) -> int:
                     raise state.ProjectError("实际输出在审查后变化，停止整理并重新审查")
                 require_render_inputs(root, plan, args)
                 commit_state(root, project, out, plan)
-            return state.emit({"ok": True, "unchanged": True, "post": out.as_posix(), "images": len(plan["images"])})
+            return emit_delivery(root, {"ok": True, "unchanged": True, "post": out.as_posix(), "images": len(plan["images"])})
         if out.exists() and any(out.iterdir()) and not args.force:
             raise state.ProjectError("发帖目录已存在但内容不同或不完整；核对后加 --force 保留上一版再更新")
-        return state.emit(execute(root, project, copy, plan, out, args))
+        return emit_delivery(root, execute(root, project, copy, plan, out, args))
     except (state.ProjectError, imaging.ImagingError, OSError) as error:
         return state.emit({"ok": False, "error": str(error)})
 

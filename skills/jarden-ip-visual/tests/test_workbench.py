@@ -325,6 +325,171 @@ class WorkbenchTests(unittest.TestCase):
         self.assertTrue(Path(second["gallery"]).is_file())
         self.assertEqual(first["delivery_id"], second["delivery_id"])
 
+    def test_renderer_update_creates_delivery_without_changing_business(self):
+        first = self.run_workbench()
+        before = self.load()["revision"]
+        signature = workbench.renderer_signature()
+        with mock.patch.object(workbench, "renderer_signature", return_value={**signature, "gallery.js": "updated"}):
+            second = self.run_workbench()
+        self.assertNotEqual(first["delivery_id"], second["delivery_id"])
+        self.assertEqual(self.load()["revision"], before)
+
+    def test_asset_catalog_update_invalidates_renderer_and_turn(self):
+        import asset_plan
+        result = self.start_turn()
+        workbench.record_foreground(self.root, self.foreground_evidence(result))
+        catalog = project.read_json(asset_plan.CATALOG_PATH)
+        catalog["assets"][0]["name"] = "Updated concept name"
+        catalog_file = self.home / "asset-catalog.json"
+        project.atomic_json(catalog_file, catalog)
+        with mock.patch.object(asset_plan, "CATALOG_PATH", catalog_file):
+            with self.assertRaisesRegex(project.ProjectError, "workbench_unsynced"):
+                workbench.check_turn(self.root)
+            refreshed = self.run_workbench()
+        self.assertNotEqual(result["delivery_id"], refreshed["delivery_id"])
+
+    def test_turn_rejects_missing_or_modified_rendered_artifacts(self):
+        for relative in ("gallery.html", "deliveries/{delivery}/index.html", "deliveries/{delivery}/manifest.json"):
+            with self.subTest(artifact=relative):
+                result = self.start_turn()
+                workbench.record_foreground(self.root, self.foreground_evidence(result))
+                target = self.root / relative.format(delivery=result["delivery_id"])
+                original = target.read_bytes()
+                target.unlink()
+                with self.assertRaisesRegex(project.ProjectError, "workbench_unsynced"):
+                    workbench.check_turn(self.root)
+                target.write_bytes(b"modified rendered artifact")
+                with self.assertRaisesRegex(project.ProjectError, "workbench_unsynced"):
+                    workbench.check_turn(self.root)
+                target.write_bytes(original)
+
+    def start_turn(self):
+        info = self.live_server()
+        self.cache_server(info)
+        with mock.patch.object(workbench.presentation, "dispatch_open", side_effect=AssertionError("host opens panel")):
+            return workbench.start_turn(self.root, open_browser=False)
+
+    def foreground_evidence(self, result):
+        return {"turn_id": result["foreground"]["turn_id"], "delivery_id": result["delivery_id"],
+                "foreground": True, "images_decoded": True, "inspected_by": "unit-test-host"}
+
+    def test_each_turn_requires_new_foreground_evidence_even_without_business_change(self):
+        first = self.start_turn()
+        self.assertEqual(first["foreground"]["status"], "pending")
+        self.assertFalse(workbench.check_turn(self.root)["ok"])
+        workbench.record_foreground(self.root, self.foreground_evidence(first))
+        self.assertTrue(workbench.check_turn(self.root)["ok"])
+        second = workbench.start_turn(self.root, open_browser=False)
+        self.assertEqual(first["delivery_id"], second["delivery_id"])
+        self.assertNotEqual(first["foreground"]["turn_id"], second["foreground"]["turn_id"])
+        self.assertFalse(workbench.check_turn(self.root)["ok"])
+        with self.assertRaisesRegex(project.ProjectError, "foreground_evidence_required"):
+            workbench.record_foreground(self.root, self.foreground_evidence(first))
+
+    def test_foreground_evidence_requires_real_fields_and_matching_latest_delivery(self):
+        result = self.start_turn()
+        evidence = self.foreground_evidence(result)
+        for key in ("turn_id", "delivery_id", "foreground", "images_decoded", "inspected_by"):
+            with self.subTest(key=key), self.assertRaisesRegex(project.ProjectError, "foreground_evidence_required"):
+                workbench.record_foreground(self.root, {**evidence, key: None})
+        verified = workbench.record_foreground(self.root, evidence)
+        self.assertEqual(verified["foreground"]["status"], "verified")
+        receipt = project.read_json(self.root / "deliveries" / result["delivery_id"] / "receipts.json")
+        self.assertEqual(receipt["latest"]["status"], "opened_verified")
+        self.assertTrue(workbench.check_turn(self.root)["ok"])
+        current = self.load()
+        current["revision"] += 1
+        self.save(current)
+        with self.assertRaisesRegex(project.ProjectError, "workbench_unsynced"):
+            workbench.check_turn(self.root)
+        with self.assertRaisesRegex(project.ProjectError, "workbench_unsynced"):
+            workbench.record_foreground(self.root, evidence)
+
+    def test_check_turn_rejects_changed_source_bytes_and_broken_snapshots(self):
+        self.make_round(recorded=True)
+        result = self.start_turn()
+        workbench.record_foreground(self.root, self.foreground_evidence(result))
+        entry = self.load()["rounds"][0]
+        image = self.root / entry["dir"] / "A.png"
+        original = image.read_bytes()
+        image.write_bytes(png_bytes(30))
+        with self.assertRaisesRegex(project.ProjectError, "workbench_unsynced"):
+            workbench.check_turn(self.root)
+        image.write_bytes(original)
+        manifest = project.read_json(Path(result["presentation"]["manifest"]))
+        (self.root / manifest["items"][0]["display_path"]).write_bytes(b"corrupt")
+        with self.assertRaisesRegex(project.ProjectError, "workbench_unsynced"):
+            workbench.check_turn(self.root)
+
+    def test_turn_cli_and_check_return_pending_without_claiming_open_verified(self):
+        info = self.live_server()
+        self.cache_server(info)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(workbench.main([str(self.root), "--turn", "--no-open"]), 0)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["foreground"]["status"], "pending")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(workbench.main([str(self.root), "--check-turn"]), 2)
+        self.assertFalse(json.loads(output.getvalue())["ok"])
+        evidence_file = self.home / "foreground-evidence.json"
+        project.atomic_json(evidence_file, self.foreground_evidence(result))
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(workbench.main([str(self.root), "--record-foreground", str(evidence_file)]), 0)
+        self.assertEqual(json.loads(output.getvalue())["foreground"]["status"], "verified")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(workbench.main([str(self.root), "--check-turn"]), 0)
+
+    def test_http_choice_syncs_new_html_and_preserves_idempotent_receipt(self):
+        current = self.load()
+        current["answers"] = {}
+        self.save(current)
+        first = self.run_workbench()
+        manifest = project.read_json(Path(first["presentation"]["manifest"]))
+        payload = {**self.decision(manifest, "answer-field"), "round_id": None,
+                   "field": "answers.product_form", "value": "plush", "items": []}
+        info = self.live_server()
+        token = info["url"].split("#token=")[1]
+        headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1", int(info["origin"].rsplit(":", 1)[1]), timeout=5)) as connection:
+            for attempt in range(2):
+                connection.request("POST", "/api/decision", body=json.dumps(payload), headers=headers)
+                response = connection.getresponse()
+                result = json.loads(response.read())
+                self.assertEqual(response.status, 200)
+                self.assertTrue(result["committed"])
+                self.assertEqual(result["workbench"]["status"], "synced")
+                latest = project.read_json(Path(result["workbench"]["manifest"]))
+                self.assertEqual(latest["project_revision"], self.load()["revision"])
+                self.assertNotEqual(latest["delivery_id"], first["delivery_id"])
+                stored = project.receipt(self.root, payload["request_id"])
+                self.assertNotIn("workbench", stored)
+                if attempt == 0:
+                    original_receipt = stored
+                else:
+                    self.assertEqual(stored, original_receipt)
+
+    def test_http_sync_failure_does_not_turn_committed_choice_into_retryable_failure(self):
+        current = self.load()
+        current["answers"] = {}
+        self.save(current)
+        first = self.run_workbench()
+        manifest = project.read_json(Path(first["presentation"]["manifest"]))
+        payload = {**self.decision(manifest, "answer-field"), "round_id": None,
+                   "field": "answers.product_form", "value": "plush", "items": []}
+        info = self.live_server()
+        token = info["url"].split("#token=")[1]
+        with mock.patch.object(workbench, "ensure_presentation", side_effect=OSError("disk full")), contextlib.closing(
+            http.client.HTTPConnection("127.0.0.1", int(info["origin"].rsplit(":", 1)[1]), timeout=5)
+        ) as connection:
+            connection.request("POST", "/api/decision", body=json.dumps(payload),
+                               headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+            response = connection.getresponse()
+            result = json.loads(response.read())
+        self.assertEqual(response.status, 200)
+        self.assertTrue(result["committed"])
+        self.assertEqual(result["workbench"]["status"], "sync_failed")
+        self.assertEqual(self.load()["answers"]["product_form"], "plush")
+
     def test_changed_derivation_source_and_review_records_invalidate_cache(self):
         _, round_file = self.make_round()
         (self.root / "derivation-source.png").write_bytes(png_bytes())

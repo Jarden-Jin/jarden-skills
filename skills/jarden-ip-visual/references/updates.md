@@ -58,7 +58,7 @@
 
 ## schema 4 与工作流边界
 
-当前源码的目标版本为 `0.4.0`，不代表已经存在同号公开 Release。schema 4 代码的项目兼容声明是读 `[1, 2, 3, 4]`、写 `[3, 4]`；发行索引与更新计划仍使用各自的 schema 1，不能与项目 schema 混为一谈。
+当前源码的版本以 `SKILL.md` 的 `metadata.version` 为准，不代表已经存在同号公开 Release。schema 4 代码的项目兼容声明是读 `[1, 2, 3, 4]`、写 `[3, 4]`；发行索引与更新计划仍使用各自的 schema 1，不能与项目 schema 混为一谈。
 
 CLI 新 `init` 默认资产模式，显式 `--workflow legacy` 保留固定商品链；两者新建均为 schema 4。已有 schema 3 legacy 继续读写，不因安装新代码自动切换。schema 1/2 写入前须显式迁移；schema 3 转资产模式也须预览迁移与确认范围，结构迁移不会自动启用资产流程、补造旧过程或审查。命令与保护边界见 [项目状态](project-state.md)。
 

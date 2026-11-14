@@ -981,9 +981,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     state = _state_api()
     try:
-        return _dispatch(args)
+        from runtime_activity import execution_lease
+        with execution_lease():
+            return state.execute_command(args)
     except (ValueError, OSError, state.ProjectError) as error:
-        return state.emit({"ok": False, "error": str(error)})
+        return state.command_error(error)
 
 
 if __name__ == "__main__":

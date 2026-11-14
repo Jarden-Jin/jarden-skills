@@ -24,6 +24,7 @@
 - `scene_plan.revision` 是独立的计划版本；产品约定、镜头计划、生成 ledger 和交付 manifest 各自的内部 `schema_version: 1` 不代表项目退回 schema 1。
 - 项目核心写入使用锁、临时文件与 `.state-transaction.json` 日志；`show` 发现未完成状态事务时会恢复。生成 ledger 另有任务锁，调用外部工具前独立落盘。不要手工删除日志或承诺整个图片生产过程都是原子事务。
 - `present_round.py` 更新交付索引和打开回执，不增加业务 revision。`brief.decisions` 中的 `origin` 区分 `user-confirmed`、`agent-inferred`、`reference-derived`；确认推断方案不改写其原始来源。
+- 每次项目对话开头运行 `workbench.py <项目> --turn` 并记录绑定本次 `turn_id` 的前台证据，结束前运行 `--check-turn`；有状态、源文件或呈现资源变化则先重新同步核验，无变化不重复打开。保存用户可见状态后、下一次生图或等待确认前也须同步；无图片呈现真实规划空态。不将展示、系统打开或聊天确认当作资产批准；宿主前台验收与失败门槛见 [HTML 交付](html-delivery.md)。
 
 ## 工作流路由
 
@@ -67,6 +68,7 @@
 
 ```text
 <python> <skill>/scripts/project.py init <项目> --input <图> --kind wireframe
+<python> <skill>/scripts/workbench.py <项目> --turn
 <python> <skill>/scripts/project.py show <项目>
 ```
 

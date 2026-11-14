@@ -224,6 +224,7 @@ class PhysicsReviewTests(unittest.TestCase):
         (self.job / "reviews/physics/index.json").unlink()
         self.call("package_post.py", self.job, "--force", code=2)
         self.assertEqual(before, (self.job / "post/manifest.json").read_bytes())
+        self.call("workbench.py", self.job, "--no-open")
         self.assertFalse(self.call("build_gallery.py", self.job)["has_post"])
 
     def test_default_clean_images_and_explicit_text_opt_in(self):

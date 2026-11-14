@@ -5,6 +5,11 @@
   const fragment = new URLSearchParams(location.hash.replace(/^#/, ""));
   const token = fragment.get("token");
   const interactive = Boolean(token) && location.protocol.startsWith("http");
+  const liveWorkbench = interactive && !data.readonly && /^\/(?:gallery\.html)?$/.test(location.pathname);
+  const syncInterval = 2500;
+  let syncTimer = null;
+  let syncRunning = false;
+  let navigating = false;
   const records = value => Array.isArray(value) ? value.filter(entry => entry && typeof entry === "object") : value && typeof value === "object" ? Object.entries(value).filter(([, entry]) => entry && typeof entry === "object").map(([identifier, entry]) => ({ id: identifier, ...entry })) : [];
   const identifiers = value => Array.isArray(value) ? value.map(entry => String(entry && typeof entry === "object" ? entry.id ?? entry.asset_id ?? "" : entry)).filter(Boolean) : [];
   const assetWorkflow = data.asset_workflow && typeof data.asset_workflow === "object" && data.asset_workflow.enabled !== false ? data.asset_workflow : null;
@@ -31,6 +36,13 @@
     adopted: false,
     syncStatus: interactive ? "checking" : "static",
     syncError: "",
+    pendingUpdate: null,
+    draftDirty: typeof persisted.draftDirty === "boolean" ? persisted.draftDirty : Boolean(
+      identifiers(persisted.selected).length || (typeof persisted.note === "string" && persisted.note.trim()) || persisted.requestId ||
+      (typeof persisted.keep === "string" && persisted.keep !== (Array.isArray(current?.keep) ? current.keep.join("、") : "")) ||
+      (persisted.fieldValue !== undefined && persisted.fieldValue !== "") ||
+      (Array.isArray(persisted.assetSelected) && JSON.stringify(persisted.assetSelected) !== JSON.stringify(identifiers(assetWorkflow?.selected)))
+    ),
     error: "",
     requestId: persisted.requestId || null,
     requestPayload: persisted.requestPayload || "",
@@ -130,8 +142,9 @@
     } catch (_) { return null; }
   }
 
-  function saveDraft() {
-    try { localStorage.setItem(storageKey, JSON.stringify({ action: state.action, selected: [...state.selected], assetSelected: [...state.assetSelected], view: state.view, note: state.note, keep: state.keep, fieldValue: state.fieldValue, requestId: state.requestId, requestPayload: state.requestPayload })); } catch (_) {}
+  function saveDraft(edited = false) {
+    if (edited) state.draftDirty = true;
+    try { localStorage.setItem(storageKey, JSON.stringify({ action: state.action, selected: [...state.selected], assetSelected: [...state.assetSelected], view: state.view, note: state.note, keep: state.keep, fieldValue: state.fieldValue, requestId: state.requestId, requestPayload: state.requestPayload, draftDirty: state.draftDirty })); } catch (_) {}
   }
 
   function receiptLabel(action) {
@@ -210,7 +223,7 @@
     state.requestId = null;
     state.requestPayload = "";
     state.error = "";
-    saveDraft();
+    saveDraft(true);
     render();
     requestAnimationFrame(() => document.querySelector(`[data-catalog-id="${CSS.escape(identifier)}"] input`)?.focus({ preventScroll: true }));
   }
@@ -239,7 +252,7 @@
     state.result = state.result && !state.result.committed ? state.result : null;
     state.requestId = null;
     state.requestPayload = "";
-    saveDraft();
+    saveDraft(true);
     render();
     requestAnimationFrame(() => {
       const control = document.querySelector(`input[data-item-id="${CSS.escape(id)}"]`);
@@ -261,7 +274,7 @@
       state.selected = new Set([...state.selected].slice(0, 1));
     }
     if (action === "request-redo") state.selected.clear();
-    saveDraft();
+    saveDraft(true);
     render();
     document.getElementById("decision-action")?.focus({ preventScroll: true });
   }
@@ -397,6 +410,7 @@
     state.action = receipt.action || state.action;
     state.selected.clear();
     state.error = "";
+    state.draftDirty = false;
     saveDraft();
   }
 
@@ -437,8 +451,37 @@
     } catch (_) { return null; }
   }
 
+  function editingSurface() {
+    return state.submitting || Boolean(document.querySelector("dialog[open]")) || Boolean(document.activeElement && /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName));
+  }
+
+  function openLatestWorkbench() {
+    if (!state.pendingUpdate || state.submitting || navigating) return;
+    saveDraft();
+    navigating = true;
+    if (syncTimer !== null) clearTimeout(syncTimer);
+    if (liveWorkbench) location.reload();
+    else location.replace(`/gallery.html#token=${encodeURIComponent(token)}`);
+  }
+
+  function syncNotice() {
+    if (state.pendingUpdate) return [el("div", { class: "notice" }, [
+      el("strong", { text: `工作台有新版本 · ${state.pendingUpdate.deliveryId}` }),
+      el("span", { text: " 本页草稿保留在当前交付；切换后请核对最新图片与状态。" }),
+      el("button", { type: "button", text: "查看最新工作台", disabled: state.submitting, onclick: openLatestWorkbench })
+    ])];
+    if (data.stale && liveWorkbench && !state.syncError) return [el("div", { class: "notice", text: "项目状态已变化，最新工作台正在准备；保留当前画面，不重复刷新。" })];
+    return [];
+  }
+
+  function syncSignature() {
+    return JSON.stringify([data.live_revision, data.stale, state.syncStatus, state.syncError, state.pendingUpdate, state.adopted, state.result]);
+  }
+
   async function syncState() {
-    if (!interactive) return;
+    if (!interactive || syncRunning || navigating) return;
+    syncRunning = true;
+    const previous = syncSignature();
     try {
       const response = await api("/api/state", { method: "GET", headers: { Accept: "application/json" } });
       if (!response.ok) throw new Error(`状态接口返回 HTTP ${response.status}`);
@@ -446,8 +489,11 @@
       const manifest = payload.manifest;
       if (!manifest) throw new Error("状态接口没有返回当前交付 manifest");
       if (payload.project_id !== data.project_id) throw new Error("实时状态不属于本页项目；没有提交任何选择");
+      if (manifest.project_id && manifest.project_id !== data.project_id) throw new Error("交付快照不属于本页项目；保留当前画面");
       data.live_revision = payload.revision ?? payload.project?.revision ?? manifest.project_revision;
       data.stale = manifest.delivery_id !== data.delivery_id || data.live_revision !== data.project_revision;
+      const ready = /^D\d+$/.test(manifest.delivery_id) && manifest.delivery_id !== data.delivery_id && Number.isInteger(data.live_revision) && manifest.project_revision === data.live_revision;
+      state.pendingUpdate = ready ? { deliveryId: manifest.delivery_id, revision: manifest.project_revision } : null;
       const saved = Object.values(payload.receipts || {}).filter(receipt => receipt.delivery_id === data.delivery_id && receipt.committed === true).pop();
       const requestId = state.requestId || saved?.request_id;
       if (requestId && !state.adopted) {
@@ -459,13 +505,32 @@
     } catch (error) {
       state.syncStatus = "error";
       state.syncError = error.name === "AbortError" ? "读取实时状态超时。" : error.message;
+      state.pendingUpdate = null;
+    } finally {
+      syncRunning = false;
     }
-    if (document.activeElement && /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) {
+    if (state.pendingUpdate && liveWorkbench && !document.hidden && state.view !== "history" && !state.draftDirty && !editingSurface()) {
+      openLatestWorkbench();
+      return;
+    }
+    if (previous === syncSignature()) return;
+    if (editingSurface()) {
       const mode = document.querySelector(".mode");
       if (mode) mode.textContent = state.syncStatus === "synced" ? "本机交互 · 已核对项目状态" : "本机交互 · 状态核对失败";
       document.querySelectorAll("[data-submit-action]").forEach(button => { button.disabled = submissionDisabled(button.getAttribute("data-submit-action")); });
       if (data.stale || data.readonly) document.querySelectorAll("input[data-item-id], input[data-asset-id], #decision-action").forEach(control => { control.disabled = true; });
-    } else if (!document.querySelector("dialog[open]") && !state.submitting) render();
+      document.getElementById("live-sync-status")?.replaceChildren(...syncNotice());
+    } else render();
+  }
+
+  function scheduleSync() {
+    if (!liveWorkbench || document.hidden || navigating) return;
+    if (syncTimer !== null) clearTimeout(syncTimer);
+    syncTimer = setTimeout(async () => {
+      syncTimer = null;
+      await syncState();
+      scheduleSync();
+    }, syncInterval);
   }
 
   function frame(item, index, label) {
@@ -723,7 +788,6 @@
     if (data.readonly) parts.push(el("div", { class: "notice" }, [el("strong", { text: "旧项目只读。" }), el("span", { text: " 可用 build_gallery 查看；明确迁移后才能提交。" })]));
     if (data.stale) parts.push(el("div", { class: "notice" }, [
       el("strong", { text: state.adopted ? "这份交付已有真实回执。" : "这份交付已过期。" }), el("span", { text: ` 当前业务版本 ${data.live_revision}，${state.adopted ? "回聊天回复「继续」；本页保留已提交记录。" : "请从最近交付重新打开。"}` }),
-      interactive && !state.adopted ? el("button", { type: "button", style: "margin-left:12px", text: "打开当前入口", onclick: () => { location.href = `/gallery.html#token=${encodeURIComponent(token)}`; } }) : null
     ]));
     if (state.syncError) parts.push(el("div", { class: "notice error" }, [el("strong", { text: "实时状态未确认。" }), el("span", { text: ` ${state.syncError} 提交已暂时停用，草稿仍会保留。` })]));
     if (data.missing) parts.push(el("div", { class: "notice" }, [el("strong", { text: `${data.missing} 张图片缺失。` }), el("span", { text: " 可以查看方向和提示词，缺图项不能采用。" })]));
@@ -738,7 +802,7 @@
         type: "radio", name: "answer", value: JSON.stringify(choice.value),
         checked: JSON.stringify(state.fieldValue) === JSON.stringify(choice.value),
         disabled: editLocked(),
-        onchange: () => { state.fieldValue = choice.value; state.requestId = null; state.requestPayload = ""; saveDraft(); updateSummary(); }
+        onchange: () => { state.fieldValue = choice.value; state.requestId = null; state.requestPayload = ""; saveDraft(true); updateSummary(); }
       }),
       el("span", {}, [el("strong", { text: choice.label }), choice.value === offer.recommended ? el("strong", { text: "（建议，可改选）" }) : null, (questionField.intros?.[choice.value] || choice.intro) ? el("small", { style: "display:block", text: questionField.intros?.[choice.value] || choice.intro }) : null])
     ])) : [el("label", { class: "field", text: "填写这个答案" }, [
@@ -746,7 +810,7 @@
         type: offer.field === "answers.concept_count" ? "number" : "text",
         value: state.fieldValue, placeholder: questionField.placeholder || "写下你的想法，也可以在聊天里补充说明",
         disabled: editLocked(),
-        oninput: event => { state.fieldValue = event.target.value; state.requestId = null; state.requestPayload = ""; saveDraft(); updateSummary(); }
+        oninput: event => { state.fieldValue = event.target.value; state.requestId = null; state.requestPayload = ""; saveDraft(true); updateSummary(); }
       })
     ])];
     const control = el("div", { class: "question" }, [
@@ -780,14 +844,14 @@
       el("label", { class: "field", for: "decision-note", text: intent && assetWorkflow && !planning ? "修改意见（必填）" : "修改意见（选填）" }, [el("textarea", {
         id: "decision-note", value: state.note, placeholder: "写下想调整的地方，其余部分继续保留。",
         maxlength: 5000,
-        disabled: editLocked(), oninput: event => { state.note = event.target.value; state.requestId = null; state.requestPayload = ""; saveDraft(); updateSummary(); }
+        disabled: editLocked(), oninput: event => { state.note = event.target.value; state.requestId = null; state.requestPayload = ""; saveDraft(true); updateSummary(); }
       })]),
       el("details", { class: "keep-editor" }, [
         el("summary", { text: "继续保留 · 编辑" }),
         el("label", { class: "field", for: "decision-keep", text: "保持项（逗号分隔）" }, [el("input", {
           id: "decision-keep", type: "text", value: state.keep, placeholder: "填入保持项，用逗号分隔",
           maxlength: 2000,
-          disabled: editLocked(), oninput: event => { state.keep = event.target.value; state.requestId = null; state.requestPayload = ""; saveDraft(); updateSummary(); }
+          disabled: editLocked(), oninput: event => { state.keep = event.target.value; state.requestId = null; state.requestPayload = ""; saveDraft(true); updateSummary(); }
         })])
       ]),
       el("div", { class: "keep-tags", id: "keep-tags" }, parseKeep().map(value => el("span", { text: value }))),
@@ -1242,7 +1306,7 @@
     app.replaceChildren(el("div", { class: "studio-layout" }, [
       navigation(),
       el("div", { class: "studio-main" }, [header(), el("main", { class: "content", "aria-label": "创作内容" }, [
-        taskHeading(), ...notices(),
+        taskHeading(), el("div", { id: "live-sync-status", "aria-live": "polite" }, syncNotice()), ...notices(),
         el("div", { class: "workspace" + (state.view === "history" ? " history-workspace" : planOverviewOnly ? " plan-workspace" : "") }, [workarea(), state.view === "history" || planOverviewOnly ? null : sidebar()])
       ])])
     ]));
@@ -1257,6 +1321,11 @@
       if (dialogs.length) dialogs[dialogs.length - 1].close();
     }
   });
+  if (liveWorkbench) document.addEventListener("visibilitychange", () => {
+    if (syncTimer !== null) clearTimeout(syncTimer);
+    syncTimer = null;
+    if (!document.hidden) syncState().finally(scheduleSync);
+  });
   render();
-  syncState();
+  syncState().finally(scheduleSync);
 })();

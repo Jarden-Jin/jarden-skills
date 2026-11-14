@@ -679,13 +679,13 @@ const settle = async () => { for (let turn = 0; turn < 30; turn++) await Promise
         image.save(source / "scale.png")
         result = self.cli("present_round.py", self.root, "--no-open")
         self.assertEqual(result["project_revision"], current_state["revision"])
-        manifest = project.read_json(self.root / "deliveries/D0002/manifest.json")
+        manifest = project.read_json(Path(result["manifest"]))
         basis = manifest["comparison_baseline"]
-        self.assertEqual(basis["delivery_id"], "D0001")
+        self.assertLess(int(basis["delivery_id"][1:]), int(manifest["delivery_id"][1:]))
         self.assertEqual(basis["round_id"], "09-scene-set")
         self.assertEqual([(match["item_id"], match["baseline_item_id"]) for match in basis["matches"]], [("scale", "scale")])
         comparison = manifest["view"]["comparison"]
-        self.assertEqual(comparison["delivery_id"], "D0001")
+        self.assertEqual(comparison["delivery_id"], basis["delivery_id"])
         self.assertTrue(comparison["items"])
         self.assertTrue(all(item["display_path"] == old_scale["display_path"] for item in comparison["items"]))
         self.assertTrue(all(item["image_sha256"] == old_scale["image_sha256"] for item in comparison["items"]))
@@ -694,7 +694,7 @@ const settle = async () => { for (let turn = 0; turn < 30; turn++) await Promise
         self.assertEqual(old_file.read_bytes(), old_bytes)
         self.assertTrue(manifest["view"]["previous_delivery"]["items"])
         self.cli("build_gallery.py", self.root)
-        self.assertEqual(build_gallery.build_data(self.root, self.data())["comparison"]["delivery_id"], "D0001")
+        self.assertEqual(build_gallery.build_data(self.root, self.data())["comparison"]["delivery_id"], basis["delivery_id"])
 
     def test_next_action_receives_root_and_preserves_business_state(self):
         state = self.data()
@@ -713,10 +713,12 @@ const settle = async () => { for (let turn = 0; turn < 30; turn++) await Promise
         self.cli("project.py", "set", self.root, "preferences.directions_per_round=5")
         self.cli("project.py", "new-round", self.root, "--stage", "concept", "--based-on", "01-concept-s1:B")
         revision = self.data()["revision"]
-        self.cli("present_round.py", self.root, "--no-open")
-        manifest = project.read_json(self.root / "deliveries/D0002/manifest.json")
+        result = self.cli("present_round.py", self.root, "--no-open")
+        manifest = project.read_json(Path(result["manifest"]))
         basis = manifest["comparison_baseline"]
-        self.assertEqual(basis["delivery_id"], "D0001")
+        baseline = project.read_json(self.root / "deliveries" / basis["delivery_id"] / "manifest.json")
+        self.assertLess(int(baseline["delivery_id"][1:]), int(manifest["delivery_id"][1:]))
+        self.assertEqual(basis["round_id"], "01-concept-s1")
         self.assertEqual({match["item_id"] for match in basis["matches"]}, {"A", "B", "C", "D", "E"})
         self.assertTrue(all(match["baseline_item_id"] == "B" for match in basis["matches"]))
         self.assertEqual(self.data()["revision"], revision)
@@ -724,8 +726,8 @@ const settle = async () => { for (let turn = 0; turn < 30; turn++) await Promise
     def test_real_cli_planned_missing_reason_is_factual(self):
         self.cli("project.py", "set", self.root, "brief.execution_status=透明协议待确认，尚未调用内置生图")
         self.cli("project.py", "new-round", self.root, "--stage", "concept")
-        self.cli("present_round.py", self.root, "--no-open")
-        manifest = project.read_json(self.root / "deliveries/D0001/manifest.json")
+        result = self.cli("present_round.py", self.root, "--no-open")
+        manifest = project.read_json(Path(result["manifest"]))
         self.assertTrue(manifest["items"])
         for item in manifest["items"]:
             self.assertFalse(item["exists"])

@@ -142,6 +142,13 @@ def server_for(root: Path, token: str, port: int = 0) -> ThreadingHTTPServer:
                 result = state.submit_decision(root, payload)
                 if state.receipt(root, result["request_id"]) != result:
                     raise state.ProjectError("receipt_readback_failed")
+                import workbench
+                try:
+                    presented = workbench.ensure_presentation(root)
+                    result = {**result, "workbench": {"status": "synced", **presented}}
+                except (state.ProjectError, OSError, ValueError) as error:
+                    result = {**result, "workbench": {"status": "sync_failed", "error": str(error),
+                              "say": "选择已提交，但工作台同步失败；不要重复提交，请回聊天恢复工作台"}}
                 self.json_response(200, result)
             except (state.ProjectError, OSError, ValueError) as error:
                 self.json_response(409, {"ok": False, "committed": False, "error": str(error)})
