@@ -48,7 +48,7 @@ class ReviewChecksTests(unittest.TestCase):
         return json.loads(result.stdout)
 
     def init(self):
-        self.call("project.py", "init", self.job, "--input", self.source, "--kind", "wireframe")
+        self.call("project.py", "init", self.job, "--input", self.source, "--kind", "wireframe", "--workflow", "legacy")
         self.call(
             "project.py", "set", self.job,
             "answers.product_form=plush", "answers.subject_scope=single",

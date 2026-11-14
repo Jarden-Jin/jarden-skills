@@ -1,6 +1,6 @@
 # 产品、镜头与实际图验收
 
-本文件负责商品用途、设计尺度、视图资料、逐图镜头、生成任务和 G1。项目事务见 [项目状态](project-state.md)，匿名物理 G2 见 [物理审查](physics-review.md)。这些字段由 Agent 从自然语言整理，不要求用户填写工程表单。
+本文件负责 legacy 商品流程及所选资产确实涉及的商品用途、设计尺度、视图资料、逐图镜头、生成任务和 G1，不是默认资产模式的通用前置。新 `init` 默认 schema 4 资产流程，schema 3 legacy 可以继续原路径；范围与单项停止条件见 [按需资产工作流](asset-workflow.md)。项目事务见 [项目状态](project-state.md)，匿名物理 G2 见 [物理审查](physics-review.md)。这些字段由 Agent 从自然语言整理，不要求用户填写工程表单。
 
 ## 先保存已经知道的事实
 
@@ -64,7 +64,7 @@
 <python> <skill>/scripts/project.py compile <项目> --slot cover
 ```
 
-首条从笔记图位生成默认计划；已有计划时只读返回。自定义计划必须在首次建立时提供；之后只能增量修改。计划包含 `schema_version:1`、`revision:0`、`slots` 和 `coverage`。每个 slot 有稳定 `id`、`role`、主体/规格引用、`view`、`yaw`、`elevation`、`pose`、`framing`、`reference_bindings`、`scale_anchor`、`keep`。方位、相机高低、产品姿态、取景独立；不因用户说“比如45°”就替换全部正面。
+首条从笔记图位生成默认计划；已有计划时只读返回当前计划与 reconciliation。发布组合变化须先核对差异，再按 [项目状态](project-state.md#legacy-镜头计划增量修改与-compile) 用 `scene-plan --reconcile` 和当前计划 revision 或 hash 显式协调，不沿用过期默认图位。自定义计划必须在首次建立时提供；之后具体图位用增量补丁，不整组覆盖。计划包含 `schema_version:1`、`revision:0`、`slots` 和 `coverage`。每个 slot 有稳定 `id`、`role`、主体/规格引用、`view`、`yaw`、`elevation`、`pose`、`framing`、`reference_bindings`、`scale_anchor`、`keep`。方位、相机高低、产品姿态、取景独立；不因用户说“比如45°”就替换全部正面。
 
 `coverage.required_views` 是本套需要的视面，`coverage.preserve_slots` 是保持图位。G0 只能证明计划格式与计划覆盖，不能证明图片真的有该角度。`compile` 按图位生成提示词和分工参考：身份、产品、视图、环境、风格、基线。环境或风格参考不能携带机位与姿态指令。生产编译会验证真实参考文件和摘要；明确侧背镜头缺少当前已确认资料时停止。
 

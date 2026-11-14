@@ -43,7 +43,7 @@ class ContractGalleryTests(unittest.TestCase):
         image = Image.new("RGBA", (120, 160))
         ImageDraw.Draw(image).ellipse((20, 10, 100, 145), fill=(210, 190, 150, 255))
         image.save(self.source)
-        self.cli("project.py", "init", self.root, "--input", self.source, "--kind", "wireframe")
+        self.cli("project.py", "init", self.root, "--input", self.source, "--kind", "wireframe", "--workflow", "legacy")
         self.cli("project.py", "set", self.root, "answers.product_form=plush", "answers.subject_scope=single",
                  'answers.subjects=["小云"]', "answers.concept_count=1", "answers.note_type=single-multiview",
                  "answers.delivery=full-post", "image_backend.kind=builtin")

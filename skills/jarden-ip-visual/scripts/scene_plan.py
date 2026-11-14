@@ -39,6 +39,7 @@ VIEW_LABELS = {
     "front": "正面", "three-quarter": "四分之三视角", "left": "左侧",
     "right": "右侧", "back": "背面", "detail": "局部细节",
 }
+NOTE_TYPES = ("series-collection", "design-manuscript", "single-multiview", "multi-scene")
 
 
 class ScenePlanError(ValueError):
@@ -175,7 +176,7 @@ def _slot(value: Any) -> dict[str, Any]:
 
 def validate_plan(plan: dict[str, Any], project: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return a normalized deep copy or raise; missing view coverage is not approval."""
-    _require(isinstance(plan, dict) and not set(plan) - {"schema_version", "slots", "coverage", "revision"},
+    _require(isinstance(plan, dict) and not set(plan) - {"schema_version", "slots", "coverage", "revision", "default_profile"},
              "invalid_plan_fields")
     _require(type(plan.get("schema_version")) is int and plan["schema_version"] == SCHEMA_VERSION,
              "unsupported_scene_plan_schema")
@@ -197,8 +198,11 @@ def validate_plan(plan: dict[str, Any], project: dict[str, Any] | None = None) -
                 _resolve(project, pointer)
         if (project.get("answers") or {}).get("delivery") == "grid-9":
             _require(len(slots) <= 9, "grid_capacity: never silently drop or replace slots")
-    return {"schema_version": SCHEMA_VERSION, "slots": slots,
-            "coverage": {"required_views": required, "preserve_slots": preserve}, "revision": plan["revision"]}
+    result = {"schema_version": SCHEMA_VERSION, "slots": slots,
+              "coverage": {"required_views": required, "preserve_slots": preserve}, "revision": plan["revision"]}
+    if "default_profile" in plan:
+        result["default_profile"] = _validated_profile(plan["default_profile"])
+    return result
 
 
 def _spec_refs(slot: dict[str, Any]) -> list[str]:
@@ -283,8 +287,274 @@ def default_plan(project: dict[str, Any], base_slots: list[dict[str, Any]], *,
         if role == "detail":
             slot.setdefault("framing", "局部近景，清楚展示材质与工艺")
         slots.append(slot)
-    return validate_plan({"schema_version": SCHEMA_VERSION, "revision": 0, "slots": slots,
-                          "coverage": copy.deepcopy(coverage) if coverage is not None else {}}, project)
+    result = validate_plan({"schema_version": SCHEMA_VERSION, "revision": 0, "slots": slots,
+                            "coverage": copy.deepcopy(coverage) if coverage is not None else {}}, project)
+    if (project.get("answers") or {}).get("note_type") in NOTE_TYPES:
+        result["default_profile"] = _make_profile(project, result["slots"])
+    return result
+
+
+def _profile_subjects(project: dict[str, Any]) -> list[str]:
+    names = [name.strip() for name in (project.get("answers") or {}).get("subjects") or []
+             if isinstance(name, str) and name.strip()]
+    if not names:
+        names = [((project.get("brief") or {}).get("ip_name") or "").strip() or "主体"]
+    count = (project.get("answers") or {}).get("concept_count")
+    counter = len(names) + 1
+    while type(count) is int and len(names) < count:
+        name = f"角色{counter}"
+        counter += 1
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def _profile_base_slots(project: dict[str, Any]) -> list[dict[str, Any]]:
+    answers = project.get("answers") or {}
+    note_type = answers.get("note_type")
+    _require(note_type in NOTE_TYPES, "missing_note_type: choose a supported default profile")
+    subjects = _profile_subjects(project)
+    slots = [{"id": "cover", "role": "cover"}]
+    if note_type == "series-collection":
+        slots.extend({"id": f"character-{index}", "role": "character", "subject": name}
+                     for index, name in enumerate(subjects, 1))
+        slots.extend({"id": f"scene-{index}", "role": "scene"} for index in (1, 2))
+    elif note_type == "design-manuscript":
+        if len(subjects) > 1:
+            slots.append({"id": "lineup", "role": "lineup"})
+        slots.extend({"id": role, "role": role} for role in ("turnaround", "manuscript"))
+        slots.extend([{"id": "scene-1", "role": "scene"}, {"id": "extension-1", "role": "extension"}])
+    elif note_type == "multi-scene":
+        slots.extend({"id": role, "role": role} for role in ("group", "home", "theme", "outing"))
+    else:
+        slots.extend({"id": role, "role": role} for role in ("scale", "detail", "angle"))
+        slots.extend([{"id": "scene-1", "role": "scene"}, {"id": "info", "role": "info"}])
+    if answers.get("delivery") == "grid-9":
+        _require(note_type != "series-collection" or len(subjects) <= 7,
+                 "grid_capacity: default profile cannot silently drop subjects")
+        if len(slots) > 9:
+            slots = [slot for slot in slots if slot["id"] != "scene-2"]
+        extra = 1
+        while len(slots) < 9:
+            role = "extension" if extra % 2 else "scene"
+            slots.append({"id": f"{role}-x{extra}", "role": role})
+            extra += 1
+    return slots
+
+
+def _make_profile(project: dict[str, Any], slots: list[dict[str, Any]]) -> dict[str, Any]:
+    answers = project.get("answers") or {}
+    result = {"schema_version": 1, "note_type": answers.get("note_type"),
+              "delivery": answers.get("delivery"), "subjects": _profile_subjects(project),
+              "slots": copy.deepcopy(slots)}
+    result["signature"] = _hash(result)
+    return result
+
+
+def _validated_profile(value: Any) -> dict[str, Any]:
+    _require(isinstance(value, dict) and set(value) == {
+        "schema_version", "note_type", "delivery", "subjects", "slots", "signature"}, "invalid_default_profile")
+    _require(type(value["schema_version"]) is int and value["schema_version"] == 1,
+             "unsupported_default_profile_schema")
+    _require(isinstance(value["note_type"], str) and value["note_type"] in NOTE_TYPES,
+             "invalid_default_profile_note_type")
+    _require(value["delivery"] in (None, "full-post", "grid-9"), "invalid_default_profile_delivery")
+    _strings(value["subjects"], "profile_subjects")
+    _require(isinstance(value["slots"], list), "invalid_default_profile_slots")
+    normalized = [_slot(slot) for slot in value["slots"]]
+    _require(normalized == value["slots"] and len({slot["id"] for slot in normalized}) == len(normalized),
+             "invalid_default_profile_slots")
+    unsigned = {field: copy.deepcopy(entry) for field, entry in value.items() if field != "signature"}
+    _require(value["signature"] == _hash(unsigned), "invalid_default_profile_signature")
+    return copy.deepcopy(value)
+
+
+def default_profile_binding(project: dict[str, Any], base_slots: list[dict[str, Any]] | None = None, *,
+                            note_type: str | None = None) -> dict[str, Any]:
+    """Return the default template snapshot, independent of existing plan edits.
+
+    Both project schema 3 and 4 use the same scene schema.  The optional base
+    slots let a router provide its canonical template without this module
+    depending on the router or touching the filesystem.
+    """
+    source = copy.deepcopy(project)
+    source.pop("scene_plan", None)
+    if note_type is not None:
+        source.setdefault("answers", {})["note_type"] = note_type
+    _require((source.get("answers") or {}).get("note_type") in NOTE_TYPES, "missing_note_type")
+    bases = _profile_base_slots(source) if base_slots is None else base_slots
+    return default_plan(source, bases)["default_profile"]
+
+
+def bind_default_profile(project: dict[str, Any], base_slots: list[dict[str, Any]] | None = None
+                         ) -> dict[str, Any]:
+    """Bind an unbound legacy plan before changing note/delivery answers.
+
+    The snapshot describes old defaults, not a new assertion that current
+    custom camera values were defaults.  No image, approval, outer revision,
+    or slot is changed.  Existing bindings are never silently replaced.
+    """
+    updated = copy.deepcopy(project)
+    if updated.get("scene_plan") is not None:
+        plan = validate_plan(updated["scene_plan"])
+        if "default_profile" not in plan:
+            plan["default_profile"] = default_profile_binding(updated, base_slots)
+        updated["scene_plan"] = plan
+    return updated
+
+
+def _inferred_profile(project: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any] | None:
+    current = {slot["id"]: slot for slot in plan["slots"]}
+    candidates = []
+    for note_type in NOTE_TYPES:
+        try:
+            profile = default_profile_binding(project, note_type=note_type)
+        except ScenePlanError:
+            continue
+        defaults = {slot["id"]: slot for slot in profile["slots"]}
+        shared = set(current) & set(defaults)
+        matches = sum(current[identifier]["role"] == defaults[identifier]["role"] for identifier in shared)
+        distance = len(set(current) ^ set(defaults)) + 2 * (len(shared) - matches)
+        candidates.append((distance, -matches, profile))
+    candidates.sort(key=lambda item: item[:2])
+    if not candidates or len(candidates) > 1 and candidates[0][:2] == candidates[1][:2]:
+        return None
+    return candidates[0][2]
+
+
+def _retention_reasons(project: dict[str, Any], plan: dict[str, Any]) -> dict[str, list[str]]:
+    slots = {slot["id"]: slot for slot in plan["slots"]}
+    reasons: dict[str, list[str]] = {identifier: [] for identifier in slots}
+
+    def retain(identifier: Any, reason: str) -> None:
+        if isinstance(identifier, str) and identifier in reasons and reason not in reasons[identifier]:
+            reasons[identifier].append(reason)
+
+    for identifier in plan["coverage"]["preserve_slots"]:
+        retain(identifier, "preserve_slot")
+    for slot in slots.values():
+        if slot["keep"]:
+            retain(slot["id"], "keep")
+        if slot["reference_bindings"] or slot.get("refs"):
+            retain(slot["id"], "reference_binding")
+        if slot.get("constraint_policy"):
+            retain(slot["id"], "constraint_policy")
+    required = set(plan["coverage"]["required_views"])
+    for slot in slots.values():
+        if slot["view"] in required:
+            retain(slot["id"], "required_view")
+    for final in project.get("finals") or []:
+        if not isinstance(final, dict):
+            continue
+        identifier = final.get("slot") or final.get("slot_id")
+        if identifier:
+            retain(identifier, "existing_image")
+        elif final.get("role"):
+            for slot in slots.values():
+                if slot["role"] == final["role"]:
+                    retain(slot["id"], "existing_image")
+    for entry in project.get("rounds") or []:
+        if not isinstance(entry, dict) or entry.get("stage") != "scene":
+            continue
+        for slot in entry.get("review_slots") or entry.get("items") or []:
+            if isinstance(slot, dict):
+                retain(slot.get("slot_id") or slot.get("id"), "historical_round")
+        for identifier in entry.get("review_paths") or {}:
+            retain(identifier, "historical_round")
+    for feedback in project.get("feedback") or []:
+        if isinstance(feedback, dict) and feedback.get("status") not in ("cancelled", "superseded"):
+            for identifier in (feedback.get("scope") or {}).get("slots") or []:
+                retain(identifier, "scoped_feedback")
+    return reasons
+
+
+def profile_diff(project: dict[str, Any], *, base_slots: list[dict[str, Any]] | None = None
+                 ) -> dict[str, Any]:
+    """Describe a note-profile transition without changing any project data."""
+    target = default_profile_binding(project, base_slots)
+    raw_plan = project.get("scene_plan")
+    if raw_plan is None:
+        return {"status": "missing_plan", "needs_coordination": True, "added_slots": [slot["id"] for slot in target["slots"]],
+                "removed_slots": [], "reused_slots": [], "retained_slots": [], "customized_slots": [],
+                "current_profile": None, "target_profile": target, "plan_hash": None,
+                "plan_revision": None, "conflicts": [], "binding_source": "missing", "retention_reasons": {}}
+    plan = validate_plan(raw_plan)
+    current_profile = plan.get("default_profile") or _inferred_profile(project, plan)
+    source = "bound" if "default_profile" in plan else "inferred" if current_profile else "unknown"
+    slots = {slot["id"]: slot for slot in plan["slots"]}
+    defaults = {slot["id"]: slot for slot in (current_profile or {}).get("slots", [])}
+    wanted = {slot["id"]: slot for slot in target["slots"]}
+    customized = [identifier for identifier in slots if identifier not in defaults or slots[identifier] != defaults[identifier]]
+    reasons = _retention_reasons(project, plan)
+    for identifier in customized:
+        reasons[identifier].append("customized_slot" if identifier in defaults else "custom_slot")
+    changed = current_profile is None or current_profile["signature"] != target["signature"]
+    removed = [identifier for identifier in slots if changed and identifier not in wanted
+               and identifier in defaults and not reasons[identifier]]
+    added = [identifier for identifier in wanted if changed and identifier not in slots]
+    retained = [identifier for identifier in slots if identifier not in wanted and identifier not in removed]
+    reused = [identifier for identifier in wanted if identifier in slots]
+    conflicts = ["slot_role_conflict:" + identifier for identifier in reused
+                 if slots[identifier]["role"] != wanted[identifier]["role"]]
+    if (project.get("answers") or {}).get("delivery") == "grid-9" and len(slots) - len(removed) + len(added) > 9:
+        conflicts.append("grid_capacity: retained custom or historical slots need an explicit capacity decision")
+    return {"status": "pending" if changed else "current", "needs_coordination": changed,
+            "added_slots": added, "removed_slots": removed, "reused_slots": reused,
+            "retained_slots": retained, "customized_slots": customized,
+            "current_profile": current_profile, "target_profile": target,
+            "plan_hash": plan_hash(plan), "plan_revision": plan["revision"],
+            "conflicts": conflicts, "binding_source": source,
+            "retention_reasons": {identifier: values for identifier, values in reasons.items() if values}}
+
+
+def coordinate_profile(project: dict[str, Any], *, base_slots: list[dict[str, Any]] | None = None,
+                       expected_revision: int | None = None, expected_hash: str | None = None
+                       ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Explicitly apply a profile diff to a copy, preserving customized work.
+
+    The router retains its existing project lock/transaction and persists the
+    result.  Preconditions refer to the scene plan.  Removed unmodified defaults
+    are archived in scene_profile_history; finals, rounds, feedback, references,
+    approvals, and unknown outer fields remain untouched.  Repeating the same
+    current-profile operation is a no-op and never creates a generation task.
+    """
+    plan = validate_plan(project.get("scene_plan"))
+    _require(expected_revision is not None or expected_hash is not None, "missing_precondition")
+    if expected_revision is not None:
+        _require(type(expected_revision) is int and expected_revision == plan["revision"], "stale_plan_revision")
+    before_hash = plan_hash(plan)
+    if expected_hash is not None:
+        _require(_digest(expected_hash) == before_hash, "stale_plan_hash")
+    diff = profile_diff(project, base_slots=base_slots)
+    _require(not diff["conflicts"], "profile_coordination_conflict: " + "; ".join(diff["conflicts"]))
+    updated = copy.deepcopy(project)
+    if not diff["needs_coordination"]:
+        return updated, {**diff, "committed": False, "unchanged": True, "invalidated_slots": [],
+                         "preserved_slots": [slot["id"] for slot in plan["slots"]],
+                         "old_revision": plan["revision"], "new_revision": plan["revision"],
+                         "before_hash": before_hash, "after_hash": before_hash}
+    slots = {slot["id"]: slot for slot in plan["slots"]}
+    removed = set(diff["removed_slots"])
+    candidate = copy.deepcopy(plan)
+    candidate["slots"] = [copy.deepcopy(slots.get(slot["id"], slot)) for slot in diff["target_profile"]["slots"]]
+    candidate["slots"].extend(copy.deepcopy(slot) for slot in plan["slots"]
+                              if slot["id"] in diff["retained_slots"])
+    candidate["default_profile"] = copy.deepcopy(diff["target_profile"])
+    candidate["revision"] += 1
+    candidate = validate_plan(candidate, project)
+    _require(set(coverage_status(candidate)["missing_views"]) <= set(coverage_status(plan)["missing_views"]),
+             "coverage_regression: cannot remove required planned views")
+    updated["scene_plan"] = candidate
+    updated.setdefault("scene_profile_history", []).append({
+        "profile": copy.deepcopy(diff["current_profile"]), "before_hash": before_hash,
+        "after_hash": plan_hash(candidate), "old_revision": plan["revision"],
+        "new_revision": candidate["revision"],
+        "removed_slots": [copy.deepcopy(slot) for slot in plan["slots"] if slot["id"] in removed]})
+    return updated, {**diff, "committed": True, "unchanged": False,
+                     "invalidated_slots": [], "preserved_slots": [identifier for identifier in slots if identifier not in removed],
+                     "old_revision": plan["revision"], "new_revision": candidate["revision"],
+                     "before_hash": before_hash, "after_hash": plan_hash(candidate),
+                     "requires_visual_review": bool(diff["added_slots"])}
 
 
 def plan_hash(plan: dict[str, Any]) -> str:

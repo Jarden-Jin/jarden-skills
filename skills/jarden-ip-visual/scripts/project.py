@@ -28,7 +28,8 @@ from typing import Any
 
 import physics_review
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+WRITABLE_SCHEMAS = (3, 4)
 STAGES = ("concept", "material", "cutout", "scene", "package", "done")
 PER_SUBJECT_STAGES = ("concept", "material")
 ASK_ORDER = ("product_form", "subject_scope", "note_type", "concept_count", "delivery")
@@ -232,15 +233,21 @@ def load_project(root: Path, writable: bool = False) -> dict[str, Any]:
     if not path.is_file():
         raise ProjectError(f"{root.as_posix()} 里没有 project.json；先运行 init")
     project = read_json(path)
-    if project.get("schema_version") not in (1, 2, SCHEMA_VERSION):
+    if project.get("schema_version") not in (1, 2, *WRITABLE_SCHEMAS):
         raise ProjectError("不支持的 project schema；保留文件，不能降级覆盖")
-    if writable and project.get("schema_version") != SCHEMA_VERSION:
+    if writable and not is_writable_project(project):
         raise ProjectError("migration_required：schema 1/2 只读；先用 migrate_project.py 预览并明确执行迁移")
     return project
 
 
+def is_writable_project(project: dict[str, Any]) -> bool:
+    if project.get("schema_version") not in WRITABLE_SCHEMAS:
+        return False
+    return not project.get("asset_workflow") or project.get("schema_version") == SCHEMA_VERSION
+
+
 def save_project(root: Path, project: dict[str, Any]) -> None:
-    if project.get("schema_version") != SCHEMA_VERSION:
+    if not is_writable_project(project):
         raise ProjectError("migration_required：不能直接写入旧项目")
     if not _TRANSACTION.get():
         with project_lock(root):
@@ -302,7 +309,7 @@ def require_reviews(root: Path, project: dict[str, Any], paths: list[str], stage
     if result.get("blocking"):
         raise ProjectError("分类审查仍有阻断问题：" + json.dumps(result["findings"], ensure_ascii=False))
     require_generation_paths(root, project, paths)
-    if project.get("schema_version") == SCHEMA_VERSION and stage in ("scene", "package", "done") and paths:
+    if is_writable_project(project) and stage in ("scene", "package", "done") and paths:
         import contract_review
         import product_contract
         missing = product_contract.missing_requirements(project, stage)
@@ -320,7 +327,7 @@ def require_reviews(root: Path, project: dict[str, Any], paths: list[str], stage
             project["review_not_assessed"][key] = {**finding, "recorded_at": now()}
 
 
-def new_project(name: str, inputs: list[dict[str, str]]) -> dict[str, Any]:
+def new_project(name: str, inputs: list[dict[str, str]], workflow: str = "legacy") -> dict[str, Any]:
     stamp = now()
     project = {
         "schema_version": SCHEMA_VERSION,
@@ -347,6 +354,10 @@ def new_project(name: str, inputs: list[dict[str, str]]) -> dict[str, Any]:
     }
     import product_contract
     product_contract.initialize(project, enabled=True)
+    if workflow == "assets":
+        import asset_workflow
+        asset_workflow.initialize(project, enabled=True)
+        project["preferences"]["directions_per_round"] = 2
     return project
 
 
@@ -513,7 +524,7 @@ def legacy_scene_slots(project: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def scene_slots(project: dict[str, Any]) -> list[dict[str, Any]]:
-    if project.get("schema_version") == SCHEMA_VERSION and project.get("scene_plan"):
+    if is_writable_project(project) and project.get("scene_plan"):
         import scene_plan
         return scene_plan.validate_plan(project["scene_plan"], project)["slots"]
     return legacy_scene_slots(project)
@@ -554,8 +565,8 @@ def requirement_signature(project: dict[str, Any], stage: str | None = None, sub
     if stage is None or stage == "scene":
         data.update(note_type=answers.get("note_type"), delivery=answers.get("delivery"))
     if stage is None:
-        data["revision"] = project.get("requirements_revision", 0) if project.get("schema_version") in (2, SCHEMA_VERSION) else project.get("revision", 0)
-    if project.get("schema_version") == SCHEMA_VERSION:
+        data["revision"] = project.get("requirements_revision", 0) if project.get("schema_version") in (2, *WRITABLE_SCHEMAS) else project.get("revision", 0)
+    if is_writable_project(project):
         import product_contract
         if stage in PER_SUBJECT_STAGES and subject:
             data["subjects"] = [subject]
@@ -605,8 +616,11 @@ def stage_action(project: dict[str, Any]) -> dict[str, Any]:
 
 def next_action(project: dict[str, Any], root: Path | None = None) -> dict[str, Any]:
     answers = project.get("answers") or {}
-    if project.get("schema_version") != SCHEMA_VERSION:
+    if not is_writable_project(project):
         return {"action": "migration", "say": "旧项目只读；先预览显式迁移，保留原图、旧报告和未知规格"}
+    import asset_workflow
+    if asset_workflow.is_enabled(project):
+        return asset_workflow.next_action(root, project)
     for field in ("product_form", "subject_scope", "concept_count"):
         if answers.get(field) in (None, "", []):
             return ask_action(project, field)
@@ -626,6 +640,12 @@ def next_action(project: dict[str, Any], root: Path | None = None) -> dict[str, 
         for field in ("note_type", "delivery"):
             if answers.get(field) in (None, "", []):
                 return ask_action(project, field)
+        if project.get("scene_plan"):
+            import scene_plan
+            reconciliation = scene_plan.profile_diff(project, base_slots=legacy_scene_slots(project))
+            if reconciliation["needs_coordination"]:
+                return {"action": "scene-plan", "issue": "profile-change", "reconciliation": reconciliation,
+                        "say": "发布组合已变化；先核对新增、保留及移除图位，再明确协调计划，不重新生成可复用图。"}
         if not project.get("scene_plan"):
             return {"action": "scene-plan", "say": "按当前笔记用途建立逐图镜头计划；保留正面并分配需要的新角度，不要求用户填写工程参数"}
     if answers.get("delivery") == "grid-9" and answers.get("note_type") == "series-collection" and len(subjects_of(project)) > 7:
@@ -759,6 +779,9 @@ def status_payload(project: dict[str, Any], note: str = "", root: Path | None = 
         payload["warnings"] = warnings
     if note:
         payload["note"] = note
+    import asset_workflow
+    if asset_workflow.is_enabled(project):
+        payload["asset_workflow"] = asset_workflow.view(root, project)
     return payload
 
 
@@ -822,7 +845,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         if not target.exists():
             shutil.copyfile(source, target)
         inputs.append({"path": f"inputs/{filename}", "kind": args.kind, "original_name": source.name})
-    project = new_project(args.name or root.resolve().name, inputs)
+    project = new_project(args.name or root.resolve().name, inputs, workflow=getattr(args, "workflow", "assets"))
     if args.reuse_from:
         previous = load_project(Path(args.reuse_from))
         old_answers = previous.get("answers") or {}
@@ -845,6 +868,10 @@ def cmd_set(args: argparse.Namespace) -> int:
     old_answers = dict(project.get("answers") or {})
     previous_subjects = subjects_of(project)
     old_detail = (project.get("brief") or {}).get("product_detail")
+    profile_keys = {pair.split("=", 1)[0].strip() for pair in args.pairs if "=" in pair}
+    if project.get("scene_plan") and old_answers.get("note_type") and profile_keys & {"answers.note_type", "answers.delivery", "answers.subjects", "answers.concept_count"}:
+        import scene_plan
+        project = scene_plan.bind_default_profile(project, base_slots=legacy_scene_slots(project))
     changed = set()
     for pair in args.pairs:
         if "=" not in pair:
@@ -942,9 +969,21 @@ def cmd_scene_plan(args: argparse.Namespace) -> int:
     root = Path(args.project).resolve()
     project = load_project(root, writable=True)
     if project.get("scene_plan"):
+        reconciliation = scene_plan.profile_diff(project, base_slots=legacy_scene_slots(project))
+        if getattr(args, "reconcile", False):
+            updated, impact = scene_plan.coordinate_profile(
+                project, base_slots=legacy_scene_slots(project),
+                expected_revision=getattr(args, "expected_revision", None),
+                expected_hash=getattr(args, "expected_hash", None),
+            )
+            if not impact["unchanged"]:
+                save_project(root, updated)
+            return emit({"ok": True, "committed": impact["committed"], "impact": impact,
+                         "scene_plan": updated["scene_plan"], "next": next_action(updated, root)})
         if args.file:
             raise ProjectError("已有镜头计划须用 scene-patch 增量修改，不能整组覆盖")
-        return emit({"ok": True, "scene_plan": project["scene_plan"], "signature": scene_plan.plan_hash(project["scene_plan"])})
+        return emit({"ok": True, "scene_plan": project["scene_plan"], "signature": scene_plan.plan_hash(project["scene_plan"]),
+                     "reconciliation": reconciliation, "needs_coordination": reconciliation["needs_coordination"]})
     if not (project.get("answers") or {}).get("note_type") or not (project.get("answers") or {}).get("delivery"):
         raise ProjectError("先确认笔记类型和交付形式，再规划实际图位")
     plan = scene_plan.validate_plan(read_json(Path(args.file)), project) if args.file else scene_plan.default_plan(project, legacy_scene_slots(project))
@@ -1018,6 +1057,35 @@ def cmd_compile(args: argparse.Namespace) -> int:
     return emit({"ok": True, "compiled": compile_scene(root, project, args.slot)})
 
 
+def task_context(project: dict[str, Any], slot_id: str) -> dict[str, Any]:
+    for entry in reversed(project.get("rounds") or []):
+        if entry.get("status") not in ("planned", "recorded") or entry.get("stage") == "scene":
+            continue
+        return {"stage": entry["stage"], "subject": entry.get("subject"), "round_id": entry["id"],
+                "requirements": requirement_signature(project, entry["stage"], entry.get("subject"))}
+    stage = project.get("stage") or "concept"
+    return {"stage": stage, "subject": None, "round_id": None,
+            "requirements": requirement_signature(project, stage)}
+
+
+def validate_task_context(root: Path, project: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    import generation_tasks
+    context = plan.get("router_context")
+    if not isinstance(context, dict) or context.get("requirements") != requirement_signature(project, context.get("stage"), context.get("subject")):
+        raise ProjectError("stale_generation_plan：本轮相关需求已变化，先准备当前计划")
+    compiled = plan["compiled"]
+    if context.get("round_id"):
+        entry = find_round(project, context["round_id"])
+        if entry.get("status") not in ("planned", "recorded"):
+            raise ProjectError("stale_generation_plan：轮次已不再接收生成")
+        data = read_json(project_path(root, entry["dir"] + "/round.json"))
+        item = next((item for item in data.get("items") or [] if item.get("id") == plan["identity"]["slot_id"]), None)
+        if not item or item.get("prompt") != compiled.get("prompt"):
+            raise ProjectError("stale_generation_plan：当前候选提示词已变化")
+        compiled = item.get("compiled") or {**compiled, "prompt": item["prompt"]}
+    return generation_tasks.validate_current_compiled(root, plan, compiled)
+
+
 def cmd_task(args: argparse.Namespace) -> int:
     import generation_tasks
     root = Path(args.project).resolve()
@@ -1028,12 +1096,27 @@ def cmd_task(args: argparse.Namespace) -> int:
         compiled = read_json(Path(args.file)) if args.file else compile_scene(root, project, args.slot)
         plan = generation_tasks.prepare(root, project, args.slot, args.intent, compiled,
             {"kind": "builtin", "tool": "image_gen.imagegen"}, {"approved": args.authorized})
+        scene_ids = {slot["id"] for slot in scene_slots(project)} if project.get("scene_plan") else set()
+        if args.file and args.slot not in scene_ids and not compiled.get("asset_instance"):
+            plan["router_context"] = task_context(project, args.slot)
         write_json(root / "generation-plans" / (plan["task_id"] + ".json"), plan)
         return emit({"ok": True, "plan": plan, "plan_file": "generation-plans/" + plan["task_id"] + ".json"})
     if args.action == "begin":
         if not args.plan:
             raise ProjectError("task begin 需要 --plan")
-        return emit({"ok": True, **generation_tasks.begin(root, read_json(project_path(root, args.plan)), authorization={"approved": args.authorized}, retry=args.retry)})
+        plan = read_json(project_path(root, args.plan))
+        import workflow_safety
+        import asset_workflow
+        if (plan.get("compiled") or {}).get("asset_instance"):
+            validator = lambda prepared: asset_workflow.validate_generation_plan(root, project, prepared)
+        elif plan.get("router_context"):
+            validator = lambda prepared: validate_task_context(root, project, plan)
+        else:
+            validator = lambda prepared: workflow_safety.validate_current_plan(root, prepared, project)
+        return emit({"ok": True, **generation_tasks.begin(
+            root, plan, authorization={"approved": args.authorized}, retry=args.retry,
+            current_validator=validator,
+        )})
     if not args.task_id:
         raise ProjectError("task complete/unknown/status 需要 --task-id")
     if args.action == "complete":
@@ -1207,6 +1290,10 @@ def cmd_new_round(args: argparse.Namespace) -> int:
         raise ProjectError("当前阶段产品约定待补：" + json.dumps(missing, ensure_ascii=False))
     if stage == "scene" and not project.get("scene_plan"):
         raise ProjectError("先运行 scene-plan 确认逐图镜头、用途与覆盖，再生成场景")
+    if stage == "scene":
+        import scene_plan
+        if scene_plan.profile_diff(project, base_slots=legacy_scene_slots(project))["needs_coordination"]:
+            raise ProjectError("scene_plan_coordination_required：发布组合已变化，先核对 scene-plan 差异并明确协调")
     subjects = subjects_of(project)
     subject = args.subject
     if stage in PER_SUBJECT_STAGES:
@@ -1421,10 +1508,6 @@ def round_eligibility(root: Path, project: dict[str, Any], entry: dict[str, Any]
         if entry.get("status") != "recorded":
             reason = "本轮尚未登记或已选定/失效"
         results[item["id"]] = {"selectable": not reason, "disabled_reason": reason, "image_sha256": digest_value}
-    if entry.get("kind") == "alternatives" and any(not item["selectable"] for item in results.values()):
-        for result in results.values():
-            if result["selectable"]:
-                result.update(selectable=False, disabled_reason="同轮其他候选缺图或未通过必要检查")
     return results
 
 
@@ -1521,8 +1604,7 @@ def cmd_select(args: argparse.Namespace) -> int:
         if not (root / image).is_file():
             raise ProjectError(f"{image} 还没有生成，不能选定")
         if stage == "scene":
-            require_physics(root, project, [f"{entry['dir']}/{candidate['image']}" for candidate in items.values()
-                                           if (root / entry["dir"] / candidate["image"]).is_file()])
+            require_physics(root, project, [f"{entry['dir']}/{item['image']}" ])
         key = entry.get("subject") if stage in PER_SUBJECT_STAGES else "_"
         selections(project, stage)[key] = {"round": entry["id"], "item": item["id"], "image": image, "origin": origin}
         entry["status"] = "picked"
@@ -1621,7 +1703,7 @@ def receipt(root: Path, request_id: str) -> dict[str, Any] | None:
 
 def submit_decision(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
     root = root.resolve()
-    allowed = {"schema_version", "request_id", "project_id", "delivery_id", "expected_revision", "round_id", "action", "items", "note", "keep", "field", "value", "origin"}
+    allowed = {"schema_version", "request_id", "project_id", "delivery_id", "expected_revision", "round_id", "action", "items", "note", "keep", "field", "value", "origin", "asset_ids", "asset_id", "instance_id", "intent", "evidence"}
     if not isinstance(payload, dict) or set(payload) - allowed or payload.get("schema_version") != 1:
         raise ProjectError("invalid_request：不支持的提交结构")
     request_id = payload.get("request_id")
@@ -1650,7 +1732,7 @@ def submit_decision(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
         origin = payload.get("origin", "user-confirmed")
         if origin not in {"user-confirmed", "agent-inferred", "reference-derived"}:
             raise ProjectError("invalid_origin：确认来源无效")
-        if action not in {"answer-field", "select", "approve-set", "request-variation", "request-slots", "request-redo"}:
+        if action not in {"answer-field", "select", "approve-set", "request-variation", "request-slots", "request-redo", "choose-assets", "approve-asset", "asset-intent"}:
             raise ProjectError("invalid_action：不支持的动作")
         if not isinstance(payload.get("note", ""), str) or len(payload.get("note", "")) > 5000:
             raise ProjectError("invalid_note：备注必须是有限长度文字")
@@ -1658,6 +1740,25 @@ def submit_decision(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(keep, (list, str)) or len(json.dumps(keep, ensure_ascii=False)) > 10000:
             raise ProjectError("invalid_keep：保持项格式不正确")
         selected = []
+        import asset_workflow
+        if asset_workflow.is_enabled(project) and action in {"choose-assets", "approve-asset", "asset-intent"}:
+            if action != "choose-assets":
+                shown = {item.get("id"): item for item in manifest.get("items") or []}
+                if payload.get("round_id") != manifest.get("round_id"):
+                    raise ProjectError("stale_asset_round：交付不再对应当前资产候选")
+                for item in payload.get("items") or []:
+                    if not isinstance(item, dict) or item.get("id") not in shown or item.get("sha256") != shown[item["id"]].get("image_sha256"):
+                        raise ProjectError("changed_asset：资产文件与当前交付不符")
+            result = asset_workflow.submit(root, project, payload)
+            save_project(root, project)
+            receipt = {"ok": True, "committed": True, "request_id": request_id,
+                       "fingerprint": fingerprint, "delivery_id": delivery_id, "action": action, "origin": origin,
+                       "asset_result": result, "new_revision": project["revision"],
+                       "selected": result.get("selected", []), "next": next_action(project, root), "updated_at": project["updated_at"]}
+            project.setdefault("decision_receipts", {})[request_id] = receipt
+            write_json(root / "decisions" / (request_id + ".json"), receipt)
+            write_json(root / "project.json", project)
+            return receipt
         if action == "answer-field":
             next_step = next_action(project, root)
             field = payload.get("field")
@@ -1772,7 +1873,7 @@ def migration_plan(root: Path) -> dict[str, Any]:
     root = root.resolve()
     project = load_project(root)
     digest_value = hashlib.sha256((root / "project.json").read_bytes()).hexdigest()
-    return {"schema_version": 1, "project": str(root), "from_schema": project["schema_version"], "to_schema": SCHEMA_VERSION, "project_sha256": digest_value, "already_migrated": project["schema_version"] == SCHEMA_VERSION, "changes": [] if project["schema_version"] == SCHEMA_VERSION else ["增加稳定主体、产品约定与增量镜头计划", "保留旧需求签名、图片、确认来源和全部未知字段", "用途、尺寸和隐藏面缺项保持未知；旧报告不自动取得新合同资格"], "backup": "backups/migrations/" + digest_value + "/project.json"}
+    return {"schema_version": 1, "project": str(root), "from_schema": project["schema_version"], "to_schema": SCHEMA_VERSION, "project_sha256": digest_value, "already_migrated": project["schema_version"] == SCHEMA_VERSION, "changes": [] if project["schema_version"] == SCHEMA_VERSION else ["升级到可承载按需资产的 schema 4，保留既有笔记工作流", "保留需求签名、原图、确认来源、回执和全部未知字段", "尚未选择的新资产保持未选择，不补造过程稿或审查通过"], "backup": "backups/migrations/" + digest_value + "/project.json"}
 
 
 def apply_migration(root: Path, plan: dict[str, Any]) -> dict[str, Any]:
@@ -1794,7 +1895,10 @@ def apply_migration(root: Path, plan: dict[str, Any]) -> dict[str, Any]:
             shutil.copyfile(root / "project.json", backup)
         previous_schema = project["schema_version"]
         project["schema_version"] = SCHEMA_VERSION
-        project["requirements_revision"] = project.get("revision", 0)
+        if previous_schema < 3:
+            project["requirements_revision"] = project.get("revision", 0)
+        else:
+            project.setdefault("requirements_revision", project.get("revision", 0))
         project.setdefault("project_id", uuid.uuid4().hex)
         project.setdefault("revision", 0)
         project.setdefault("presentations", {})
@@ -1819,6 +1923,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--kind", default="reference", help="输入类型：" + "、".join(sorted(INPUT_KINDS)))
     init.add_argument("--name")
     init.add_argument("--reuse-from", help="同一会话里上一个项目的目录，沿用它的通用答案和生图设置")
+    init.add_argument("--workflow", choices=("assets", "legacy"), default="assets", help="默认按资产选择；legacy 保留固定笔记工作流")
     init.set_defaults(func=cmd_init)
     show = sub.add_parser("show", help="查看状态和下一步")
     show.add_argument("project")
@@ -1847,6 +1952,9 @@ def build_parser() -> argparse.ArgumentParser:
     planner = sub.add_parser("scene-plan", help="建立或查看实际逐图镜头计划")
     planner.add_argument("project")
     planner.add_argument("--file")
+    planner.add_argument("--reconcile", action="store_true", help="按已核对差异协调当前发布组合，保留自定义与已有素材")
+    planner.add_argument("--expected-revision", type=int)
+    planner.add_argument("--expected-hash")
     planner.set_defaults(func=cmd_scene_plan)
     patcher = sub.add_parser("scene-patch", help="以明确范围追加、编辑、替换或重排，不覆盖无关图位")
     patcher.add_argument("project")
@@ -1932,6 +2040,8 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("--status", choices=("completed", "cancelled"), required=True)
     resolve.add_argument("--note")
     resolve.set_defaults(func=cmd_resolve_intent)
+    import asset_workflow
+    asset_workflow.add_parser(sub)
     return parser
 
 

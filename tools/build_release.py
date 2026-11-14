@@ -21,6 +21,7 @@ CHANNEL = "stable"
 PROJECT_SCHEMAS = {
     2: {"read": [1, 2], "write": [2]},
     3: {"read": [1, 2, 3], "write": [3]},
+    4: {"read": [1, 2, 3, 4], "write": [3, 4]},
 }
 DEPENDENCIES = {"python": ">=3.10", "pillow": "required-for-image-operations"}
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)

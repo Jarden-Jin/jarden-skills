@@ -1,14 +1,41 @@
 # 项目状态、产品约定与恢复
 
-项目状态以 `project.json` 和已登记的审查、选择回执为准；HTML、浏览器草稿与生成任务回执不等于批准。JSON 使用 UTF-8，命令返回 JSON。`<项目>` 是目录参数，含空格时作为单个参数传入；图片路径通常相对项目根。以下是接口说明，不要求恢复项目时全部执行；产品与镜头的执行规则另见 [产品、镜头与实际图验收](product-and-shots.md)。
+项目状态以 `project.json` 和已登记的审查、选择回执为准；HTML、浏览器草稿与生成任务回执不等于批准。JSON 使用 UTF-8，命令返回 JSON。`<项目>` 是目录参数，含空格时作为单个参数传入；图片路径通常相对项目根。从 [主流程](../SKILL.md) 进入本文件；默认资产范围与停止条件见 [按需资产工作流](asset-workflow.md)，只有 legacy 或确实涉及商品的分支才读 [产品与镜头](product-and-shots.md)。
+
+## 目录
+
+- [schema、版本与事务](#schema版本与事务)
+- [工作流路由](#工作流路由)
+- [项目结构](#项目结构)
+- [建立、查看和保存已知答案](#建立查看和保存已知答案)
+- [商品用途、设计尺度与视图来源](#商品用途设计尺度与视图来源)
+- [legacy 镜头计划、增量修改与 compile](#legacy-镜头计划增量修改与-compile)
+- [原生生成与 ledger 恢复](#原生生成与-ledger-恢复)
+- [legacy 开轮、G1 实际图与 G2 物理审查](#legacy-开轮g1-实际图与-g2-物理审查)
+- [legacy 选择与通用反馈](#legacy-选择与通用反馈)
+- [legacy prepared 实际图与正式打包](#legacy-prepared-实际图与正式打包)
+- [恢复与停止](#恢复与停止)
 
 ## schema、版本与事务
 
-- 当前项目代码读 schema `[1, 2, 3]`，只写 `[3]`。schema 1/2 可只读查看，`next.action=migration`；未知 schema 拒绝读取和降级覆盖。Skill 版本只从 `SKILL.md` 的 `metadata.version` 读取，不从项目 schema、目录名或 README 推断。
-- `revision` 是业务版本，答案、选择、产品约定和审查登记等成功保存后递增。`requirements_revision` 配合阶段需求签名使旧轮次失效；schema 3 的签名还绑定产品约定与适用的镜头计划，不能只比较 revision。
+- `SCHEMA_VERSION=4`，项目代码读 schema `[1, 2, 3, 4]`、写 `[3, 4]`。schema 1/2 只读，`next.action=migration`；schema 3 的 legacy 项目可以继续写入，不自动改为资产模式。带资产工作流数据的项目须使用 schema 4，未知 schema 拒绝读取和降级覆盖。
+- Skill 版本只从 `SKILL.md` 的 `metadata.version` 读取，不从项目 schema、目录名或 README 推断。schema 4 同时容纳资产和 legacy 模式，不能仅凭数字判断当前工作流。
+- `revision` 是业务版本，答案、选择、产品约定和审查登记等成功保存后递增。`requirements_revision` 配合 legacy 阶段需求签名使旧轮次失效；schema 3/4 的商品签名还绑定产品约定与适用镜头计划，不能只比较 revision。
 - `scene_plan.revision` 是独立的计划版本；产品约定、镜头计划、生成 ledger 和交付 manifest 各自的内部 `schema_version: 1` 不代表项目退回 schema 1。
 - 项目核心写入使用锁、临时文件与 `.state-transaction.json` 日志；`show` 发现未完成状态事务时会恢复。生成 ledger 另有任务锁，调用外部工具前独立落盘。不要手工删除日志或承诺整个图片生产过程都是原子事务。
 - `present_round.py` 更新交付索引和打开回执，不增加业务 revision。`brief.decisions` 中的 `origin` 区分 `user-confirmed`、`agent-inferred`、`reference-derived`；确认推断方案不改写其原始来源。
+
+## 工作流路由
+
+| 入口或状态 | 如何继续 |
+| --- | --- |
+| 新 `init`，省略 `--workflow` 或指定 `assets` | 创建 schema 4 资产项目，先确认本轮资产；以真实 `show.next` 继续 |
+| 新 `init --workflow legacy` | 创建 schema 4 legacy 项目，沿用概念→材质→透明商品图→场景→发帖的固定流程 |
+| 现有 schema 3 legacy | 原路径继续，不强制迁移或附加资产语义 |
+| schema 1/2 | 只读展示；写入前对单个项目预览并显式迁移 |
+| schema 3 要转资产模式 | 先显式预览迁移到 4，再确认资产范围；结构迁移本身不等于启用资产模式 |
+
+`next_action` 在可写检查后优先路由已启用的 `asset_workflow`，不先套用 legacy 的品类、产品用途、场景或发帖问卷。`show` 在资产模式另返回 `asset_workflow` 视图；目录、计划、真实文件来源和单项审查的命令见 [资产操作示例](asset-workflow.md#操作示例)，不手写状态或猜测动作参数。程序调用 `new_project(..., workflow="legacy")` 可显式建立旧流程数据；命令行 `init` 的默认值仍是 assets。
 
 ## 项目结构
 
@@ -34,23 +61,36 @@
   post/
 ```
 
-产品、视图和镜头约定分别在 `project.json` 的 `product_contract`、`scene_plan`。交付 manifest 冻结项目版本、真实上次交付、比较基线和内容寻址快照；替换源图不会替换旧交付。`receipts.json` 保存打开事件，选择提交回执另在 `decisions/` 和 `project.decision_receipts`；页面已派发打开不等于用户看过。
+以上为共享记录及 legacy 商品轮次的布局，不要求每个资产项目创建全部目录。资产工作流数据保存在 `project.json` 的 `asset_workflow`；产品、视图和镜头约定在 `product_contract`、`scene_plan`，其存在不代表纯平面资产也须补齐商品规格。交付 manifest 冻结项目版本、真实上次交付、比较基线和内容寻址快照；替换源图不会替换旧交付。`receipts.json` 保存打开事件，选择提交回执另在 `decisions/` 和 `project.decision_receipts`；页面已派发打开不等于用户看过。
 
 ## 建立、查看和保存已知答案
 
 ```text
 <python> <skill>/scripts/project.py init <项目> --input <图> --kind wireframe
 <python> <skill>/scripts/project.py show <项目>
+```
+
+以上默认进入资产模式。需要固定商品链时，只对另一个新项目显式指定：
+
+```text
+<python> <skill>/scripts/project.py init <旧流程新项目> --kind text --workflow legacy
+```
+
+以下是保存已经知道的信息的例子，不是所有项目必填的初始化问卷；产品、笔记及交付字段仅在所选范围需要时保存：
+
+```text
 <python> <skill>/scripts/project.py set <项目> answers.product_form=plush answers.subject_scope=single
 <python> <skill>/scripts/project.py set <项目> 'answers.subjects=["角色名"]' answers.concept_count=1
 <python> <skill>/scripts/project.py set <项目> answers.note_type=single-multiview answers.delivery=full-post image_backend.kind=builtin
 ```
 
-输入类型为 wireframe、sketch、flat-design、ai-image、photo、text、reference；纯文字用 `--kind text`，可不传 `--input`。重复 `init` 只读已有项目。`--reuse-from <旧项目>` 仅沿用通用品类、笔记类型、交付方式、方向数和后端设置，不替代本项目的用途、尺寸或身份确认。
+输入类型为 wireframe、sketch、flat-design、ai-image、photo、text、reference；纯文字用 `--kind text`，可不传 `--input`。重复 `init` 只读已有项目，传入不同 `--workflow` 也不会切换现有工作流。`--reuse-from <旧项目>` 仅沿用通用品类、笔记类型、交付方式、方向数和后端设置，不替代本项目的资产范围、用途、尺寸或身份确认。
 
-`answers` 存已知答案；`brief` 存角色、卖点、bible、补充和保持项；`preferences.directions_per_round` 默认 3，与角色数不同。品类、角色、数量变化使相应后续定稿失效；笔记和交付变化使场景与发帖失效，旧图片保留。角色名唯一，缩减名单时同时明确数量和保留对象。
+`answers` 存已知答案；`brief` 存角色、卖点、bible、补充和保持项。新资产项目的 `preferences.directions_per_round` 默认 2，新 legacy 项目默认 3；旧项目和 `--reuse-from` 的已存设置保留，方向数不是角色数或验收门槛。legacy 品类、角色、数量变化使相应后续定稿失效，笔记和交付变化使场景与发帖失效，旧图片保留。资产模式只按实际依赖核对影响范围，不用未选笔记驱动额外生成。角色名唯一，缩减名单时同时明确数量和保留对象。
 
-## 自然用途、设计尺度与视图来源
+## 商品用途、设计尺度与视图来源
+
+本节用于 legacy 商品流程，或所选资产确实包含产品尺度、视图等约定的部分；不是线稿、平涂、设定文档的通用前置。
 
 用户已说明用途、尺度和保持项时一次保存，不重新拆问。`product_contract.subjects/specs/view_assets` 使用稳定 ID；从 `show.product_contract` 读取 ID，不自行猜测。用途保留原文，例如「桌面摆放，也能拆下挂在包上」，不能由这句话自动添挂扣结构。
 
@@ -83,22 +123,26 @@
 
 尺寸支持 `unknown/numeric/range/qualitative`；数值可填 height、width、depth、total_length，单位 mm/cm/m，范围用两元素数组；程序派生 `normalized_mm`。定性用 `description`，已知尺寸均需 `measurement_basis`。`evidence_kind` 区分设计目标、用户提供规格与样品测量；`measured_sample` 必须有 evidence。确认设计目标不能写成实测。
 
-用途须在开轮前确认，尺寸可在概念阶段未知，scene/package/done 前须确认数值、范围或可观察的定性尺度。页面自由输入支持带量取口径的单维 mm/cm 数值和同单位范围，不把范围上界误写为站高。多维文字完整保留为定性描述；Agent 需要精确多维、m 单位或实测依据时用结构化 `product`，不能声称页面能解析任意尺寸句子。
+legacy 用途须在开轮前确认，尺寸可在概念阶段未知，相关 scene/package/done 前须确认数值、范围或可观察的定性尺度。页面自由输入支持带量取口径的单维 mm/cm 数值和同单位范围，不把范围上界误写为站高。多维文字完整保留为定性描述；Agent 需要精确多维、m 单位或实测依据时用结构化 `product`，不能声称页面能解析任意尺寸句子。
 
 `view record` 校验真实图片并绑定摘要；`confirm` 另记确认人和依据，原 `origin` 保留。正面透明主资产继续使用，只补镜头需要的侧背资料。`compile` 对 left/right/back 检查当前款式下已确认的对应视图；未知隐藏面先提案确认。多视图是离散二维效果图。
 
-## scene_plan、增量修改与 compile
+## legacy 镜头计划、增量修改与 compile
 
-先确认笔记类型和交付方式，再建立计划；已有计划不能用 `--file` 整组覆盖。
+本节是旧四类发布组合的商品镜头接口，不是资产目录的计划入口。先确认笔记类型和交付方式，再建立计划；已有计划不能用 `--file` 整组覆盖。资产模式仅在明确进入对应商品场景范围时使用，不为非发布资产强制建立整套镜头。
 
 ```text
 <python> <skill>/scripts/project.py scene-plan <项目>
 <python> <skill>/scripts/project.py scene-plan <项目> --file <首次镜头计划.json>
+<python> <skill>/scripts/project.py scene-plan <项目> --reconcile --expected-revision <当前scene_plan.revision>
+<python> <skill>/scripts/project.py scene-plan <项目> --reconcile --expected-hash <scene-plan返回的signature>
 <python> <skill>/scripts/project.py scene-patch <项目> --file <增量修改.json>
 <python> <skill>/scripts/project.py compile <项目> --slot <真实图位ID>
 ```
 
-不传 `--file` 时，`scene-plan` 首次从笔记模板建立计划，之后只返回当前计划及 signature。计划结构是 `schema_version: 1`、`revision`、`slots`、`coverage`。每个 slot 必有稳定 `id`、`role`、`view`；可填 subject/subjects、指向具体款式的 spec_ref/spec_refs、yaw、elevation、pose、framing、scale_anchor、keep、description 和 reference_bindings。`coverage.required_views`、`coverage.preserve_slots` 明确覆盖与保持目标；默认计划不自动要求正侧背三视图。
+不传 `--file` 时，`scene-plan` 首次从笔记模板建立计划，之后只读返回当前计划、signature 和 reconciliation。计划结构是 `schema_version: 1`、`revision`、`slots`、`coverage`。每个 slot 必有稳定 `id`、`role`、`view`；可填 subject/subjects、指向具体款式的 spec_ref/spec_refs、yaw、elevation、pose、framing、scale_anchor、keep、description 和 reference_bindings。`coverage.required_views`、`coverage.preserve_slots` 明确覆盖与保持目标；默认计划不自动要求正侧背三视图。
+
+笔记类型、交付方式、主体数量或九宫格设置变化后，若 `next.action=scene-plan` 且 `issue=profile-change`，先读差异，再在用户确认协调后执行 `--reconcile`。`--expected-revision` 必须匹配当前 `scene_plan.revision`，或 `--expected-hash` 必须匹配上次 `scene-plan` 输出的 `signature`（计划 hash）；两者至少提供一个，过期或冲突时拒绝写入。协调只应用明确的新默认 profile：保留自定义、已有图、历史轮次、保持项、引用和未知字段，清洁移除的默认图位归档到 `scene_profile_history`；不会自动生图，也不把可复用图位标成待重做。输出的 `impact`、新 revision 和 `next` 必须读回；重复同一协调是 unchanged，不创建任务。容量冲突或覆盖退化时停止，改用 `scene-patch` 或重新确认范围。
 
 追加是 JSON 中的 `op: append`，没有 `scene-patch append` 子命令。以下示例须替换为实际图位、款式 pointer、计划 revision 与已定稿图片摘要：
 
@@ -133,6 +177,8 @@ G0 是生成前的计划检查：确认所需视面、尺度锚点、保持项�
 
 默认 `image_backend.kind=builtin`，由宿主原生/系统 `imagegen` 调用，不索取 Key；不可用则保存待生成状态。路径、失败或质量问题不能触发自动换供应商。外部服务须由用户明确选择，另读 [图片后端](image-backends.md)。
 
+生成授权、防重和未决对账是共享保护；具体提示词、参考和生成范围来自当前工作流的计划，不因复用 ledger 就转入 legacy 商品链。
+
 生成 ledger 在 `tasks/gen-*.json`，计划在 `generation-plans/`。以下 CLI 自身不调用图片工具；`--authorized` 只记录已经获得的授权：
 
 ```text
@@ -144,6 +190,8 @@ G0 是生成前的计划检查：确认所需视面、尺度锚点、保持项�
 ```
 
 `--file` 接受原始 compiled 对象，不能把 `compile` 的整个 `{ok, compiled}` 响应直接当请求；省略时按 `--slot` 编译当前场景。概念、材质与候选变化须提供本次实际 prompt 和 references/refs 或含 path 的 bindings，不能直接拿相同模板充当不同请求。`prepare` 模块函数只读，但 `project.py task … prepare` 会保存计划文件。
+
+`task begin` 按计划内容分流：资产计划含 `compiled.asset_instance` 时由资产工作流校验实例、资产范围、需求签名和已批准上游；普通 scene 计划由 `workflow_safety.validate_current_plan` 重新编译当前场景合同；非 scene 的 `task prepare --file` 计划带 `router_context`，按当前 stage、subject、round 和需求签名校验，不把旧 concept/material CLI 改成 scene 语义。所有新 claim 前都必须先过当前依赖校验；规格、提示词、参考字节或相关需求已过期时在 claim 前拒绝，不获得 `should_call`。已有 completed/requesting/unknown 先按 ledger 恢复和对账，不能用新 intent 绕过过期计划。
 
 只有 `begin` 当次返回 `should_call=true` 才调用宿主工具；调用前 requesting 已落盘，保存返回的 task_id、claim_id。键绑定 project_id、slot_id、intent_id、编译语义与真实参考字节、后端描述；改输出路径、移动项目或重开页面不产生新的调用资格。后端描述禁止凭据。
 
@@ -157,7 +205,9 @@ G0 是生成前的计划检查：确认所需视面、尺度锚点、保持项�
 
 CLI 的 `task failed --task-id <ID> --claim <claim> --reason <依据> --retryable` 只用于明确外部未执行的安全失败，再 `task begin --plan <计划> --retry --authorized` 才能重试。超时或丢响应必须 unknown，不能用 failed 洗掉未决调用。ledger 校验图片结构与摘要，不证明视觉质量或服务端来源，也不替代 G1/G2。可选 API 的成功响应后下载中断另走 `image_api.py resume`；它不是原生工具 ledger 的恢复入口。
 
-## 开轮、G1 实际图与 G2 物理审查
+## legacy 开轮、G1 实际图与 G2 物理审查
+
+以下 `new-round`、`accept-input`、`record-round` 属于 legacy 固定阶段接口；资产模式按其真实 `next` 与单项合同推进，不用旧开轮命令替代资产实例登记。
 
 ```text
 <python> <skill>/scripts/project.py new-round <项目> --stage concept --subject <角色> --count 3
@@ -193,7 +243,9 @@ G2 只送另一份匿名 `packet/`，含完整图片、已确认品类与通用�
 
 G1 逐图证据绑定实际字节与适用合同/参考/图位，整套证据另绑定集合与顺序；局部改动可保留无关图证据，但须重验整套。G2 按品类上下文和图片哈希复用。程序只能检查摘要、范围、报告与看图声明，不能证明审查实际独立或视觉判断正确。
 
-## 选择、提交和局部回改
+## legacy 选择与通用反馈
+
+以下 `select` 和基于旧轮次的 `new-round` 用于 legacy。`feedback` 保存原话和影响范围，`submit` 仍须通过服务端支持的协议；不能将资产目录编号直接当成 legacy 候选 ID，或以方向意向冒充正式批准。
 
 ```text
 <python> <skill>/scripts/project.py select <项目> <轮次> A
@@ -206,11 +258,13 @@ G1 逐图证据绑定实际字节与适用合同/参考/图位，整套证据另
 
 真人选定才用默认 user-confirmed；Agent 模拟或推断明确 `--origin agent-inferred`，参考材料用 reference-derived。superseded 不能重新激活。局部场景修改先 scene-patch，再 `new-round --stage scene --kind set --slots <逗号分隔图位>`；未受影响图继续用有效字节。
 
-提交协议自身 `schema_version=1`，绑定 request_id、project_id、delivery_id、expected_revision 和当前 round_id。图像动作还带 items，保持项与备注用 keep/note；answer-field 带当前 field/value，round_id 为空。action 仅为 answer-field、select、approve-set、request-variation、request-slots、request-redo。相同 ID 和内容返回同一回执，内容冲突、旧版本、旧交付、换图和伪造图位拒绝。
+legacy 提交协议自身 `schema_version=1`，绑定 request_id、project_id、delivery_id、expected_revision 和当前 round_id。图像动作还带 items，保持项与备注用 keep/note；answer-field 带当前 field/value，round_id 为空。legacy action 为 answer-field、select、approve-set、request-variation、request-slots、request-redo。资产操作以当前服务端实际支持的请求为准，不猜测动作或绕过回执。相同 ID 和内容返回同一回执，内容冲突、旧版本、旧交付、换图和伪造图位拒绝。
 
 补图/重做只登记 pending_intents，不等于生成授权。feedback 保存原话、解释、可观察改法、保持项、scope 和比较基线；不自动换角色或撤销全部确认。真实 `committed=true` 已执行选择，不重复 select；静态草稿交回聊天后才提交一次。
 
-## prepared 实际图与正式打包
+## legacy prepared 实际图与正式打包
+
+本节用于已选择的旧四类发布组合，不是资产模式的通用导出器。线稿、文档和素材库按所选类型交付，不强制转成 3:4 发布图、`copy.json` 或 `post/`。
 
 ```text
 <python> <skill>/scripts/package_post.py <项目> --dry-run
@@ -231,7 +285,7 @@ G1 逐图证据绑定实际字节与适用合同/参考/图位，整套证据另
 
 ## 恢复与停止
 
-先 show，再检查当前轮、pending_intents、已提交回执、ledger 与交付 manifest；不要重新 init 或删除已通过方向。`next` 除 ask/backend/round/generate/record-round/review/await-choice/package/done，还可能为 migration、contract、scene-plan、resolve-intent。planned 轮真实图片已齐时先补审/登记，缺图可 `record-round --allow-missing` 展示，但不能选缺图或绕过已存在图的审查。
+先 show，再检查当前工作流、pending_intents、已提交回执、ledger 与交付 manifest；不要重新 init 或删除已通过方向。资产模式以 `asset_workflow` 和真实 `next` 核对所选范围的完成与缺项，不强制到旧 `stage=done`。legacy 的 `next` 除 ask/backend/round/generate/record-round/review/await-choice/package/done，还可能为 migration、contract、scene-plan、resolve-intent。legacy planned 轮真实图片已齐时先补审/登记，缺图可 `record-round --allow-missing` 展示，但不能选缺图或绕过已存在图的审查。
 
 ```text
 <python> <skill>/scripts/workbench.py <项目> --serve
@@ -240,11 +294,11 @@ G1 逐图证据绑定实际字节与适用合同/参考/图位，整套证据另
 
 workbench 可复用有效交付、回执和本机服务，`--record-ready` 只在 next=record-round 时登记已有图，不生成、不选择、不自动审查或打包。有 requesting/unknown 或 output_invalid 且原 next=generate 时，返回 reconcile-task 与原 project_next。其 automatic_generation、should_call 始终 false；详细行为见 [HTML 交付](html-delivery.md)。
 
-历史 stage=done 不保证当前可发布；缺图、缺审、合同或输出变化时保留旧文件，按当前 next 补审或整理。安装代码与迁移项目是两件事：schema 1/2 先在单个项目外生成计划，再明确执行：
+legacy 历史 stage=done 不保证当前可发布；缺图、缺审、合同或输出变化时保留旧文件，按当前 next 补审或整理。安装代码与迁移项目是两件事：schema 1/2 写前，或用户明确要求将 schema 3 升到 4 时，先在单个项目外生成计划，再明确执行：
 
 ```text
 <python> <skill>/scripts/migrate_project.py <项目> --out <项目外计划.json>
 <python> <skill>/scripts/migrate_project.py <项目> --apply --plan <项目外计划.json>
 ```
 
-预览不改项目；执行核对 project_sha256 和完整计划，备份原 project.json 到 backups/migrations/，保留未知字段、图片、选择来源与旧审查；重复执行 unchanged。新用途、尺寸、隐藏面和 G1 资格不补造，缺项继续待确认。代码更新、回滚不扫描或迁移项目，见 [更新说明](updates.md)。
+预览不改项目；当前 `migrate_project.py` 目标为 schema 4，执行核对 project_sha256 和完整计划，备份原 project.json 到 backups/migrations/，保留未知字段、原图、来源、选择、审查与回执；重复执行 unchanged。结构迁移不会自动初始化资产工作流或把旧效果图改成历史草稿；迁移到 4 后通过有真实范围依据的 `assets <项目> choose` 显式启用，不能只改 schema 数字或重新 init 代替工作流切换。新用途、尺寸、隐藏面和 G1 资格不补造，缺项继续待确认。代码更新、回滚不扫描或迁移项目，见 [更新说明](updates.md)。

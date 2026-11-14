@@ -318,7 +318,7 @@ def task_statuses(root: Path) -> list[dict[str, Any]]:
 def _run_workbench(root: Path, *, serve: bool, open_browser: bool, record_ready: bool) -> dict[str, Any]:
     root = root.expanduser().resolve()
     initial = state.load_project(root)
-    legacy = initial.get("schema_version") != state.SCHEMA_VERSION
+    legacy = not state.is_writable_project(initial)
     recorded = False
     if legacy:
         data = gallery.build_gallery(root)

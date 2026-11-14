@@ -42,7 +42,7 @@ def snapshot_image(root: Path, original: str) -> tuple[str | None, str | None]:
                 digest.update(chunk)
                 target.write(chunk)
         image_hash = digest.hexdigest()
-        suffix = source.suffix.lower() if source.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"} else ".img"
+        suffix = source.suffix.lower() if source.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".md", ".json", ".pdf", ".zip"} else ".img"
         relative = f"artifacts/sha256/{image_hash}{suffix}"
         destination = gallery.project_path(root, relative)
         if destination.exists():
@@ -165,7 +165,7 @@ def present_round(root: Path, *, open_browser: bool = True, output: Path | None 
     if output.suffix.lower() not in {".html", ".htm"}:
         raise state.ProjectError("交付输出必须是 HTML，不能覆盖源图片或 JSON")
     initial = state.load_project(root, writable=False)
-    if initial.get("schema_version") != state.SCHEMA_VERSION:
+    if not state.is_writable_project(initial):
         raise state.ProjectError("旧项目只读；先明确迁移，再创建交付。可用 build_gallery 只读查看")
     with state.project_lock(root):
         project = state.load_project(root, writable=False)

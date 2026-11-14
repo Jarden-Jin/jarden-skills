@@ -95,7 +95,7 @@ def _local(root: Path, relative: str, *, exists: bool = True) -> Path:
 
 def _active(project: dict[str, Any], stage: str) -> bool:
     contract = project.get("product_contract")
-    return project.get("schema_version") == 3 and isinstance(contract, dict) and contract.get("enabled") is True and stage in STAGES
+    return project.get("schema_version") in (3, 4) and isinstance(contract, dict) and contract.get("enabled") is True and stage in STAGES
 
 
 def _neutral(value: Any) -> Any:

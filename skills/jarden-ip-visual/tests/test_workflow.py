@@ -36,7 +36,7 @@ class WorkflowTests(unittest.TestCase):
         return json.loads(result.stdout)
 
     def init(self):
-        return self.call("project.py", "init", self.job, "--input", self.source, "--kind", "wireframe")
+        return self.call("project.py", "init", self.job, "--input", self.source, "--kind", "wireframe", "--workflow", "legacy")
 
     def known(self, subjects=None, note_type="single-multiview", delivery="full-post"):
         names = subjects or ["小云"]

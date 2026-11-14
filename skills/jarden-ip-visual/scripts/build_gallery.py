@@ -291,7 +291,7 @@ def round_items(root: Path, entry: dict[str, Any], data: dict[str, Any], project
             prompt_state = "提示词已保存" if str(item.get("prompt") or "").strip() else "提示词尚未填写"
             missing_reason = f"{'图片尚未生成' if item.get('status') == 'planned' or entry.get('status') == 'planned' else '图片文件缺失'}；{detail}；{prompt_state}"
         reason = missing_reason or permitted.get("disabled_reason") or ""
-        if project.get("schema_version") != state.SCHEMA_VERSION:
+        if not state.is_writable_project(project):
             reason = "旧项目只读；明确迁移后才能提交"
         badge = item.get("id") if data.get("kind") == "alternatives" else item.get("slot_label") or item.get("id")
         method = item.get("method", "generate")
@@ -426,7 +426,7 @@ def build_data(root: Path, project: dict[str, Any], *, prefer_latest: bool = Tru
             })
     kind = "missing" if missing else (current or {}).get("kind") or "alternatives"
     g1 = []
-    if project.get("schema_version") == state.SCHEMA_VERSION:
+    if state.is_writable_project(project):
         for group in ([current] if current else []) + history:
             if group.get("stage") == "scene":
                 paths = [item["original_path"] for item in group["items"]]
@@ -439,7 +439,7 @@ def build_data(root: Path, project: dict[str, Any], *, prefer_latest: bool = Tru
                 g1.append(g1_view(root, project, [f"{post_dir}/{image['file']}" for image in info.get("images") or []], "package", "实际发布集合"))
             except VIEW_ERRORS:
                 g1.append(g1_view(root, project, [], "package", "实际发布集合待补"))
-    return {
+    result = {
         "title": ((project.get("brief") or {}).get("ip_name") or project.get("project") or "IP 项目") + " · 视觉对比页",
         "subtitle": f"项目 {project.get('project')} · 更新于 {project.get('updated_at')}",
         "chips": chips(project),
@@ -453,7 +453,7 @@ def build_data(root: Path, project: dict[str, Any], *, prefer_latest: bool = Tru
         "project_revision": project.get("revision", 0),
         "stage": project.get("stage"),
         "snapshot_at": state.now(),
-        "readonly": project.get("schema_version") != state.SCHEMA_VERSION,
+        "readonly": not state.is_writable_project(project),
         "next": gallery_next(root, project),
         "product_contract": product_view(root, project),
         "scene_plan": plan_view(root, project),
@@ -467,6 +467,15 @@ def build_data(root: Path, project: dict[str, Any], *, prefer_latest: bool = Tru
         "delivery_history": [],
         "maintenance": maintenance_summary(),
     }
+    import asset_workflow
+    if asset_workflow.is_enabled(project):
+        workflow = asset_workflow.view(root, project)
+        result["asset_workflow"] = workflow
+        result["current"] = workflow.get("current")
+        result["next"] = workflow.get("next") or state.next_action(project, root)
+        result["stage"] = "assets"
+        result["missing"] = sum(not item.get("exists") for item in (result["current"] or {}).get("items", []))
+    return result
 
 
 def project_path(root: Path, value: str) -> Path:
@@ -588,7 +597,7 @@ def delivery_data(root: Path, project: dict[str, Any], manifest: dict[str, Any])
     data.update({key: copy.deepcopy(manifest.get(key)) for key in
                  ("project_id", "delivery_id", "project_revision", "stage", "subject", "round_id", "kind", "next", "decisions", "feedback")})
     data["snapshot_at"] = manifest.get("created_at")
-    data["readonly"] = project.get("schema_version") != state.SCHEMA_VERSION
+    data["readonly"] = not state.is_writable_project(project)
     data["stale"] = project.get("revision", 0) != manifest.get("project_revision") or (project.get("presentations") or {}).get("latest_delivery_id", manifest["delivery_id"]) != manifest["delivery_id"]
     data["live_revision"] = project.get("revision", 0)
     data["receipts"] = decision_receipts(root, manifest["delivery_id"])
@@ -603,7 +612,7 @@ def delivery_data(root: Path, project: dict[str, Any], manifest: dict[str, Any])
             except VIEW_ERRORS:
                 return {**value, "path": None, "exists": False, "disabled_reason": "冻结图片待补；未用当前图片替代"}
         return {key: verify_projection(child) for key, child in value.items()}
-    for key in ("product_contract", "scene_plan"):
+    for key in ("product_contract", "scene_plan", "asset_workflow"):
         if key in data:
             data[key] = verify_projection(data[key])
     verified = delivery_summary(root, manifest)

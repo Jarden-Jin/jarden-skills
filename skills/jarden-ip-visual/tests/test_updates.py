@@ -764,6 +764,7 @@ class CheckStateTests(FixtureMixin, unittest.TestCase):
         self.assertEqual(payload["accepted_project_schemas"], [
             {"read": [1, 2], "write": [2]},
             {"read": [1, 2, 3], "write": [3]},
+            {"read": [1, 2, 3, 4], "write": [3, 4]},
         ])
         self.assertEqual((self.project / "project.json").read_bytes(), before)
 
@@ -1045,7 +1046,7 @@ class ReleaseBuilderTests(unittest.TestCase):
 
     def test_builder_rejects_unsupported_or_ambiguous_project_schema_blob(self):
         sources = (
-            "SCHEMA_VERSION = 4\n",
+            "SCHEMA_VERSION = 5\n",
             "SCHEMA_VERSION = True\n",
             "SCHEMA_VERSION = 3.0\n",
             "SCHEMA_VERSION = '3'\n",

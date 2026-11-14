@@ -36,7 +36,7 @@ import uuid
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 
 SCHEMA_VERSION = 1
@@ -263,6 +263,144 @@ def _checked_plan(root: Path, plan: dict[str, Any], authorization: dict[str, Any
         if plan.get(field) != checked[field]:
             raise TaskError("plan_conflict: plan content does not match its stable key")
     return checked
+
+
+def _recovery_semantic(value: Any, snapshot: Any, field: str = "") -> Any:
+    if isinstance(value, list):
+        if not isinstance(snapshot, list) or len(value) != len(snapshot):
+            raise TaskError("plan_conflict: receipt request differs from plan")
+        return [_recovery_semantic({"path": item} if field in _REFERENCE_LISTS and isinstance(item, str) else item,
+                                   snapshot[index]) for index, item in enumerate(value)]
+    if not isinstance(value, dict):
+        return value
+    if not isinstance(snapshot, dict):
+        raise TaskError("plan_conflict: receipt request differs from plan")
+    normalized = {name: _recovery_semantic(entry, snapshot.get(name), name)
+                  for name, entry in value.items() if name not in _VOLATILE and name not in _REFERENCE_PATHS}
+    if _REFERENCE_PATHS & set(value):
+        actual = snapshot.get("sha256")
+        if not isinstance(actual, str) or not re.fullmatch(r"[0-9a-f]{64}", actual):
+            raise TaskError("plan_conflict: missing bound reference hash")
+        for name in _REFERENCE_PATHS & set(value):
+            _text(value[name], "reference_path")
+        if normalized.get("sha256", actual) != actual:
+            raise TaskError("plan_conflict: reference hash differs from receipt")
+        normalized["sha256"] = actual
+    return normalized
+
+
+def _recovery_plan(plan: dict[str, Any], task: dict[str, Any],
+                   authorization: dict[str, Any] | None) -> dict[str, Any]:
+    try:
+        copied = _json_copy(plan)
+        if copied.get("kind") != "generation-plan" or copied.get("schema_version") != SCHEMA_VERSION:
+            raise TaskError("invalid_plan: use prepare() before beginning a task")
+        for field in ("identity", "task_id", "idempotency_key", "request", "request_sha256"):
+            if copied.get(field) != task[field]:
+                raise TaskError("task_conflict: the same stable key has different request content")
+        request = {field: _recovery_semantic(copied[field], task["request"][field])
+                   for field in ("compiled", "backend")}
+        if request != task["request"]:
+            raise TaskError("plan_conflict: plan content differs from receipt")
+        copied["authorization"] = _authorization(
+            copied["authorization"] if authorization is None else authorization, copied["identity"])
+        return copied
+    except (KeyError, TypeError) as error:
+        raise TaskError("invalid_plan: missing plan fields") from error
+
+
+def current_compiled_fingerprint(root: str | Path, compiled: dict[str, Any]) -> str:
+    """Return the stable dependency fingerprint for a freshly compiled request.
+
+    The caller supplies a current, local compilation rather than a project
+    revision.  This keeps validation scoped to the slot's actual inputs and
+    continues to exclude output, delivery, and other volatile descriptors.
+    """
+    directory = _root(root)
+    if not isinstance(compiled, dict) or not compiled:
+        raise TaskError("invalid_current_compiled: expected a nonempty object")
+    normalized = _dependency_semantic(directory, compiled)
+    if not normalized:
+        raise TaskError("invalid_current_compiled: semantic descriptor is empty")
+    return _digest(normalized)
+
+
+def _dependency_semantic(root: Path, compiled: dict[str, Any]) -> dict[str, Any]:
+    normalized = _semantic(root, _json_copy(compiled))
+    if isinstance(normalized, dict):
+        normalized.pop("signature", None)
+    return normalized
+
+
+def validate_current_compiled(root: str | Path, plan: dict[str, Any],
+                              compiled: dict[str, Any]) -> dict[str, Any]:
+    """Check a current slot compilation without creating a receipt or lock."""
+    directory = _root(root)
+    checked = _checked_plan(directory, plan, None)
+    expected = current_compiled_fingerprint(directory, checked["request"]["compiled"])
+    actual = current_compiled_fingerprint(directory, compiled)
+    changed = _changed_paths(_dependency_semantic(directory, checked["request"]["compiled"]),
+                            _dependency_semantic(directory, compiled))
+    details = {"valid": actual == expected, "task_id": checked["task_id"],
+               "slot_id": checked["identity"]["slot_id"],
+               "expected_compile_fingerprint": expected,
+               "current_compile_fingerprint": actual,
+               "prepared_identity_fingerprint": checked["identity"]["compile_fingerprint"],
+               "relevant_change": actual != expected,
+               "change_scope": _change_scope(changed), "changed_paths": changed}
+    if actual != expected:
+        error = TaskError("stale_generation_plan: current slot dependencies changed; prepare a current plan")
+        error.details = details
+        raise error
+    return details
+
+
+def _changed_paths(before: Any, after: Any, path: str = "") -> list[str]:
+    if type(before) is not type(after):
+        return [path or "/"]
+    if isinstance(before, dict):
+        paths = []
+        for key in sorted(set(before) | set(after)):
+            token = key.replace("~", "~0").replace("/", "~1")
+            child = path + "/" + token
+            paths.extend([child] if key not in before or key not in after
+                         else _changed_paths(before[key], after[key], child))
+        return paths
+    if isinstance(before, list):
+        paths = []
+        for index in range(max(len(before), len(after))):
+            child = path + "/" + str(index)
+            paths.extend([child] if index >= len(before) or index >= len(after)
+                         else _changed_paths(before[index], after[index], child))
+        return paths
+    return [] if before == after else [path or "/"]
+
+
+def _change_scope(paths: list[str]) -> str:
+    if not paths:
+        return "none"
+    if any(path.startswith("/contract_hashes/") for path in paths):
+        return "product_contract"
+    if any(path.startswith(("/slot_sha256", "/constraint_policy")) for path in paths):
+        return "scene_contract"
+    if any(path.startswith(("/bindings", "/references", "/refs")) for path in paths):
+        return "reference_dependency"
+    return "compiled_dependency"
+
+
+def _run_current_validator(plan: dict[str, Any], validator: Any) -> None:
+    if validator is None:
+        return
+    if not callable(validator):
+        raise TaskError("invalid_current_validator: expected a callable")
+    try:
+        result = validator(copy.deepcopy(plan))
+    except TaskError:
+        raise
+    except Exception as error:
+        raise TaskError("current_plan_invalid: current validation failed") from error
+    if not (result is None or result is True or isinstance(result, dict) and result.get("valid") is True):
+        raise TaskError("current_plan_invalid: current validation failed")
 
 
 def _task_path(root: Path, task_id: str) -> Path:
@@ -611,24 +749,28 @@ def _view(root: Path, task: dict[str, Any], claimed: bool = False, reused: bool 
 
 
 def begin(root: str | Path, plan: dict[str, Any], *, authorization: dict[str, Any] | None = None,
-          retry: bool = False, tool_request_id: str | None = None) -> dict[str, Any]:
+          retry: bool = False, tool_request_id: str | None = None,
+          current_validator: Callable[[dict[str, Any]], Any] | None = None) -> dict[str, Any]:
     """Atomically claim a task; call a tool only when this returns should_call=True.
 
     A claim is fsynced independently even inside a project transaction. Retrying a
     requesting/unknown task is never allowed, irrespective of its PID or age.
+    current_validator runs under the task lock only before a new claim or an
+    explicit safe retry, never while resuming an existing pending/completed task.
+    It accepts a plan copy and returns None, True, or a dict with valid=True;
+    every other result or exception prevents the claim from being written.
     """
     directory = _root(root)
     if type(retry) is not bool:
         raise TaskError("invalid_retry: expected a boolean")
-    checked = _checked_plan(directory, plan, authorization)
     if tool_request_id is not None:
         _text(tool_request_id, "tool_request_id")
     with task_lock(directory):
-        checked = _checked_plan(directory, checked, None)
-        task = _load_task(directory, checked["task_id"])
+        if not isinstance(plan, dict):
+            raise TaskError("invalid_plan: use prepare() before beginning a task")
+        task = _load_task(directory, plan.get("task_id"))
         if task is not None:
-            if task["identity"] != checked["identity"] or task["request"] != checked["request"] or task["request_sha256"] != checked["request_sha256"]:
-                raise TaskError("task_conflict: the same stable key has different request content")
+            _recovery_plan(plan, task, authorization)
             result = _view(directory, task)
             if result.get("resume_status") == "output_invalid":
                 raise TaskError("output_invalid: restore or reconcile the completed output; do not resend")
@@ -636,7 +778,10 @@ def begin(root: str | Path, plan: dict[str, Any], *, authorization: dict[str, An
                 return result
             if task.get("retryable") is not True:
                 raise TaskError("retry_forbidden: failure is not known to be safe to retry")
+        checked = _checked_plan(directory, plan, authorization)
         approval = _authorization(checked["authorization"], checked["identity"], required=True)
+        _run_current_validator(checked, current_validator)
+        checked = _checked_plan(directory, checked, None)
         stamp = _stamp()
         history = [] if task is None else task.get("previous_attempts", []) + [{
             field: task.get(field) for field in ("attempt", "claim_id", "status", "reason", "tool_request_id", "started_at", "updated_at")

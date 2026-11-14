@@ -1,6 +1,13 @@
 # HTML 交付与工作台
 
-每个新的用户可见轮次都通过 `present_round.py` 冻结交付；恢复已有项目可用 `workbench.py` 复用交付和回执。页面、manifest 和图片快照一起保存。聊天必须写清变化摘要、已核验可访问的页面入口，以及全部待确认问题和选项；工作台只辅助查看与可选提交，不是必需反馈入口。
+从 [主流程](../SKILL.md) 进入。每个新的用户可见轮次都通过 `present_round.py` 冻结交付；恢复已有项目可用 `workbench.py` 复用交付和回执。页面、manifest 和图片快照一起保存。聊天必须写清变化摘要、已核验可访问的页面入口，以及全部待确认问题和选项；工作台只辅助查看与可选提交，不是必需反馈入口。
+
+## 工作流与页面路由
+
+- 新 `init` 默认 assets，显式 `--workflow legacy` 保留旧商品链；两者新建均使用 schema 4。schema 3 legacy 可继续，不能把「旧流程」误当作「只读项目」。
+- 资产页的目录、所选范围、计划、当前实例和下一步来自真实 `asset_workflow` 视图；`build_gallery` 使用其 `current` 和 `next`，展示阶段为 assets。没有该模式时继续 legacy 轮次协议，不能写死角色、资产数量或默认候选。
+- 目录条目不等于完成项，方向意向不等于批准；只选文档或线稿时不展示强制发帖链。具体资产边界见 [按需资产工作流](asset-workflow.md)。页面只呈现服务端已支持的操作，未接通时保留草稿或回聊天，不显示假成功。
+- 「纯白工作室」的浅色画布、松绿强调与细边界属于视觉样式 token；它们不替代链接鉴权 token、revision、图片摘要和提交回执。原图完整显示，放大、键盘、证据入口与移动端可读性须按真实页面验收，不能仅凭设计稿宣称完成。
 
 ## 生成与呈现
 
@@ -12,9 +19,9 @@
 ```
 
 - `present_round.py` 生成单调递增的 `D0001…`，把当时图片复制到 `artifacts/sha256/`，写不可变 `deliveries/Dxxxx/manifest.json` 与 `index.html`，再更新项目根 `gallery.html`。
-- 没有当前 round 时仍生成交付页：`round_id` 为 `null`，`items` 为空；有发帖包时 kind 为 post，否则为 summary。问题来自 `next_action`，展示唯一缺项和已保存答案；有推荐值和选项才显示，用途、尺寸可自由输入。
+- legacy 没有当前 round 时仍生成交付页：`round_id` 为 `null`，`items` 为空；有发帖包时 kind 为 post，否则为 summary。资产模式使用自身的 current，不以缺少 legacy round 推断没有资产。问题来自真实 `next_action`；有推荐值和选项才显示，用途、尺寸只在当前范围需要时询问。
 - `build_gallery.py` 默认渲染 `presentations.latest_delivery_id`；它不改项目、不制造交付，可用于移动后的项目、只读检查和指定历史交付。
-- 项目代码读 schema `[1, 2, 3]`、只写 `[3]`。schema 1/2 只能用 build_gallery 或 workbench 只读展示，不写 project.json、不创建交付；present_round 拒绝旧 schema，须先显式迁移。交付 manifest 的 schema_version 仍为 1。
+- 项目代码读 schema `[1, 2, 3, 4]`、写 `[3, 4]`，展示与呈现使用 `is_writable_project` 检查资格。schema 1/2 只读、不创建交付；schema 3 legacy 可呈现，资产模式须 schema 4。`present_round` 拒绝未具备可写资格的项目，先显式迁移。交付 manifest 的 schema_version 仍为 1。
 - 两个 CLI 从读取项目到写完页面、打开回执和输出结果，始终持有真实安装目录的 `execution_lease`；期间更新器不得切换代码。有未结束的安装事务时，命令在写入项目前退出，待恢复后重试。
 
 交付 manifest 是呈现时的冻结记录。用户提交后不反写旧 manifest；回执单独登记，页面刷新时按 `delivery_id` 读取。
@@ -35,7 +42,7 @@ workbench 用 `.workbench/presentation.json` 比较业务版本、项目 fingerp
 
 服务记录在 `.workbench/server.json`，按真实项目、project_id、PID、URL、token 与 `/api/state` 健康响应核对；已有健康服务才 `server.reused=true`，否则受锁保护启动 serve_gallery。POSIX 上子服务以新会话启动，不能随一次 CLI 命令结束被回收。当前就绪等待预算为 8 秒，单次健康请求预算 1.5 秒，启动的服务时限为 1800 秒；冷启动或较慢机器不因过短探测反复启停。
 
-分享链接前，`workbench.py --serve` 还必须对即将展示的准确 URL 再做一次真实健康检查，并返回 `link_check.status=ok`。只有 `server.status=ready`、`link_check.status=ok` 且 `url` 非空时才可在聊天里展示可点击入口；不得只凭 PID、缓存、`open` 返回或 HTML 文件存在宣称可访问。检查失败时有界返回静态入口与“新选择尚未提交”，不假装交互模式成功；旧 schema 不启动可写服务。若运行环境仍会回收子服务，改用持续运行的前台会话，或只给 `file://` 静态页并明确「尚未提交」。
+分享链接前，`workbench.py --serve` 还必须对即将展示的准确 URL 再做一次真实健康检查，并返回 `link_check.status=ok`。只有 `server.status=ready`、`link_check.status=ok` 且 `url` 非空时才可在聊天里展示可点击入口；不得只凭 PID、缓存、`open` 返回或 HTML 文件存在宣称可访问。检查失败时有界返回静态入口与“新选择尚未提交”，不假装交互模式成功；schema 1/2 等只读项目不启动可写服务，schema 3 legacy 不因此受限。若运行环境仍会回收子服务，改用持续运行的前台会话，或只给 `file://` 静态页并明确「尚未提交」。
 
 返回 JSON 包含 presentation、delivery_id、gallery、url、link_check、server、open、interaction、next/project_next、committed_receipt/receipts、generation_tasks。最后两项生成控制标记 automatic_generation 和 should_call 始终 false，工作台不会代宿主调用原生图片工具。
 
@@ -76,7 +83,9 @@ CLI 的系统打开成功只能记录 open_dispatched；失败或未请求时按
 
 ## 动作与页面状态
 
-工作台调用 `next_action(project, root)` 检查当前源图与实际发布包。历史业务 `stage=done` 不代表当前交付可用；顶部以 `next.action` 为准，`review` 显示待审查、`package` 显示待整理，只有 `done` 显示已完成，不为展示修改业务阶段。
+工作台调用 `next_action(project, root)`；启用资产模式时优先使用资产下一步，否则检查 legacy 当前轮次与实际发布包。历史业务 `stage=done` 不代表当前交付可用，目录中有文件也不代表本轮合格。顶部以真实 next 和所选范围的完成资格为准；legacy 的 `review` 显示待审查、`package` 显示待整理，不能只凭旧 stage 显示完成，不为展示修改业务阶段。
+
+以下为 legacy 动作；资产选择、意向和单项采用须使用当前服务端实际支持的动作，不把目录编号塞入旧候选选择请求：
 
 - `answer-field`：只回答当前 `next_action` 的一个字段，另带 `field` 和 `value`。
 - `select`：单一方向采用；`approve-set`：逐图保留，未选图位按跳过提交。
@@ -86,17 +95,17 @@ CLI 的系统打开成功只能记录 open_dispatched；失败或未请求时按
 - 提交前显示“尚未提交”；提交失败保留勾选、备注和请求标识；成功后显示读回 revision，并提示回聊天继续。
 - 页面支持图片放大、浅底/深底/棋盘透明检查、键盘焦点、草稿恢复；手机端按单列阅读，操作不被底部遮挡。
 
-用途与尺寸问题由 next 中的 `product.usage:<主体ID>`、`product.size:<主体ID>` 驱动，保留自由输入。页面尺寸保存只支持简单 mm/cm 数值转 height 或定性描述；范围、多维尺寸、实测依据等交回 Agent 用 product JSON 保存，见 [项目状态](project-state.md)。不让用户填写 yaw/elevation 等内部机位参数。
+legacy 商品用途与尺寸问题由 next 中的 `product.usage:<主体ID>`、`product.size:<主体ID>` 驱动，保留自由输入；资产模式不凭该问卷阻塞未选商品资产。页面简单尺寸输入与结构化 product JSON 的边界见 [项目状态](project-state.md)，多维尺寸和实测依据需由 Agent 如实保存。不让用户填写 yaw/elevation 等内部机位参数。
 
 已有 committed=true 回执必须读回并续作，不能再执行一次 select；request-* 的 committed 只说明意向已登记，不表示已批准生图。页面提交不是必须步骤：用户直接在聊天里给出编号、修改意见或选择同样有效，Agent 应按聊天原话登记并继续。
 
 ## 实际图、合同与发布输出
 
-HTML 中的图片和可选择状态来自真实文件及门禁。G0 的 scene_plan/compile 只有计划依据；G1 必须独立看真实图，核对身份、设计尺度和镜头覆盖；G2 由另一位隔离执行者只看匿名图片及品类，检查可见物理。G1 合同、Bible、作者提示词或 G1 判词不得塞进 G2 匿名包，页面文案不能解释掉图像错误。
+HTML 中的图片和可选择状态来自真实文件及门禁。资产按实际内容和探索／正式采用分级，纯平面、文档不自动套商品门槛；legacy 商品场景及适用商品资产的 G0 scene_plan/compile 只有计划依据，G1 必须独立看真实图核对身份、设计尺度和镜头覆盖，G2 由另一位隔离执行者检查匿名图片的可见物理。G1 合同、Bible、作者提示词或 G1 判词不得塞进 G2 匿名包，页面文案不能解释掉图像错误。
 
-当前 gallery 已有保持项、bible、分类/物理状态和 G1 阻断后的禁选原因，但尚未单独投影完整 product_contract、scene_plan 或逐项 G1 证据。不能声称页面已具备完整合同编辑器、多视图旋转器或 G1 明细面板；必要说明由 Agent 根据实际 show/审查结果补充，保留审查文件入口。
+gallery 数据包含保持项、bible、分类／物理状态，以及 `product_contract`、`scene_plan` 和 `g1` 的展示投影；资产模式另外提供 `asset_workflow`。这些是状态与证据摘要，不是完整合同编辑器、真实多视旋转器或审查通过证明。实际显示与交互须另做页面验证；Agent 根据 show 和审查结果补充说明，保留证据文件入口。
 
-package_post 的 `--prepare-review` 返回 reviews/post 下的实际排版图片、manifest 和 ordered_slots_file。对返回的完整 images 顺序做 G1 publication，对无有效报告的新字节做 G2；prepare 本身不产生 post 定稿。正式打包优先复制 render_signature 与输入摘要一致的 prepared/已有 post 字节，重新验证图位、合同和实际顺序。只改正文可复用图；改源图、裁切、overlay、实际使用字体或渲染实现产生新像素时须重审。页面交付最终 post 的实际编号图片，不用原场景源图冒充已审排版图。
+选择 legacy 发布组合后，package_post 的 `--prepare-review` 返回 reviews/post 下的实际排版图片、manifest 和 ordered_slots_file；它不是通用资产导出入口。对返回的完整 images 顺序做 G1 publication，对无有效报告的新字节做 G2；prepare 本身不产生 post 定稿。正式打包优先复制 render_signature 与输入摘要一致的 prepared/已有 post 字节，重新验证图位、合同和实际顺序。只改正文可复用图；改源图、裁切、overlay、实际使用字体或渲染实现产生新像素时须重审。页面交付最终 post 的实际编号图片，不用原场景源图冒充已审排版图。
 
 ## 检查方式与证据边界
 

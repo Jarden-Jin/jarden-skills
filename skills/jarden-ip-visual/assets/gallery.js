@@ -5,16 +5,27 @@
   const fragment = new URLSearchParams(location.hash.replace(/^#/, ""));
   const token = fragment.get("token");
   const interactive = Boolean(token) && location.protocol.startsWith("http");
-  const current = data.current || null;
-  const items = current ? current.items || [] : [];
+  const records = value => Array.isArray(value) ? value.filter(entry => entry && typeof entry === "object") : value && typeof value === "object" ? Object.entries(value).filter(([, entry]) => entry && typeof entry === "object").map(([identifier, entry]) => ({ id: identifier, ...entry })) : [];
+  const identifiers = value => Array.isArray(value) ? value.map(entry => String(entry && typeof entry === "object" ? entry.id ?? entry.asset_id ?? "" : entry)).filter(Boolean) : [];
+  const assetWorkflow = data.asset_workflow && typeof data.asset_workflow === "object" && data.asset_workflow.enabled !== false ? data.asset_workflow : null;
+  const catalogSource = assetWorkflow?.catalog;
+  const catalog = records(catalogSource?.items || catalogSource?.assets || catalogSource).filter(entry => entry.id != null).map(entry => ({ ...entry, id: String(entry.id).padStart(2, "0") }));
+  const catalogGroups = records(catalogSource?.groups || assetWorkflow?.groups);
+  const assetActions = new Set(identifiers(assetWorkflow?.submit_actions || assetWorkflow?.submission?.actions || assetWorkflow?.actions));
+  const rawCurrent = data.current || assetWorkflow?.current;
+  const current = rawCurrent && typeof rawCurrent === "object" ? { ...rawCurrent, items: records(rawCurrent.items) } : null;
+  const items = current ? current.items.map(item => ({ ...item, id: String(item.id ?? item.instance_id ?? "") })) : [];
+  const offer = data.next || assetWorkflow?.next || null;
   const storageKey = `jarden:draft:${data.project_id || data.title}:${data.delivery_id || data.snapshot_at}`;
   const persisted = loadDraft() || {};
   const state = {
-    action: persisted.action || (data.next && data.next.action === "ask" ? "answer-field" : (current && current.kind === "set" ? "approve-set" : "select")),
-    selected: new Set((persisted.selected || []).filter(id => items.some(item => item.id === id && (item.selectable || (persisted.action || "").startsWith("request-"))))),
-    note: persisted.note || "",
-    keep: persisted.keep || "",
+    action: typeof persisted.action === "string" ? persisted.action : (offer?.action === "ask" ? "answer-field" : (current?.kind === "set" && !assetWorkflow ? "approve-set" : "select")),
+    selected: new Set(identifiers(persisted.selected).filter(id => items.some(item => item.id === id && (String(persisted.action || "").startsWith("request-") ? intentEligible(item) : item.selectable)))),
+    note: typeof persisted.note === "string" ? persisted.note : "",
+    keep: typeof persisted.keep === "string" ? persisted.keep : (Array.isArray(current?.keep) ? current.keep.join("、") : ""),
     fieldValue: persisted.fieldValue ?? "",
+    view: ["design", "assets", "history"].includes(persisted.view) ? persisted.view : (assetWorkflow && !current && !identifiers(assetWorkflow.selected).length ? "assets" : "design"),
+    assetSelected: new Set(identifiers(persisted.assetSelected ?? assetWorkflow?.selected).map(identifier => identifier.padStart(2, "0"))),
     submitting: false,
     result: null,
     adopted: false,
@@ -29,7 +40,7 @@
   };
   if (state.action === "approve-set") {
     const eligible = items.filter(item => item.selectable).map(item => item.id);
-    state.selected = new Set((persisted.selected || eligible).filter(id => eligible.includes(id)));
+    state.selected = new Set((Array.isArray(persisted.selected) ? identifiers(persisted.selected) : eligible).filter(id => eligible.includes(id)));
   }
   if (data.receipts && data.receipts.length) {
     state.result = data.receipts[data.receipts.length - 1];
@@ -61,11 +72,11 @@
   const checkLabel = { identity: "身份与结构", scale: "设计尺度", view: "实际视面、姿态与取景", coverage: "整套覆盖", preservation: "原图保持", order: "实际排列" };
   const nextStatus = action => ({ review: "待审查", package: "待整理", ask: "等待回答", generate: "待制作", round: "待制作", backend: "待配置", "await-choice": "等待选择", done: "已完成" })[action] || "状态待核对";
   const statusLabel = draft => {
-    if (state.adopted) return state.result.action === "answer-field" ? "回答已保存" : (state.result.action || "").startsWith("request-") ? "意向已登记" : "已采用";
+    if (state.adopted) return receiptLabel(state.result.action);
     if (data.stale) return "交付已过期";
     if (offer && (offer.action === "review" || offer.action === "package")) return nextStatus(offer.action);
     if (data.stage === "done") return nextStatus(offer && offer.action);
-    if (!current) return data.kind === "post" ? "发帖交付" : (offer && offer.action === "ask" ? "等待回答" : "状态交付");
+    if (!current) return assetWorkflow && identifiers(assetWorkflow.selected).length ? "计划已保存" : data.kind === "post" ? "发帖交付" : (offer && offer.action === "ask" ? "等待回答" : "状态交付");
     if (data.readonly) return "旧项目只读";
     if (current.missing || data.missing) return "部分图片缺失";
     if (items.some(item => item.disabled_reason && !item.selectable)) return "有待审或不可用项";
@@ -81,7 +92,6 @@
   };
   const text = value => value == null ? "" : String(value);
   const safeNote = value => value && typeof value === "object" ? JSON.stringify(value) : text(value);
-  const offer = data.next || null;
   const questionFields = {
     "answers.product_form": { label: "产品形态", intro: "这次想把 IP 做成哪种周边？选一个最接近的类型，具体款式可以在聊天里补充。" },
     "answers.subject_scope": {
@@ -121,7 +131,88 @@
   }
 
   function saveDraft() {
-    try { localStorage.setItem(storageKey, JSON.stringify({ action: state.action, selected: [...state.selected], note: state.note, keep: state.keep, fieldValue: state.fieldValue, requestId: state.requestId, requestPayload: state.requestPayload })); } catch (_) {}
+    try { localStorage.setItem(storageKey, JSON.stringify({ action: state.action, selected: [...state.selected], assetSelected: [...state.assetSelected], view: state.view, note: state.note, keep: state.keep, fieldValue: state.fieldValue, requestId: state.requestId, requestPayload: state.requestPayload })); } catch (_) {}
+  }
+
+  function receiptLabel(action) {
+    return action === "answer-field" ? "回答已保存" : action === "choose-assets" ? "资产计划已保存" : action === "asset-intent" || (action || "").startsWith("request-") ? "意向已登记（未生成图片）" : "已采用";
+  }
+
+  function receiptSelection(receipt) {
+    const selected = identifiers(receipt?.selected);
+    if (selected.length) return selected;
+    const instance = receipt?.asset_result?.instance_id || receipt?.asset_result?.intent?.instance_id || receipt?.instance_id;
+    return ["approve-asset", "asset-intent"].includes(receipt?.action) && instance ? [String(instance)] : [];
+  }
+
+  function projectName() {
+    return (data.title || data.project_id || "创作项目").replace(/\s*·\s*视觉对比页$/, "");
+  }
+
+  function productFormLabel(value) {
+    return ({ plush: "毛绒周边", figure: "手办摆件", puzzle: "拼图", other: "其他周边" })[value] || value || "原创 IP 项目";
+  }
+
+  function capability(entry) {
+    const support = entry?.support;
+    const value = typeof support === "object" && support ? support.status || support.level || support.kind : support;
+    const blocked = ["unsupported", "not-supported", "unavailable", "blocked", "unverified"].includes(value) || support === false;
+    const supported = !blocked && (entry?.supported === true || support === true || ["supported", "design-reference", "ready", "full", "native", "available", "visual", "visual-only", "raster", "partial", "limited"].includes(value));
+    const partial = ["design-reference", "visual", "visual-only", "raster", "partial", "limited"].includes(value);
+    const reason = typeof support === "object" && support ? support.reason || support.description : "";
+    return { selectable: supported, label: partial ? "设计参考" : supported ? "可制作" : ["unsupported", "not-supported", "unavailable", "blocked"].includes(value) || support === false ? "暂不支持" : "能力待核对", reason: reason || entry?.blocked_reason || entry?.support_reason || entry?.boundary || entry?.limitation || entry?.support_label || entry?.description || "" };
+  }
+
+  function editLocked() {
+    return state.submitting || data.stale || data.readonly || state.adopted;
+  }
+
+  function canWrite() {
+    return interactive && Boolean(data.delivery_id) && !editLocked() && state.syncStatus === "synced";
+  }
+
+  function itemLabel(item) {
+    return item?.label || item?.badge || item?.candidate || item?.id || "";
+  }
+
+  function fileKind(item) {
+    return item?.asset_kind || current?.asset_kind || catalog.find(entry => entry.id === (item?.asset_id || current?.asset_id))?.kind || "image";
+  }
+
+  function isImage(item) {
+    return fileKind(item) !== "document" && (!item?.path || /\.(png|jpe?g|webp|gif|avif|svg)(?:\?.*)?$/i.test(item.path));
+  }
+
+  function intentEligible(item) {
+    return assetWorkflow ? item?.intent_selectable === true || item?.selectable === true : Boolean(item);
+  }
+
+  function submissionDisabled(action) {
+    return !canWrite() || (action !== "answer-field" && Boolean(validate(action)));
+  }
+
+  function setView(view, assetId) {
+    state.view = view;
+    state.error = "";
+    saveDraft();
+    render();
+    requestAnimationFrame(() => {
+      const target = assetId ? document.querySelector(`[data-catalog-id="${CSS.escape(assetId)}"] input`) : document.getElementById("current");
+      target?.focus({ preventScroll: true });
+      target?.scrollIntoView({ block: "nearest" });
+    });
+  }
+
+  function setAssetSelection(identifier, checked) {
+    const entry = catalog.find(asset => asset.id === identifier);
+    if (editLocked() || (checked && !capability(entry).selectable)) return;
+    if (checked) state.assetSelected.add(identifier); else state.assetSelected.delete(identifier);
+    state.requestId = null;
+    state.requestPayload = "";
+    state.error = "";
+    saveDraft();
+    render();
+    requestAnimationFrame(() => document.querySelector(`[data-catalog-id="${CSS.escape(identifier)}"] input`)?.focus({ preventScroll: true }));
   }
 
   function setResult(message, isError) {
@@ -136,6 +227,7 @@
   }
 
   function setSelection(id, checked) {
+    if (editLocked() || !items.some(item => item.id === id && (state.action.startsWith("request-") ? intentEligible(item) : item.selectable))) return;
     if (state.action === "select" || state.action === "request-variation") {
       state.selected.clear();
       if (checked) state.selected.add(id);
@@ -164,6 +256,7 @@
     if (action === "select" || action === "approve-set") {
       state.selected = new Set([...state.selected].filter(id => items.find(item => item.id === id && item.selectable)));
     }
+    if (action.startsWith("request-")) state.selected = new Set([...state.selected].filter(id => intentEligible(items.find(item => item.id === id))));
     if (action === "select" || action === "request-variation") {
       state.selected = new Set([...state.selected].slice(0, 1));
     }
@@ -178,6 +271,10 @@
       const item = items.find(entry => entry.id === id);
       return { id, sha256: item && item.image_sha256 };
     });
+  }
+
+  function selectedLabels() {
+    return [...state.selected].map(identifier => itemLabel(items.find(item => item.id === identifier)) || identifier).join("、");
   }
 
   function actionPayload(kind) {
@@ -198,6 +295,18 @@
       payload.field = offer && offer.field;
       payload.value = offer && offer.field === "answers.concept_count" && state.fieldValue !== "" ? Number(state.fieldValue) : state.fieldValue;
     }
+    if (kind === "choose-assets") {
+      payload.asset_ids = [...state.assetSelected];
+      payload.items = [];
+      payload.evidence = `用户在交付 ${data.delivery_id} 点击保存资产选择：${payload.asset_ids.join("、")}${payload.note ? `；备注：${payload.note}` : ""}`;
+    }
+    if (kind === "approve-asset" || kind === "asset-intent") {
+      const selected = items.find(item => state.selected.has(item.id));
+      payload.asset_id = selected?.asset_id || current?.asset_id;
+      payload.instance_id = selected?.instance_id || selected?.id || current?.instance_id;
+      if (kind === "asset-intent") payload.intent = state.action;
+      if (kind === "approve-asset") payload.evidence = `用户在交付 ${data.delivery_id} 点击采用候选 ${payload.instance_id}${payload.note ? `；备注：${payload.note}` : ""}`;
+    }
     const comparable = JSON.stringify({ ...payload, request_id: "" });
     if (state.requestId && comparable !== state.requestPayload) {
       payload.request_id = freshId;
@@ -217,6 +326,27 @@
     if (data.readonly) return "旧项目当前只读；先明确迁移后再提交。";
     if (data.stale) return "页面已经过期；刷新后再核对交付。";
     if (state.adopted) return "本交付已提交；请刷新交付，再核对新的状态。";
+    if (state.syncStatus !== "synced") return "实时项目状态尚未核对，草稿已保留；请稍后重试。";
+    if (["choose-assets", "approve-asset", "asset-intent"].includes(action)) {
+      if (!assetWorkflow || !assetActions.has(action)) return "当前入口不支持写入这项操作；可导出回复草稿，回聊天继续。";
+      if (!data.delivery_id) return "当前没有可提交的交付；请先生成新的工作台快照。";
+      if (action === "choose-assets") {
+        if (!state.assetSelected.size) return "至少选择一项可制作的资产。";
+        const unsupported = [...state.assetSelected].find(identifier => !capability(catalog.find(entry => entry.id === identifier)).selectable);
+        return unsupported ? `${unsupported} 不在当前可制作范围内；先取消此项。` : "";
+      }
+      if (action === "approve-asset") {
+        if (state.selected.size !== 1) return "每次只确认一项真实资产；请保留一个选择。";
+        const item = items.find(entry => state.selected.has(entry.id));
+        if (!capability(catalog.find(entry => entry.id === (item?.asset_id || current?.asset_id))).selectable) return "当前资产能力未支持或未核实，不能确认完成。";
+      }
+      if (action === "asset-intent") {
+        if (!state.note.trim()) return "先填写希望如何调整；意向只登记，不会自动生图。";
+        if (state.action === "request-redo") return "";
+        if (!state.selected.size) return "先选择需要继续制作的资产或图位。";
+        return [...state.selected].some(identifier => !intentEligible(items.find(item => item.id === identifier))) ? "所选候选尚不具备登记方向意向的资格。" : "";
+      }
+    }
     if (action === "answer-field") {
       if (!offer || offer.action !== "ask" || !offer.field) return "当前没有待回答的问题。";
       if (state.fieldValue === "") return "先选择或填写一个答案。";
@@ -331,14 +461,24 @@
       state.syncError = error.name === "AbortError" ? "读取实时状态超时。" : error.message;
     }
     if (document.activeElement && /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) {
-      document.querySelector(".mode").textContent = state.syncStatus === "synced" ? "本机交互 · 已核对项目状态" : "本机交互 · 状态核对失败";
-      if (data.stale || state.syncError) document.querySelectorAll(".actions button").forEach(button => { button.disabled = true; });
+      const mode = document.querySelector(".mode");
+      if (mode) mode.textContent = state.syncStatus === "synced" ? "本机交互 · 已核对项目状态" : "本机交互 · 状态核对失败";
+      document.querySelectorAll("[data-submit-action]").forEach(button => { button.disabled = submissionDisabled(button.getAttribute("data-submit-action")); });
+      if (data.stale || data.readonly) document.querySelectorAll("input[data-item-id], input[data-asset-id], #decision-action").forEach(control => { control.disabled = true; });
     } else if (!document.querySelector("dialog[open]") && !state.submitting) render();
   }
 
   function frame(item, index, label) {
     const box = el("div", { class: "image-frame" });
-    if (item.exists && item.path) {
+    if (item.exists && item.path && !isImage(item)) {
+      box.className += " file-frame";
+      box.appendChild(el("div", { class: "file-preview" }, [
+        el("span", { class: "file-type", text: fileKind(item) === "document" ? "文档资产" : "文件资产" }),
+        el("strong", { text: item.title || item.name || item.id }),
+        el("p", { class: "meta", text: item.disabled_reason || "打开真实文件查看内容，确认仍以文件和审查证据为准。" }),
+        el("a", { href: imageSource(item.path), target: "_blank", rel: "noopener noreferrer", text: "打开原文件 ↗" })
+      ]));
+    } else if (item.exists && item.path) {
       box.appendChild(el("button", {
         class: "image-open", type: "button", "aria-label": `放大 ${item.title || item.id || "图片"}`,
         onclick: () => openZoomItem(item)
@@ -362,43 +502,48 @@
         el("span", { text: item.disabled_reason || "保留方向与提示词；当前没有可采用的图片" })
       ]));
     }
-    if (item.id) box.appendChild(el("span", { class: "image-marker", text: item.id }));
+    if (item.id) box.appendChild(el("span", { class: "image-marker", text: itemLabel(item) }));
     return box;
   }
 
   function candidate(item, index, historical) {
-    const chosen = (state.result?.selected || []).includes(item.id);
+    const chosen = receiptSelection(state.result).includes(item.id);
     const active = historical ? Boolean(item.picked) : state.adopted ? chosen : state.selected.has(item.id);
-    const isSet = state.action === "approve-set";
+    const isSet = state.action === "approve-set" && !assetWorkflow;
     const intent = state.action.startsWith("request-");
     const control = el("input", {
       type: isSet || state.action === "request-slots" ? "checkbox" : "radio",
       name: !historical && !isSet && state.action !== "request-slots" ? "selection" : undefined,
-      checked: state.action === "select" ? active : active,
+      checked: active,
       "data-item-id": historical ? undefined : item.id,
-      disabled: historical || (!item.selectable && !intent) || state.submitting || data.stale || data.readonly || state.adopted || state.action === "request-redo",
-      "aria-label": `${isSet ? "保留" : "选择"} ${item.id}${item.title ? " " + item.title : ""}`,
+      disabled: historical || (intent ? !intentEligible(item) : !item.selectable) || state.submitting || data.stale || data.readonly || state.adopted || state.action === "request-redo",
+      "aria-label": `${isSet ? "保留" : "选择"} ${itemLabel(item)}${item.title ? " " + item.title : ""}`,
       onchange: event => setSelection(item.id, event.target.checked)
     });
-    return el("article", { class: "candidate" + (active ? " selected" : "") }, [
+    const visual = frame(item, historical ? index + 3 : index, item.exists ? "" : "图片未生成");
+    if (active) visual.appendChild(el("span", { class: "selected-badge", text: historical ? "历史已选" : state.adopted ? state.result?.action === "asset-intent" || state.result?.action?.startsWith("request-") ? "意向已登记" : "已采用" : "当前选择" }));
+    return el("article", { class: "candidate" + (active ? " selected" : ""), "data-candidate-id": item.id }, [
+      visual,
       el("div", { class: "candidate-head" }, [
         el("label", { class: "choice" }, [
-          control,
           el("div", {}, [
-            el("h3", { text: `${item.id}${item.title ? " · " + item.title : ""}` }),
-            historical ? el("div", { class: "item-status", text: item.picked ? "历史已选 · 只读" : "历史记录 · 只读" }) : state.adopted ? el("div", { class: "item-status", text: chosen ? ((state.result.action || "").startsWith("request-") ? "意向已登记" : "已采用 · 回执已读回") : "本次未采用" }) : intent ? el("div", { class: "item-status", text: active ? "已标记意向，尚未提交" : "仅登记制作意向" }) : item.selectable ? el("div", { class: "item-status", text: active ? "已暂选，尚未提交" : (isSet ? "可保留" : "可选择") }) : el("div", { class: "item-status blocked", text: "不可采用" })
-          ])
+            el("h3", { text: item.title || item.name || item.id }),
+            item.idea ? el("p", { class: "meta", text: item.idea }) : null,
+            historical ? el("div", { class: "item-status", text: item.picked ? "历史已选 · 只读" : "历史记录 · 只读" }) : state.adopted ? el("div", { class: "item-status", text: chosen ? receiptLabel(state.result.action) + " · 回执已读回" : "本次未采用" }) : intent ? el("div", { class: "item-status", text: active ? "已标记意向，尚未提交" : intentEligible(item) ? "可登记意向，未正式采用" : "当前不能登记方向意向" }) : !item.selectable ? el("div", { class: "item-status blocked", text: assetWorkflow && item.intent_selectable ? "可登记方向意向 · 尚不可采用" : "不可采用" }) : null
+          ]),
+          control
         ])
       ]),
-      frame(item, historical ? index + 3 : index, item.exists ? "" : "图片未生成"),
       el("div", { class: "candidate-body" }, [
-        item.idea ? el("p", { text: item.idea }) : null,
-        item.method ? el("div", { class: "meta", text: `制作方式：${item.method}` }) : null,
         item.disabled_reason ? el("div", { class: "item-status blocked", text: `原因：${item.disabled_reason}` }) : null,
-        item.physics ? el("div", { class: "meta", text: `独立物理审查：${item.physics.verdict === "pass" ? "通过" : "未通过"} · ${item.physics.reason || "见审查记录"}` }) : null,
-        item.prompt ? el("details", {}, [el("summary", { text: item.method_code && item.method_code !== "generate" ? "制作说明" : "生图提示词" }), el("pre", { text: item.prompt })]) : null,
-        item.sources && item.sources.length ? el("details", {}, [el("summary", { text: "来源图片" }), el("pre", { text: item.sources.join("\n") })]) : null,
-        item.image_sha256 ? el("details", {}, [el("summary", { text: "文件与摘要" }), el("pre", { text: `原始路径：${item.original_path || "未记录"}\n显示快照：${item.display_path || item.path || "缺失"}\nSHA-256：${item.image_sha256}` })]) : null
+        item.prompt || item.image_sha256 || item.physics || item.method || item.sources?.length ? el("details", { class: "item-evidence" }, [
+          el("summary", { text: "制作与文件证据" }),
+          item.method ? el("p", { class: "meta", text: `制作方式：${item.method}` }) : null,
+          item.physics ? el("p", { class: "meta", text: `独立物理审查：${item.physics.verdict === "pass" ? "通过" : "未通过"} · ${item.physics.reason || "见审查记录"}` }) : null,
+          item.prompt ? el("pre", { text: item.prompt }) : null,
+          item.sources?.length ? el("pre", { text: `来源图片：${item.sources.join("\n")}` }) : null,
+          item.image_sha256 ? el("pre", { text: `原始路径：${item.original_path || "未记录"}\n显示快照：${item.display_path || item.path || "缺失"}\nSHA-256：${item.image_sha256}` }) : null
+        ]) : null
       ])
     ]);
   }
@@ -412,7 +557,7 @@
   function receiptLine(receipt) {
     if (!receipt) return null;
     if (receipt.committed === true) {
-      const label = receipt.action === "answer-field" ? "回答已保存" : (receipt.action || "").startsWith("request-") ? "意向已登记（未生成图片）" : "已采用";
+      const label = receiptLabel(receipt.action);
       return el("div", { class: "item-status", text: `${label} · 请求 ${receipt.request_id} · 读回版本 ${receipt.new_revision ?? "—"} · 回聊天回复「继续」` });
     }
     if (receipt.error) return el("div", { class: "item-status blocked", text: receipt.error });
@@ -420,24 +565,54 @@
   }
 
   function header() {
-    const draft = [...state.selected].length > 0 || state.note.trim() || parseKeep().length;
     const modeText = interactive
       ? (state.syncStatus === "synced" ? "本机交互 · 已核对项目状态" : state.syncStatus === "error" ? "本机交互 · 状态核对失败" : "本机交互 · 正在核对状态")
       : `静态快照 · ${data.snapshot_at ? compactTime(data.snapshot_at) : "时间未记录"}`;
-    return [
-      el("div", { class: "brandbar" }, [
-        el("div", { class: "brand" }, [el("span", { class: "brandmark", text: "J", "aria-hidden": "true" }), el("span", { text: "Jarden" })]),
-        el("div", { class: "mode", text: modeText })
+    const activeStep = state.view === "assets" ? 0 : assetWorkflow?.completion?.complete === true || offer?.action === "done" ? 2 : 1;
+    return el("header", { class: "topbar" }, [
+      el("div", { class: "crumbs", "aria-label": "当前位置" }, [
+        el("span", { class: "crumb-root", text: "我的项目" }),
+        el("span", { class: "crumb-divider", text: "/", "aria-hidden": "true" }),
+        el("strong", { text: projectName() }),
+        el("span", { class: "crumb-divider", text: "/", "aria-hidden": "true" }),
+        el("span", { text: state.view === "assets" ? "资产清单" : state.view === "history" ? "创作记录" : "设计工作台" })
       ]),
-      el("div", { class: "taskhead" }, [
-        el("div", {}, [
-          el("div", { class: "eyebrow", text: `${data.answers?.product_form ? "IP 创作" : "创意项目"} / ${data.stage === "done" ? nextStatus(offer && offer.action) : stageLabel[data.stage] || "状态"}` }),
-          el("h1", { text: current ? current.heading : (data.title || "Jarden 创作工作台").replace(" · 视觉对比页", "") }),
-          el("div", { class: "meta", text: `${data.delivery_id ? data.delivery_id + " · " : ""}${revLabel()}${data.snapshot_at ? " · " + compactTime(data.snapshot_at) : ""}` })
-        ]),
-        el("span", { class: "state" + (data.stale || data.missing || data.readonly ? " warning" : ""), text: statusLabel(draft), role: "status", "aria-live": "polite" })
+      el("div", { class: "top-context" }, [
+        assetWorkflow ? el("ol", { class: "progress", "aria-label": "创作流程" }, ["选资产", "做设计", "整理交付"].map((label, index) => el("li", { class: index === activeStep ? "active" : "", "aria-current": index === activeStep ? "step" : undefined }, [el("span", { text: String(index + 1), "aria-hidden": "true" }), el("span", { text: label })]))) : null,
+        el("span", { class: "mode", text: modeText })
       ])
-    ];
+    ]);
+  }
+
+  function navigation() {
+    const selected = catalog.filter(entry => state.assetSelected.has(entry.id));
+    const entries = [["design", "设计工作台"], ["assets", "资产清单"], ["history", "创作记录"]];
+    return el("aside", { class: "project-nav", "aria-label": "项目导航" }, [
+      el("div", { class: "brand" }, [el("span", { class: "brandmark", text: "J", "aria-hidden": "true" }), el("span", { text: "Jarden" })]),
+      el("div", { class: "project-identity" }, [
+        el("span", { class: "project-avatar", text: [...projectName()][0], "aria-hidden": "true" }),
+        el("div", {}, [el("strong", { text: projectName() }), el("span", { class: "meta", text: productFormLabel(data.answers?.product_form) })])
+      ]),
+      el("span", { class: "nav-label", text: "工作空间" }),
+      el("nav", { class: "nav-items", "aria-label": "工作空间" }, entries.filter(([view]) => view !== "assets" || assetWorkflow).map(([view, label]) => el("button", { type: "button", class: "nav-item" + (state.view === view ? " active" : ""), "aria-current": state.view === view ? "page" : undefined, onclick: () => setView(view) }, [el("span", { text: label }), view === "assets" ? el("span", { class: "nav-count", text: String(state.assetSelected.size).padStart(2, "0") }) : null]))),
+      selected.length ? el("div", { class: "nav-assets" }, [
+        el("span", { class: "nav-label", text: `本次资产 · ${selected.length} 项` }),
+        ...selected.map(entry => el("button", { type: "button", class: "nav-asset" + (current?.asset_id === entry.id ? " active" : ""), onclick: () => setView("assets", entry.id) }, [el("span", { class: "asset-id", text: entry.id }), el("span", { text: entry.name })]))
+      ]) : null,
+      el("div", { class: "nav-bottom" }, [el("span", { text: data.readonly ? "旧项目只读" : interactive ? "本机创作工作区" : "交付快照" }), el("small", { text: "图像与记录始终保留" })])
+    ]);
+  }
+
+  function taskHeading() {
+    const draft = state.selected.size > 0 || state.note.trim();
+    const planSaved = !current && assetWorkflow && identifiers(assetWorkflow.selected).length > 0;
+    return el("div", { class: "taskhead" }, [
+      el("div", {}, [
+        el("h1", { text: state.view === "assets" ? "选择这次的资产" : state.view === "history" ? "创作记录" : planSaved ? "本轮资产计划" : current?.heading || (offer?.action === "ask" ? questionField.label : projectName()) }),
+        el("p", { class: "meta", text: state.view === "assets" ? "按用途挑选，可多选。先确定要做什么，再逐项完善。" : state.view === "history" ? "保留每次交付、原始图片与已经确认的决定。" : planSaved ? "范围已保存。核对内部前置后，回到聊天继续。" : offer?.action === "ask" ? questionField.intro : current?.note || "比较本轮方向；确认后再精修细节。" })
+      ]),
+      el("span", { class: "state" + (data.stale || data.missing || data.readonly ? " warning" : ""), text: state.view === "assets" && !state.adopted && !data.stale && !data.readonly ? "资产规划" : statusLabel(draft), role: "status", "aria-live": "polite" })
+    ]);
   }
 
   function agreements() {
@@ -464,7 +639,7 @@
 
   function productSection() {
     const contract = data.product_contract;
-    return el("details", { class: "agreements contract", open: true }, [
+    return el("details", { class: "agreements contract" }, [
       el("summary", {}, [el("h2", { text: "产品约定" }), el("span", { class: "meta", text: "用途、设计尺度与来源" })]),
       !contract || contract.reason ? el("p", { class: "meta", text: contract?.reason || "本交付未记录产品约定；未知内容待补。" }) : null,
       ...(contract?.subjects || []).map(subject => el("article", { class: "contract-subject" }, [
@@ -492,7 +667,7 @@
 
   function planSection() {
     const plan = data.scene_plan;
-    return el("details", { class: "agreements contract", open: true }, [
+    return el("details", { class: "agreements contract" }, [
       el("summary", {}, [el("h2", { text: "视角计划" }), el("span", { class: "meta", text: "G0 · 计划依据" })]),
       el("p", { class: "meta", text: plan?.reason || "本交付未记录视角计划；G0 计划不是已实证图像。" }),
       plan?.required_views?.length ? el("p", { class: "meta", text: `计划要求：${plan.required_views.map(viewLabel).join("、")}` }) : null,
@@ -524,11 +699,11 @@
 
   function g1Section() {
     const groups = data.g1 || [];
-    return el("details", { class: "agreements contract", open: true }, [
+    return el("details", { class: "agreements contract" }, [
       el("summary", {}, [el("h2", { text: "G1 实际图验收" }), el("span", { class: "meta", text: "逐图检查与整套范围" })]),
       el("p", { class: "meta", text: "以下为已绑定原图和适用约定的报告状态。程序核对范围与记录，不能证明实际独立看图或精确测量。" }),
       !groups.length ? el("p", { class: "meta", text: "本交付未记录 G1 实际图验收，待补；不由计划推定通过。" }) : null,
-      ...groups.map(group => el("details", { class: "review-group", open: true }, [
+      ...groups.map(group => el("details", { class: "review-group" }, [
         el("summary", { text: `${group.label} · ${group.stage === "package" || group.stage === "done" ? "完整实际发布集合" : "本批实际图片"} · ${reviewLabel(group.sequence?.status)}` }),
         ...(group.items || []).map(item => el("div", {}, [
           reviewDetail(item, item.slot_id || "图位待绑定"),
@@ -540,10 +715,7 @@
   }
 
   function notices() {
-    const parts = [el("div", { class: "notice" }, [
-      el("strong", { text: "沟通方式。" }),
-      el("span", { text: " 所有需要你确认或反馈的事项都会在聊天正文说明；这里的按钮仅作可选辅助提交。" })
-    ])];
+    const parts = [];
     if (!interactive) parts.push(el("div", { class: "notice" }, [
       el("strong", { text: "只读快照。" }),
       el("span", { text: " 选择与备注只保存在本机草稿；不会写入项目。请在聊天里回复编号或明确指令继续。" })
@@ -565,16 +737,16 @@
       el("input", {
         type: "radio", name: "answer", value: JSON.stringify(choice.value),
         checked: JSON.stringify(state.fieldValue) === JSON.stringify(choice.value),
-        disabled: state.submitting || state.adopted,
-        onchange: () => { state.fieldValue = choice.value; state.requestId = null; state.requestPayload = ""; saveDraft(); }
+        disabled: editLocked(),
+        onchange: () => { state.fieldValue = choice.value; state.requestId = null; state.requestPayload = ""; saveDraft(); updateSummary(); }
       }),
       el("span", {}, [el("strong", { text: choice.label }), choice.value === offer.recommended ? el("strong", { text: "（建议，可改选）" }) : null, (questionField.intros?.[choice.value] || choice.intro) ? el("small", { style: "display:block", text: questionField.intros?.[choice.value] || choice.intro }) : null])
     ])) : [el("label", { class: "field", text: "填写这个答案" }, [
       el("input", {
         type: offer.field === "answers.concept_count" ? "number" : "text",
         value: state.fieldValue, placeholder: questionField.placeholder || "写下你的想法，也可以在聊天里补充说明",
-        disabled: state.submitting || state.adopted,
-        oninput: event => { state.fieldValue = event.target.value; state.requestId = null; state.requestPayload = ""; saveDraft(); }
+        disabled: editLocked(),
+        oninput: event => { state.fieldValue = event.target.value; state.requestId = null; state.requestPayload = ""; saveDraft(); updateSummary(); }
       })
     ])];
     const control = el("div", { class: "question" }, [
@@ -587,68 +759,170 @@
   }
 
   function sidebar() {
-    const selectedCount = [...state.selected].filter(id => items.find(item => item.id === id && item.selectable)).length;
-    const canChoose = current && !data.readonly && !data.stale && !state.adopted && (!interactive || state.syncStatus === "synced");
-    const canWrite = interactive && data.delivery_id && !data.readonly && !data.stale && !state.adopted && state.syncStatus === "synced";
-    const choiceAvailable = items.some(item => item.selectable);
+    const displaySelection = state.adopted ? receiptSelection(state.result) : [...state.selected];
+    const selectedCount = displaySelection.filter(id => items.find(item => item.id === id && item.selectable)).length;
+    const planning = state.view === "assets";
+    const selectedItem = items.find(item => displaySelection.includes(item.id));
     const intent = state.action.startsWith("request-");
+    const normalAction = current?.kind === "set" && !assetWorkflow ? "approve-set" : "select";
+    const action = planning ? "choose-assets" : offer?.action === "ask" ? "answer-field" : assetWorkflow ? intent ? "asset-intent" : "approve-asset" : intent ? state.action : normalAction;
+    const connected = !["choose-assets", "approve-asset", "asset-intent"].includes(action) || assetActions.has(action);
+    const hasAction = planning || current || offer?.action === "ask";
+    const submitText = planning ? "保存资产选择" : action === "answer-field" ? "保存这个答案" : intent ? "登记制作意向" : normalAction === "approve-set" ? "确认保留勾选图位" : selectedItem ? `按 ${itemLabel(selectedItem)} 继续` : "先选择一个方向";
     const actionLabels = {
-      select: "采用一个方向", "approve-set": "保留勾选图位",
+      select: assetWorkflow ? "确认当前资产" : "采用一个方向", "approve-set": "保留勾选图位",
       "request-variation": "沿所选方向补变化", "request-slots": "指定图位补图", "request-redo": "整轮重新制作"
     };
-    return el("aside", { class: "sidebar", "aria-label": "本轮选择" }, [
-      el("div", { class: "eyebrow", text: current && current.kind === "set" ? "逐图保留" : "本轮选择" }),
-      el("h2", { text: canChoose ? (current.kind === "set" ? "保留这一组" : "选一个方向") : (current ? "查看本轮状态" : "确认项目需求") }),
-      el("div", { class: "draft-status", text: state.adopted ? "已写入并读回真实回执" : selectedCount ? `${selectedCount} 项暂选 · 尚未提交` : "尚未选择" }),
-      current && !state.adopted ? el("label", { class: "field", text: "这次想做什么" }, [
-        el("select", { id: "decision-action", "aria-label": "这次想做什么", disabled: state.submitting || data.stale || data.readonly, onchange: event => setAction(event.target.value) },
-          [current.kind === "set" ? "approve-set" : "select", "request-variation", "request-slots", "request-redo"].map(action => el("option", { value: action, selected: state.action === action, text: actionLabels[action] })))
-      ]) : null,
+    return el("aside", { class: "sidebar", id: "decision-panel", tabindex: "-1", "aria-label": "本轮选择" }, [
+      el("h2", { text: planning ? "本次资产计划" : "这一轮的决定" }),
+      el("div", { class: "current-pick" }, [el("span", { class: "selection-dot" + (planning ? state.assetSelected.size ? " filled" : "" : selectedCount ? " filled" : ""), "aria-hidden": "true" }), el("strong", { text: planning ? `已选 ${state.assetSelected.size} 项` : selectedItem ? `${itemLabel(selectedItem)} · ${selectedItem.title || selectedItem.name || "当前选择"}` : selectedCount ? `保留 ${selectedCount} 项` : "还未选择" })]),
+      el("p", { class: "draft-status", text: state.adopted ? "已写入并读回真实回执" : planning ? "选择仅在保存并读回回执后生效。" : "选定后，沿这个方向继续。其他方案会保留在记录里。" }),
+      el("label", { class: "field", for: "decision-note", text: intent && assetWorkflow && !planning ? "修改意见（必填）" : "修改意见（选填）" }, [el("textarea", {
+        id: "decision-note", value: state.note, placeholder: "写下想调整的地方，其余部分继续保留。",
+        maxlength: 5000,
+        disabled: editLocked(), oninput: event => { state.note = event.target.value; state.requestId = null; state.requestPayload = ""; saveDraft(); updateSummary(); }
+      })]),
+      el("details", { class: "keep-editor" }, [
+        el("summary", { text: "继续保留 · 编辑" }),
+        el("label", { class: "field", for: "decision-keep", text: "保持项（逗号分隔）" }, [el("input", {
+          id: "decision-keep", type: "text", value: state.keep, placeholder: "填入保持项，用逗号分隔",
+          maxlength: 2000,
+          disabled: editLocked(), oninput: event => { state.keep = event.target.value; state.requestId = null; state.requestPayload = ""; saveDraft(); updateSummary(); }
+        })])
+      ]),
+      el("div", { class: "keep-tags", id: "keep-tags" }, parseKeep().map(value => el("span", { text: value }))),
+      assetWorkflow ? assetSummary() : null,
       el("div", { class: "submit-summary", id: "submit-summary", text: selectionSummary(selectedCount) }),
       el("div", { class: "actions" }, [
-        canWrite && current && !intent && current.kind === "set" ? el("button", { class: "primary", type: "button", disabled: state.submitting || !choiceAvailable || !state.selected.size, onclick: () => submit("approve-set"), text: !choiceAvailable ? "暂无可保留图位" : !state.selected.size ? "先勾选要保留的图" : state.submitting ? "正在确认…" : "确认保留未选者标为跳过" }) : null,
-        canWrite && current && !intent && current.kind !== "set" ? el("button", { class: "primary", type: "button", disabled: state.submitting || !choiceAvailable || !state.selected.size, onclick: () => submit("select"), text: !choiceAvailable ? "暂无可采用方向" : !state.selected.size ? "先选择一个方向" : state.submitting ? "正在提交…" : "确认采用所选方向" }) : null,
-        canWrite && current && intent ? el("button", { class: "primary", type: "button", disabled: state.submitting || (state.action !== "request-redo" && !state.selected.size), onclick: () => submit(state.action), text: state.submitting ? "正在登记…" : "确认登记意向（不会生图）" }) : null,
-        canWrite && offer && offer.action === "ask" ? el("button", { class: "primary", type: "button", disabled: state.submitting, onclick: () => submit("answer-field"), text: state.submitting ? "正在保存…" : "保存这个答案" }) : null
+        !state.adopted && hasAction && interactive && connected ? el("button", { class: "primary", type: "button", "data-submit-action": action, disabled: submissionDisabled(action), onclick: () => submit(action), text: state.submitting ? "正在确认…" : submitText }) : null,
+        !state.adopted && (!interactive || !connected) && hasAction ? el("button", { class: "primary", type: "button", onclick: exportIntent, text: planning ? "导出资产选择草稿" : "导出回复草稿" }) : null
       ]),
-      el("label", { class: "field", text: "给下一轮的备注" }, [el("textarea", {
-        value: state.note, placeholder: current && current.kind === "set" ? "例如：第 3 张换室外光，其余保持" : "例如：采用 B，保留眼睛和配色",
-        maxlength: 5000,
-        disabled: state.submitting, oninput: event => { state.note = event.target.value; state.requestId = null; state.requestPayload = ""; saveDraft(); updateSummary(); }
-      })]),
-      el("label", { class: "field", text: "保持项（逗号分隔）" }, [el("input", {
-        type: "text", value: state.keep, placeholder: "例如：左耳缺口、圆眼睛",
-        maxlength: 2000,
-        disabled: state.submitting, oninput: event => { state.keep = event.target.value; state.requestId = null; state.requestPayload = ""; saveDraft(); updateSummary(); }
-      })]),
-      el("div", { class: "hint", text: "这里的提交为可选辅助；待确认事项以聊天正文为准。提交后必须读回真实回执才显示「已采用」，页面不会调用生图或下一阶段。" }),
+      !planning && current && !state.adopted ? el("details", { class: "decision-options", open: intent }, [
+        el("summary", { text: "还想看看其他方向" }),
+        el("label", { class: "field", for: "decision-action", text: "这次想做什么" }, [el("select", { id: "decision-action", disabled: editLocked(), onchange: event => setAction(event.target.value) }, [normalAction, "request-variation", ...(!assetWorkflow ? ["request-slots"] : []), "request-redo"].map(option => el("option", { value: option, selected: state.action === option, text: actionLabels[option] })))])
+      ]) : null,
+      !interactive || !connected ? el("p", { class: "hint", text: "草稿不会写入项目。导出后回聊天发送，由 Agent 核对并继续。" }) : null,
       state.result || state.error ? el("div", { id: "result", class: "result" + (state.error ? " notice error" : ""), role: "status", "aria-live": "polite" }, [
         state.error ? el("span", { text: state.error }) : null,
         receiptLine(state.result)
       ]) : null,
-      el("div", { class: "hint", id: "save-state", text: "草稿自动保存在此浏览器；提交失败不会清空。" }),
-      el("div", { class: "secondary-actions", style: "margin-top:12px" }, [
-        el("button", { type: "button", onclick: exportIntent, text: "导出回复草稿" })
-      ])
+      state.adopted && state.result?.action === "choose-assets" ? el("button", { class: "text-button", type: "button", onclick: copyContinue, text: "复制「继续」回聊天" }) : null,
+      el("p", { class: "hint", id: "save-state", text: "草稿自动保存在此浏览器，刷新或提交失败仍可恢复。" }),
+      interactive && connected || !hasAction ? el("button", { class: "text-button", type: "button", onclick: exportIntent, text: "导出回复草稿" }) : null
+    ]);
+  }
+
+  function assetSummary() {
+    const chosen = [...state.assetSelected];
+    const direct = new Set();
+    const visit = identifier => {
+      const entry = catalog.find(asset => asset.id === identifier);
+      for (const dependency of entry?.dependencies || []) {
+        if (chosen.includes(dependency) || direct.has(dependency)) continue;
+        direct.add(dependency);
+        visit(dependency);
+      }
+    };
+    chosen.forEach(visit);
+    return el("section", { class: "asset-summary", "aria-label": "本次资产" }, [
+      el("div", { class: "field-label" }, [el("strong", { text: "本次交付" }), el("span", { class: "meta", text: `${chosen.length} 项` })]),
+      ...chosen.map(identifier => {
+        const entry = catalog.find(asset => asset.id === identifier);
+        return el("button", { type: "button", class: "asset-row" + (current?.asset_id === identifier ? " current" : ""), onclick: () => setView("assets", identifier) }, [el("span", { class: "asset-id", text: identifier }), el("span", { text: entry?.name || "目录资料待补" })]);
+      }),
+      direct.size ? el("div", { class: "dependency-note", role: "note" }, [
+        el("strong", { text: "将补必要前置" }),
+        ... [...direct].map(identifier => el("span", { text: `${identifier} ${catalog.find(asset => asset.id === identifier)?.name || ""}`.trim() }))
+      ]) : null,
+      !chosen.length ? el("p", { class: "hint", text: "还没有选择资产，可先到资产清单挑选。" }) : null
+    ]);
+  }
+
+  function assetPlanOverview() {
+    const chosen = identifiers(state.adopted && state.result?.action === "choose-assets"
+      ? receiptSelection(state.result).concat(identifiers(state.result?.asset_result?.selected)).filter((identifier, index, values) => values.indexOf(identifier) === index)
+      : assetWorkflow?.selected);
+    if (!chosen.length) return null;
+    const missing = new Set();
+    const visit = identifier => {
+      const entry = catalog.find(asset => asset.id === identifier);
+      for (const dependency of entry?.dependencies || []) {
+        if (chosen.includes(dependency) || missing.has(dependency)) continue;
+        missing.add(dependency);
+        visit(dependency);
+      }
+    };
+    chosen.forEach(visit);
+    const saved = [...state.assetSelected].every(identifier => chosen.includes(identifier)) && chosen.length === state.assetSelected.size;
+    return el("section", { class: "asset-plan-overview", "aria-label": "已保存的资产计划" }, [
+      el("div", { class: "eyebrow", text: saved ? "范围与前置" : "资产范围" }),
+      el("h2", { text: saved ? "下一步准备" : "确认本轮资产范围" }),
+      el("p", { class: "meta", text: saved ? "制作在聊天中继续；这里的页面只核对范围、依赖和文件，不自动生成。" : "先在资产清单确认范围，保存并读回回执后再继续。" }),
+      el("div", { class: "plan-preview" }, chosen.map(identifier => {
+        const entry = catalog.find(asset => asset.id === identifier);
+        return el("div", { class: "plan-preview-row" }, [el("span", { class: "asset-id", text: identifier }), el("strong", { text: entry?.name || "目录资料待补" }), el("span", { class: "meta", text: capability(entry).label })]);
+      })),
+      missing.size ? el("p", { class: "dependency-summary", text: `内部会补必要前置：${[...missing].map(identifier => `${identifier} ${catalog.find(asset => asset.id === identifier)?.name || ""}`.trim()).join("、")}。这些不是额外交付。` }) : null,
+      el("div", { class: "plan-actions" }, [
+        el("button", { type: "button", class: "primary", onclick: () => setView("assets"), text: saved ? "查看或调整资产" : "去确认资产范围" }),
+        saved ? el("button", { type: "button", onclick: copyContinue, text: "复制「继续」" }) : null
+      ]),
+      saved ? el("p", { class: "meta", text: "回到聊天粘贴并发送「继续」，准备下一项资产。" }) : null
+    ]);
+  }
+
+  function copyContinue() {
+    const fallback = () => {
+      const modal = el("dialog", { "aria-label": "继续指令" }, [
+        el("div", { class: "dialog-toolbar" }, [el("strong", { text: "继续指令" }), el("button", { type: "button", onclick: () => modal.close(), text: "关闭" })]),
+        el("div", { class: "export-content" }, [el("p", { text: "回到聊天发送下面的内容。" }), el("textarea", { readonly: true, value: "继续" })])
+      ]);
+      modal.addEventListener("close", () => modal.remove());
+      app.appendChild(modal); modal.showModal();
+    };
+    if (navigator.clipboard?.writeText) navigator.clipboard.writeText("继续").then(() => setResult("已复制「继续」；回到聊天粘贴发送。", false)).catch(fallback);
+    else fallback();
+  }
+
+  function mobileContinue() {
+    if (!current || state.view !== "design" || state.adopted || offer?.action === "ask") return null;
+    const intent = state.action.startsWith("request-");
+    const action = assetWorkflow ? intent ? "asset-intent" : "approve-asset" : intent ? state.action : current.kind === "set" ? "approve-set" : "select";
+    const selectedItem = items.find(item => state.selected.has(item.id));
+    return el("div", { class: "mobile-continue" }, [
+      el("button", {
+        class: "primary", type: "button", "data-mobile-submit": action,
+        disabled: submissionDisabled(action), onclick: () => submit(action),
+        text: state.submitting ? "正在确认…" : intent ? "提交制作意向" : selectedItem ? `用 ${itemLabel(selectedItem)} 继续` : "先选择一个方向"
+      }),
+      el("button", {
+        class: "text-button", type: "button",
+        onclick: () => { const panel = document.getElementById("decision-panel"); panel?.focus({ preventScroll: true }); panel?.scrollIntoView({ block: "start" }); },
+        text: "补充意见"
+      })
     ]);
   }
 
   function selectionSummary(count) {
     if (state.adopted) return "本交付已提交；回聊天回复「继续」进入下一步。";
+    if (state.view === "assets") return state.assetSelected.size ? `${state.assetSelected.size} 项资产暂选，保存后逐项制作；不会自动生成或验收。` : "至少选择一项可制作的资产。";
     if (offer && offer.action === "ask" && !current) return "只回答当前一个缺失问题；不会伪造图片或进入生成。";
     if (!current) return "当前交付没有需要提交的轮次。";
-    if (state.action === "request-redo") return "登记整轮重做意向，不撤销原图，不调用生图。回聊天继续执行。";
-    if (state.action === "request-slots") return state.selected.size ? `将请求补齐或修改 ${[...state.selected].join("、")}；其余图位保留。` : "勾选需要补齐或修改的图位；只登记意向。";
-    if (state.action === "request-variation") return state.selected.size ? `将沿 ${[...state.selected].join("、")} 登记补变化意向；尚未生成新图。` : "先选一个方向作为后续制作意向；待审图仍不能采用。";
+    if (state.action === "request-redo") return `${assetWorkflow && !state.note.trim() ? "先在修改意见里说明想怎样调整。" : ""}登记整轮重做意向，不撤销原图，不调用生图。回聊天继续执行。`;
+    if (state.action === "request-slots") return state.selected.size ? `将请求补齐或修改 ${selectedLabels()}；其余图位保留。` : "勾选需要补齐或修改的图位；只登记意向。";
+    if (state.action === "request-variation") return state.selected.size ? `${assetWorkflow && !state.note.trim() ? "先在修改意见里说明想怎样调整。" : ""}将沿 ${selectedLabels()} 登记补变化意向；尚未生成新图。` : "先选一个方向作为后续制作意向；待审图仍不能采用。";
     if (!items.some(item => item.selectable)) return "本轮没有可采用项；请先查看待审、缺图或过期原因。";
-    if (current.kind === "set") return count ? `${count} 张保留；未勾选图位提交后标为跳过。` : "勾选要保留的图位；未选者提交后标为跳过。";
+    if (current.kind === "set" && !assetWorkflow) return count ? `${count} 张保留；未勾选图位提交后标为跳过。` : "勾选要保留的图位；未选者提交后标为跳过。";
     if (offer && offer.action === "ask") return "保存当前唯一缺失问题；不会重复提问。";
-    return count ? `将提交 ${[...state.selected].join("、")}，其他方向不采用。` : "先选一个方向，再确认采用。";
+    return count ? `将提交 ${selectedLabels()}，其他方向不采用。` : "先选一个方向，再确认采用。";
   }
 
   function updateSummary() {
     const target = document.getElementById("submit-summary");
     if (target) target.textContent = selectionSummary([...state.selected].length);
+    const tags = document.getElementById("keep-tags");
+    if (tags) tags.replaceChildren(...parseKeep().map(value => el("span", { text: value })));
+    document.querySelectorAll("[data-submit-action]").forEach(button => { button.disabled = submissionDisabled(button.getAttribute("data-submit-action")); });
   }
 
   function previousSection() {
@@ -745,26 +1019,100 @@
     ]);
   }
 
+  function assetCatalog() {
+    const groups = new Map();
+    catalog.forEach(entry => {
+      const group = typeof entry.category === "object" ? entry.category.name || entry.category.label || entry.category.id : entry.category;
+      const groupDefinition = catalogGroups.find(category => category.id === group);
+      const label = groupDefinition?.name || groupDefinition?.label || group || "其他资产";
+      if (!groups.has(label)) groups.set(label, []);
+      groups.get(label).push(entry);
+    });
+    const instances = records(assetWorkflow?.instances);
+    return el("section", { class: "workarea asset-catalog", id: "current", tabindex: "-1", "aria-label": "资产多选目录" }, [
+      el("div", { class: "sectionhead" }, [el("h2", { text: "资产清单" }), el("span", { class: "meta", text: `${catalog.length} 项 · 可多选` })]),
+      el("button", { class: "mobile-plan-jump", type: "button", text: `查看已选 ${state.assetSelected.size} 项与保存方式`, onclick: () => { const panel = document.getElementById("decision-panel"); panel?.focus({ preventScroll: true }); panel?.scrollIntoView({ block: "start" }); } }),
+      el("details", { class: "catalog-intro" }, [
+        el("summary", { text: "怎样选择" }),
+        el("p", { text: "按成果挑选，不必一次做完。依赖、审核和文件要求会随计划保存，实际制作逐项确认。" })
+      ]),
+      !catalog.length ? el("div", { class: "empty" }, [el("h3", { text: "资产目录尚未载入" }), el("p", { text: "当前快照没有目录数据。请回聊天获取新的交付；这里不会生成或写入资产。" })]) : null,
+      ...[...groups.entries()].map(([label, entries]) => el("fieldset", { class: "catalog-group" }, [
+        el("legend", {}, [el("span", { text: label }), el("span", { class: "meta", text: `${entries.length} 项` })]),
+        el("div", { class: "catalog-options" }, entries.map(entry => {
+          const support = capability(entry);
+          const selected = state.assetSelected.has(entry.id);
+          const instance = instances.find(record => String(record.asset_id || record.catalog_id || "").padStart(2, "0") === entry.id);
+          const description = support.reason || entry.deliverable || "";
+          return el("label", { class: "catalog-option" + (selected ? " selected" : "") + (!support.selectable ? " unsupported" : ""), "data-catalog-id": entry.id }, [
+            el("input", { type: "checkbox", checked: selected, "data-asset-id": entry.id, "aria-describedby": description ? `asset-description-${entry.id}` : undefined, disabled: editLocked() || (!support.selectable && !selected), onchange: event => setAssetSelection(entry.id, event.target.checked) }),
+            el("span", { class: "asset-id", text: entry.id }),
+            el("span", { class: "catalog-copy" }, [
+              el("span", { class: "catalog-title" }, [el("strong", { text: entry.name || entry.id }), el("span", { class: "support-label" + (!support.selectable ? " blocked" : ""), text: support.label })]),
+              description ? el("span", { class: "meta", id: `asset-description-${entry.id}`, text: safeNote(description) }) : null,
+              Array.isArray(entry.dependencies) && entry.dependencies.length ? el("span", { class: "meta", text: `前置资产：${entry.dependencies.join("、")}` }) : null,
+              Array.isArray(entry.delivery) && entry.delivery.length ? el("span", { class: "meta", text: `交付：${entry.delivery.join(" / ")}` }) : null,
+              instance ? el("span", { class: "item-status", text: ({ approved: "已有确认记录", pending: "待制作", draft: "待确认", recorded: "已记录，待确认", blocked: "暂不可继续", stale: "已失效，待核对" })[instance.status] || `当前记录：${instance.status || "待核对"}` }) : null
+            ])
+          ]);
+        }))
+      ])),
+      el("details", { class: "capability-boundary", open: true }, [
+        el("summary", { text: "能力边界" }),
+        el("p", { text: "视觉效果图不等于分层源文件、可编辑矢量、3D 模型、纸样或可量产文件。未支持的资产不能提交为完成；记录和确认均需核对真实文件与证据。" }),
+        ...records(assetWorkflow?.boundaries).map(boundary => el("p", { text: boundary.reason || boundary.description || boundary.name || safeNote(boundary) }))
+      ])
+    ]);
+  }
+
+  function evidenceSection() {
+    return el("details", { class: "technical-evidence", id: "technical-evidence" }, [
+      el("summary", { text: "约定与技术证据" }),
+      el("p", { class: "meta", text: `${data.delivery_id || "静态页面"} · ${revLabel()}${data.snapshot_at ? " · " + compactTime(data.snapshot_at) : ""}` }),
+      agreements(), productSection(), planSection(), g1Section(),
+      el("p", { class: "meta", text: "待确认事项以聊天正文为准。页面不会调用生图、安装更新或自动进入下一阶段；正式保存以服务端资格校验和真实回执为准。" })
+    ]);
+  }
+
+  function previousHint() {
+    const previous = data.previous_delivery;
+    if (!previous) return null;
+    const receipt = records(previous.receipts).filter(record => record.committed === true).pop();
+    return el("div", { class: "previous-hint" }, [
+      el("span", { text: receipt ? "上一轮已确认" : "上次交付" }),
+      el("strong", { text: receipt?.selected?.join("、") || previous.round_id || previous.delivery_id }),
+      el("button", { class: "text-button", type: "button", onclick: () => setView("history"), text: "查看记录 →" })
+    ]);
+  }
+
   function workarea() {
+    if (state.view === "assets" && assetWorkflow) return assetCatalog();
+    if (state.view === "history") return el("section", { class: "workarea history-view", id: "current", tabindex: "-1", "aria-label": "创作记录" }, [previousSection(), comparisonSection(), feedbackSection(), picksSection(), archiveSection(), evidenceSection(), maintenanceSection()]);
     if (!current && !data.post) {
-      return el("section", { class: "workarea", id: "current" }, [
-        question() || el("div", { class: "empty" }, [el("h2", { text: "当前没有待查看的视觉轮次" }), el("p", { text: data.next?.say || "完成下一项确认后，新的可查看交付会出现在这里。" })]),
-        previousSection(), picksSection(), archiveSection()
+      return el("section", { class: "workarea", id: "current", tabindex: "-1" }, [
+        question() || assetPlanOverview() || el("div", { class: "empty" }, [el("h2", { text: "当前没有待查看的视觉轮次" }), el("p", { text: !assetWorkflow && offer?.action !== "ask" && offer?.say || "完成下一项确认后，新的可查看交付会出现在这里。" })]),
+        assetWorkflow && !identifiers(assetWorkflow.selected).length ? el("button", { type: "button", text: "查看资产清单", onclick: () => setView("assets") }) : null,
+        evidenceSection()
       ]);
     }
-    if (!current) return el("section", { class: "workarea", id: "current" }, [data.post ? postSection() : el("div", { class: "empty", text: "当前交付只有状态。" }), previousSection(), picksSection(), archiveSection()]);
-    return el("section", { class: "workarea", id: "current", "aria-labelledby": "current-title" }, [
+    if (!current) return el("section", { class: "workarea", id: "current", tabindex: "-1" }, [data.post ? postSection() : el("div", { class: "empty", text: "当前交付只有状态。" }), evidenceSection()]);
+    return el("section", { class: "workarea", id: "current", tabindex: "-1", "aria-labelledby": "current-title" }, [
       question(),
-      el("div", { class: "sectionhead", style: "margin-top:18px" }, [
-        el("div", {}, [el("h2", { id: "current-title", text: current.kind === "set" ? "本轮交付图位" : "本轮方向" }), el("span", { class: "meta", text: current.hint || "先看图，再决定；技术证据按需展开。" })]),
-        el("button", { type: "button", onclick: exportIntent, text: "导出回复草稿" })
+      current.keep?.length ? el("div", { class: "keep-summary", "aria-label": "继续保留的设计特征" }, [
+        el("span", { class: "meta", text: "继续保留" }),
+        ...current.keep.slice(0, 4).map(value => el("span", { text: value }))
+      ]) : null,
+      el("div", { class: "sectionhead comparison-tools" }, [
+        el("h2", { id: "current-title", class: "active-tab", text: current.kind === "set" ? "本轮交付" : "方向比较" }),
+        el("div", { class: "tool-buttons" }, [
+          el("button", { class: "text-button", type: "button", disabled: !items.some(item => item.exists && item.path && isImage(item)), onclick: () => openZoomItem(items.find(item => state.selected.has(item.id) && item.exists && item.path && isImage(item)) || items.find(item => item.exists && item.path && isImage(item))), text: "放大查看" }),
+          el("button", { class: "text-button", type: "button", onclick: exportIntent, text: "导出草稿" })
+        ])
       ]),
       el("div", { class: "candidates" }, items.map((item, index) => candidate(item, index))),
-      previousSection(),
-      comparisonSection(),
-      feedbackSection(),
-      picksSection(),
-      archiveSection()
+      mobileContinue(),
+      previousHint(),
+      evidenceSection()
     ]);
   }
 
@@ -773,20 +1121,33 @@
     const lines = [
       `项目：${data.title || data.project_id || "Jarden"}`,
       `交付：${data.delivery_id || "静态页面"}`,
-      `动作：${offer && offer.action === "ask" ? "回答当前问题" : state.action}`,
+      `动作：${state.view === "assets" ? "选择资产（choose-assets）" : offer && offer.action === "ask" ? "回答当前问题" : state.action}`,
+      state.view === "assets" ? `资产：${[...state.assetSelected].map(identifier => `${identifier} ${catalog.find(entry => entry.id === identifier)?.name || "目录资料待补"}`).join("、") || "尚未选择"}` : null,
       offer && offer.action === "ask" ? `回答（${questionField.label}）：${questionChoices.find(choice => JSON.stringify(choice.value) === JSON.stringify(state.fieldValue))?.label || safeNote(state.fieldValue) || "尚未选择"}` : null,
       `选择：${selected.length ? selected.join("、") : "尚未选择"}`,
+      assetWorkflow && state.view !== "assets" && current?.asset_id ? `资产编号：${current.asset_id}` : null,
       `备注：${state.note || "—"}`,
       `保持：${parseKeep().length ? parseKeep().join("、") : "—"}`,
       "请按上面的选择继续。这只是回复草稿，尚未提交。"
     ].filter(Boolean);
-    const modal = el("dialog", { id: "export-dialog" }, [
+    const modal = el("dialog", { id: "export-dialog", "aria-label": "回复草稿（未提交）" }, [
       el("div", { class: "dialog-toolbar" }, [el("strong", { text: "回复草稿（未提交）" }), el("button", { type: "button", onclick: () => modal.close(), text: "关闭" })]),
       el("div", { class: "export-content" }, [
-        el("p", { class: "meta", text: "复制后回到聊天发送。静态页面没有服务，不会写入项目。" }),
-        el("textarea", { readonly: true, value: lines.join("\n") })
+        el("p", { class: "meta", text: "复制后回到聊天发送。导出不代表保存、生成或确认完成。" }),
+        el("textarea", { readonly: true, "aria-label": "回复草稿内容", value: lines.join("\n") })
       ])
     ]);
+    showDialog(modal);
+  }
+
+  function showDialog(modal, onClose) {
+    const opener = document.activeElement;
+    modal.addEventListener("click", event => { if (event.target === modal) modal.close(); });
+    modal.addEventListener("close", () => {
+      modal.remove();
+      if (onClose) onClose();
+      if (opener?.isConnected) opener.focus({ preventScroll: true });
+    }, { once: true });
     app.appendChild(modal);
     modal.showModal();
   }
@@ -803,12 +1164,10 @@
       ]),
       el("div", { class: "export-content" }, [
         el("p", { text: "复制后回到对话发送。页面不会下载或安装更新，也不会改变当前创作。" }),
-        el("textarea", { readonly: true, value: message })
+        el("textarea", { readonly: true, "aria-label": "维护请求内容", value: message })
       ])
     ]);
-    modal.addEventListener("close", () => modal.remove());
-    app.appendChild(modal);
-    modal.showModal();
+    showDialog(modal);
   }
 
   function maintenanceSection() {
@@ -835,11 +1194,14 @@
   function openZoomItem(item) {
     state.zoomItem = item;
     state.lastFocused = document.activeElement;
-    if (!item) return;
-    const modal = el("dialog", { id: "zoom-dialog", "aria-label": `${item.id} 图片放大` }, [
+    if (!item || !isImage(item)) return;
+    const zoomable = items.filter(entry => entry.exists && entry.path && isImage(entry));
+    const switchable = zoomable.length > 1 ? zoomable : [];
+    const modal = el("dialog", { id: "zoom-dialog", "aria-label": `${itemLabel(item)} 图片放大` }, [
       el("div", { class: "dialog-toolbar" }, [
-      el("div", {}, [el("strong", { text: `${item.id} · ${item.title || "本轮图片"}` }), el("div", { class: "meta", text: "使用右侧按钮切换浅底、深底与棋盘" })]),
+      el("div", {}, [el("strong", { class: "zoom-title", text: `${itemLabel(item)} · ${item.title || "本轮图片"}` }), el("div", { class: "meta", text: switchable.length ? "直接切换同一轮候选，不必关闭查看器" : "使用右侧按钮切换浅底、深底与棋盘" })]),
         el("div", { class: "dialog-tools" }, [
+          ...switchable.map(entry => el("button", { type: "button", "data-zoom-item": entry.id, "aria-pressed": entry.id === item.id ? "true" : "false", onclick: () => switchZoom(modal, entry), text: itemLabel(entry) })),
           el("button", { type: "button", onclick: () => changeBg(modal), text: "浅底 / 深底 / 棋盘" }),
           el("button", { type: "button", onclick: () => modal.close(), text: "关闭 ✕" })
         ])
@@ -847,10 +1209,23 @@
       el("div", { class: "zoom-stage", "data-background": state.zoomBackground }, [el("img", { src: imageSource(item.path), alt: item.title || item.id })]),
       el("div", { class: "dialog-caption", text: `${item.method || ""}${item.image_sha256 ? " · 图片摘要 " + item.image_sha256.slice(0, 12) : ""}` })
     ]);
-    app.appendChild(modal);
-    modal.addEventListener("click", event => { if (event.target === modal) modal.close(); });
-    modal.addEventListener("close", () => { modal.remove(); state.zoomItem = null; if (state.lastFocused) state.lastFocused.focus(); });
-    modal.showModal();
+    showDialog(modal, () => { state.zoomItem = null; });
+  }
+
+  function switchZoom(modal, item) {
+    if (!item || !isImage(item)) return;
+    state.zoomItem = item;
+    const image = modal.querySelector(".zoom-stage img");
+    if (image) {
+      image.src = imageSource(item.path);
+      image.alt = item.title || item.id;
+    }
+    const title = modal.querySelector(".zoom-title");
+    if (title) title.textContent = `${itemLabel(item)} · ${item.title || "本轮图片"}`;
+    const caption = modal.querySelector(".dialog-caption");
+    if (caption) caption.textContent = `${item.method || ""}${item.image_sha256 ? " · 图片摘要 " + item.image_sha256.slice(0, 12) : ""}`;
+    modal.setAttribute("aria-label", `${itemLabel(item)} 图片放大`);
+    modal.querySelectorAll("[data-zoom-item]").forEach(button => button.setAttribute("aria-pressed", button.dataset.zoomItem === item.id ? "true" : "false"));
   }
 
   function changeBg(modal) {
@@ -863,16 +1238,14 @@
   function render() {
     const focused = document.activeElement;
     const savedSelection = focused && focused.getAttribute && focused.getAttribute("data-item-id");
-    app.replaceChildren(
-      ...header(),
-      ...notices(),
-      agreements(),
-      productSection(),
-      planSection(),
-      g1Section(),
-      el("div", { class: "workspace" }, [workarea(), sidebar()]),
-      maintenanceSection()
-    );
+    const planOverviewOnly = state.view === "design" && !current && assetWorkflow && identifiers(assetWorkflow.selected).length > 0;
+    app.replaceChildren(el("div", { class: "studio-layout" }, [
+      navigation(),
+      el("div", { class: "studio-main" }, [header(), el("main", { class: "content", "aria-label": "创作内容" }, [
+        taskHeading(), ...notices(),
+        el("div", { class: "workspace" + (state.view === "history" ? " history-workspace" : planOverviewOnly ? " plan-workspace" : "") }, [workarea(), state.view === "history" || planOverviewOnly ? null : sidebar()])
+      ])])
+    ]));
     if (savedSelection) {
       document.querySelector(`input[data-item-id="${CSS.escape(savedSelection)}"]`)?.focus({ preventScroll: true });
     }

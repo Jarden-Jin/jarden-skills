@@ -1,0 +1,340 @@
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const vm = require("node:vm");
+
+const root = path.resolve(__dirname, "..");
+const assets = path.join(root, "skills/jarden-ip-visual/assets");
+const source = fs.readFileSync(path.join(assets, "gallery.js"), "utf8");
+const catalog = JSON.parse(fs.readFileSync(path.join(assets, "asset-catalog.json"), "utf8"));
+const walk = node => [node, ...node.children.flatMap(walk)];
+const content = node => [node.textContent, ...node.children.map(content)].join(" ");
+const settle = async () => { for (let turn = 0; turn < 40; turn++) await Promise.resolve(); };
+
+function matches(node, selector) {
+  const attribute = selector.match(/\[([^=\]]+)(?:="([^"]*)")?\]/);
+  const tag = selector.match(/^[a-z]+/i)?.[0];
+  const classNames = [...selector.matchAll(/\.([\w-]+)/g)].map(match => match[1]);
+  const identifier = selector.match(/#([\w-]+)/)?.[1];
+  const attributeMatches = !attribute || (attribute[2] === undefined ? node.attributes[attribute[1]] !== undefined : node.attributes[attribute[1]] === attribute[2]);
+  return (!tag || node.tagName === tag.toUpperCase()) && classNames.every(className => String(node.className || "").split(/\s+/).includes(className)) && (!identifier || node.attributes.id === identifier) && attributeMatches;
+}
+
+function environment(input, options = {}) {
+  let document;
+  class Element {
+    constructor(tag) {
+      this.tagName = tag.toUpperCase();
+      this.children = [];
+      this.attributes = {};
+      this.listeners = {};
+      this.textContent = "";
+      this.parentElement = null;
+      this.disabled = false;
+    }
+    setAttribute(name, value) { this.attributes[name] = value; if (name === "disabled") this.disabled = true; }
+    getAttribute(name) { return this.attributes[name]; }
+    addEventListener(name, handler) { this.listeners[name] = handler; }
+    appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
+    replaceChildren(...children) { this.children.forEach(child => { child.parentElement = null; }); this.children = []; children.forEach(child => this.appendChild(child)); }
+    remove() { if (this.parentElement) this.parentElement.children = this.parentElement.children.filter(child => child !== this); this.parentElement = null; }
+    get isConnected() { return this === app || Boolean(this.parentElement?.isConnected); }
+    focus() { document.activeElement = this; }
+    scrollIntoView() {}
+    querySelectorAll(selector) { return walk(this).filter(node => selector.split(",").some(part => matches(node, part.trim()))); }
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+    showModal() { this.setAttribute("open", ""); this.querySelector("button")?.focus(); }
+    close() { delete this.attributes.open; this.listeners.close?.(); }
+  }
+  const data = structuredClone(input);
+  const app = new Element("div");
+  const stored = options.storage || new Map();
+  const posts = [];
+  const requests = [];
+  let receipt = null;
+  document = {
+    activeElement: null,
+    createElement: tag => new Element(tag),
+    addEventListener() {},
+    getElementById: identifier => identifier === "gallery-data" ? { textContent: JSON.stringify(data) } : identifier === "app" ? app : walk(app).find(node => node.attributes.id === identifier),
+    querySelector: selector => app.querySelector(selector),
+    querySelectorAll: selector => app.querySelectorAll(selector),
+  };
+  const reply = (body, status = 200) => ({ ok: status < 400, status, json: async () => body });
+  const context = {
+    document, CSS: { escape: value => value },
+    location: { hash: options.interactive ? "#token=ui-fixture-token" : "", protocol: options.interactive ? "http:" : "file:" },
+    localStorage: { getItem: key => stored.get(key) || null, setItem: (key, value) => stored.set(key, value) },
+    URLSearchParams, Intl, Date, AbortController, setTimeout, clearTimeout,
+    requestAnimationFrame: callback => callback(),
+    crypto: { randomUUID: () => `request-${posts.length}` },
+    fetch: async (url, request) => {
+      requests.push({ url, authorization: request?.headers?.Authorization });
+      if (url === "/api/state") {
+        if (options.syncFailure) throw new Error("状态不可读");
+        return reply({ project_id: data.project_id, revision: options.liveRevision ?? data.project_revision, manifest: data, receipts: {} });
+      }
+      if (url === "/api/decision") {
+        const payload = JSON.parse(request.body);
+        posts.push(payload);
+        if (options.submitFailure) return reply({ error: "拒绝写入" }, 409);
+        receipt = { committed: true, action: payload.action, request_id: payload.request_id, delivery_id: payload.delivery_id, new_revision: data.project_revision + 1, selected: options.assetReceipt ? [] : payload.items.map(item => item.id), asset_result: options.assetReceipt ? { instance_id: payload.instance_id } : undefined };
+        return reply(receipt);
+      }
+      if (url.startsWith("/api/receipt/")) return receipt ? reply(receipt) : reply({}, 404);
+      throw new Error(`Unexpected request: ${url}`);
+    }
+  };
+  context.window = context;
+  vm.runInNewContext(source, context, { timeout: 2000 });
+  return {
+    app, document, stored, posts, requests,
+    nodes: selector => app.querySelectorAll(selector),
+    text: () => content(app),
+    button: label => walk(app).find(node => node.tagName === "BUTTON" && (content(node).trim() === label || node.children[0]?.textContent === label)),
+    click: async button => { assert.ok(button, "missing button"); assert.equal(button.disabled, false); button.focus(); await button.listeners.click?.({ target: button }); await settle(); },
+    change: async (selector, value, checked = true) => {
+      const node = document.querySelector(selector);
+      assert.ok(node, `missing ${selector}`);
+      assert.equal(node.disabled, false, `${selector} is disabled`);
+      node.focus();
+      node.value = value;
+      node.checked = checked;
+      await node.listeners.change?.({ target: node });
+      await settle();
+    },
+    input: (identifier, value) => {
+      const node = document.getElementById(identifier);
+      assert.ok(node, `missing ${identifier}`);
+      node.focus();
+      node.value = value;
+      node.listeners.input({ target: node });
+    }
+  };
+}
+
+function baseData(overrides = {}) {
+  return {
+    title: "山间小兔", project_id: "quiet-studio-fixture", delivery_id: "D0042", project_revision: 8,
+    stage: "material", snapshot_at: "2026-11-14T12:00:00Z", next: { action: "await-choice" },
+    current: {
+      kind: "alternatives", heading: "比较材质方向", round_id: "R002-material", hint: "只比较材质，造型继续保留。",
+      items: [
+        { id: "A", title: "细密短绒", idea: "轮廓更利落", path: "a.png", exists: true, selectable: true, image_sha256: "a".repeat(64) },
+        { id: "B", title: "松软长绒", idea: "更轻盈蓬松", path: "b.png", exists: true, selectable: true, image_sha256: "b".repeat(64) }
+      ]
+    },
+    ...overrides
+  };
+}
+
+async function run() {
+  const staticPage = environment(baseData());
+  await settle();
+  assert.equal(staticPage.nodes(".candidate").length, 2);
+  assert.match(staticPage.text(), /山间小兔/);
+  assert.equal(staticPage.nodes("[data-submit-action]").length, 0);
+  assert.equal(staticPage.document.getElementById("technical-evidence").attributes.open, undefined);
+  await staticPage.change('input[data-item-id="B"]', "B");
+  staticPage.input("decision-note", "脸部再干净一些");
+  staticPage.input("decision-keep", "圆眼睛、长耳朵");
+  const opener = staticPage.button("导出回复草稿");
+  await staticPage.click(opener);
+  assert.equal(staticPage.nodes("dialog").length, 1);
+  assert.match(staticPage.nodes("textarea").at(-1).value, /选择：B/);
+  assert.match(staticPage.nodes("textarea").at(-1).value, /尚未提交/);
+  staticPage.nodes("dialog")[0].close();
+  assert.equal(staticPage.nodes("dialog").length, 0);
+  assert.equal(staticPage.document.activeElement, opener);
+  const restored = environment(baseData(), { storage: staticPage.stored });
+  assert.equal(restored.nodes('input[data-item-id="B"]')[0].checked, true);
+  assert.equal(restored.document.getElementById("decision-note").value, "脸部再干净一些");
+  assert.equal(restored.nodes(".keep-tags")[0].children.length, 2);
+
+  const interactive = environment(baseData(), { interactive: true });
+  await settle();
+  await interactive.change('input[data-item-id="B"]', "B");
+  await interactive.click(interactive.button("按 B 继续"));
+  assert.equal(interactive.posts.length, 1);
+  assert.equal(interactive.posts[0].action, "select");
+  assert.equal(interactive.posts[0].expected_revision, 8);
+  assert.equal(interactive.posts[0].items[0].sha256, "b".repeat(64));
+  assert.ok(interactive.requests.some(request => request.url.startsWith("/api/receipt/")));
+  assert.ok(interactive.requests.every(request => request.authorization === "Bearer ui-fixture-token"));
+  assert.match(interactive.text(), /回执已读回/);
+
+  const failed = environment(baseData(), { interactive: true, submitFailure: true });
+  await settle();
+  await failed.change('input[data-item-id="A"]', "A");
+  failed.input("decision-note", "保留这个草稿");
+  await failed.click(failed.button("按 A 继续"));
+  assert.match(failed.text(), /拒绝写入/);
+  assert.equal(failed.document.getElementById("decision-note").value, "保留这个草稿");
+  assert.equal(failed.nodes('input[data-item-id="A"]')[0].checked, true);
+
+  for (const options of [{ liveRevision: 9 }, { syncFailure: true }]) {
+    const locked = environment(baseData(), { interactive: true, ...options });
+    await settle();
+    assert.ok(locked.nodes("[data-submit-action]").every(button => button.disabled));
+  }
+  const readonly = environment(baseData({ readonly: true }), { interactive: true });
+  await settle();
+  assert.ok(readonly.nodes("input[data-item-id]").every(control => control.disabled));
+
+  const workflow = { catalog, selected: [], instances: [], current: null, next: { action: "choose-assets" } };
+  const assetsPage = environment(baseData({ current: null, next: null, asset_workflow: workflow }), { interactive: true });
+  await settle();
+  assert.equal(assetsPage.nodes(".catalog-option").length, 21);
+  assert.equal(assetsPage.nodes(".catalog-group").length, 4);
+  assert.match(assetsPage.text(), /设计过程/);
+  assert.match(assetsPage.text(), /设定规范/);
+  assert.equal(assetsPage.nodes('input[data-asset-id="06"]')[0].disabled, true);
+  assert.equal(assetsPage.nodes('input[data-asset-id="09"]')[0].disabled, false);
+  await assetsPage.change('input[data-asset-id="02"]', "02");
+  await assetsPage.change('input[data-asset-id="09"]', "09");
+  assert.equal(assetsPage.nodes("[data-submit-action]").length, 0);
+  await assetsPage.click(assetsPage.button("导出资产选择草稿"));
+  const exported = assetsPage.nodes("textarea").at(-1).value;
+  assert.match(exported, /02 定稿精细线稿/);
+  assert.match(exported, /09 标准三视图/);
+  assert.equal(assetsPage.posts.length, 0);
+
+  const wired = environment(baseData({ current: null, next: null, asset_workflow: { ...workflow, selected: ["02", "09"], submit_actions: ["choose-assets"] } }), { interactive: true });
+  await settle();
+  await wired.click(wired.button("资产清单"));
+  await wired.click(wired.button("保存资产选择"));
+  assert.deepEqual(wired.posts[0].asset_ids, ["02", "09"]);
+  assert.deepEqual(wired.posts[0].items, []);
+  assert.match(wired.posts[0].evidence, /点击保存资产选择/);
+  assert.match(wired.text(), /资产计划已保存/);
+
+  const assetCurrent = {
+    kind: "set", heading: "确认线稿", round_id: "asset-round-02", asset_id: "02",
+    items: { "line-1": { title: "线稿版本一", badge: "A", asset_id: "02", instance_id: "line-1", path: "a.png", exists: true, selectable: true, image_sha256: "a".repeat(64) } }
+  };
+  const approval = environment(baseData({ current: null, next: null, asset_workflow: { ...workflow, current: assetCurrent, selected: ["02"], submit_actions: ["approve-asset", "asset-intent"] } }), { interactive: true, assetReceipt: true });
+  await settle();
+  assert.equal(approval.nodes(".candidate").length, 1);
+  await approval.change('input[data-item-id="line-1"]', "line-1");
+  await approval.click(approval.button("按 A 继续"));
+  assert.equal(approval.posts[0].action, "approve-asset");
+  assert.equal(approval.posts[0].asset_id, "02");
+  assert.equal(approval.posts[0].instance_id, "line-1");
+  assert.match(approval.posts[0].evidence, /点击采用候选 line-1/);
+  assert.equal(approval.nodes(".candidate.selected").length, 1);
+  assert.match(approval.nodes(".current-pick")[0].children[1].textContent, /A · 线稿版本一/);
+
+  const draftCurrent = structuredClone(assetCurrent);
+  draftCurrent.items["line-1"].selectable = false;
+  draftCurrent.items["line-1"].intent_selectable = true;
+  draftCurrent.items["line-2"] = { ...draftCurrent.items["line-1"], id: "line-2", badge: "B", intent_selectable: false };
+  const intent = environment(baseData({ current: null, next: null, asset_workflow: { ...workflow, current: draftCurrent, selected: ["02"], submit_actions: ["approve-asset", "asset-intent"] } }), { interactive: true });
+  await settle();
+  assert.equal(intent.nodes('input[data-item-id="line-1"]')[0].disabled, true);
+  await intent.change("#decision-action", "request-variation");
+  assert.equal(intent.nodes('input[data-item-id="line-1"]')[0].disabled, false);
+  assert.equal(intent.nodes('input[data-item-id="line-2"]')[0].disabled, true);
+  await intent.change('input[data-item-id="line-1"]', "line-1");
+  intent.input("decision-note", "继续完善耳朵比例");
+  await intent.click(intent.button("登记制作意向"));
+  assert.equal(intent.posts[0].action, "asset-intent");
+  assert.equal(intent.posts[0].intent, "request-variation");
+  assert.match(intent.text(), /意向已登记（未生成图片）/);
+
+  const documentCurrent = structuredClone(assetCurrent);
+  documentCurrent.asset_id = "08";
+  documentCurrent.items["line-1"] = { ...documentCurrent.items["line-1"], asset_kind: "document", asset_id: "08", path: "identity.md", title: "核心设定文档" };
+  const documentPage = environment(baseData({ current: null, next: null, asset_workflow: { ...workflow, current: documentCurrent, selected: ["08"] } }));
+  assert.equal(documentPage.nodes("img").length, 0);
+  assert.equal(documentPage.nodes(".file-preview").length, 1);
+  assert.match(documentPage.text(), /打开原文件/);
+
+  const unknownCatalog = structuredClone(catalog);
+  unknownCatalog.assets.find(entry => entry.id === "01").support = "unverified";
+  unknownCatalog.assets.find(entry => entry.id === "02").support = null;
+  unknownCatalog.groups = unknownCatalog.groups.map(({ name, ...group }) => ({ ...group, label: name }));
+  const unknownSupport = environment(baseData({ current: null, next: null, asset_workflow: { ...workflow, catalog: unknownCatalog } }));
+  assert.equal(unknownSupport.nodes('input[data-asset-id="01"]')[0].disabled, true);
+  assert.equal(unknownSupport.nodes('input[data-asset-id="02"]')[0].disabled, true);
+  assert.match(unknownSupport.text(), /设计过程/);
+
+  const incomplete = environment(baseData({ current: { kind: "set", items: null }, asset_workflow: { catalog: null, instances: null, current: null, selected: null } }));
+  assert.ok(incomplete.text());
+  const malformedDraft = new Map([["jarden:draft:quiet-studio-fixture:D0042", JSON.stringify({ selected: "invalid", note: 5, keep: [], action: false })]]);
+  assert.ok(environment(baseData(), { storage: malformedDraft }).text());
+  console.log("quiet-studio runtime: static drafts, receipts, locking, 21 assets, capability boundaries, and asset payloads passed");
+}
+
+function serve() {
+  const http = require("node:http");
+  const imageRoot = process.env.JARDEN_UI_IMAGE_ROOT;
+  const receipts = new Map();
+  const dataFor = pathname => {
+    const data = baseData();
+    data.asset_workflow = {
+      catalog, selected: ["02", "04", "07", "09"], plan: {}, instances: [], current: data.current,
+      next: data.next, completion: { complete: false }, submit_actions: ["choose-assets", "approve-asset", "asset-intent"]
+    };
+    data.current.asset_id = "07";
+    data.current.keep = ["奶油白色", "圆眼睛", "长耳朵"];
+    data.current.items.forEach(item => { item.asset_id = "07"; item.badge = item.id; item.id = `assets-long-instance-identifier-${item.id}`; item.instance_id = item.id; });
+    if (pathname === "/catalog.html") {
+      data.current = null;
+      data.next = { action: "choose-assets" };
+      data.asset_workflow.current = null;
+      data.asset_workflow.selected = [];
+      data.asset_workflow.next = data.next;
+    }
+    if (pathname === "/legacy.html") delete data.asset_workflow;
+    if (pathname === "/document.html") {
+      const documentItem = { ...data.current.items[0], asset_kind: "document", asset_id: "08", path: "identity.md", title: "IP 核心设定文档" };
+      data.current = { ...data.current, kind: "set", heading: "确认核心设定文档", asset_id: "08", items: [documentItem] };
+      data.asset_workflow.current = data.current;
+      data.asset_workflow.selected = ["08"];
+    }
+    if (pathname === "/readonly.html") data.readonly = true;
+    if (pathname === "/stale.html") data.stale = true;
+    return data;
+  };
+  const server = http.createServer(async (request, response) => {
+    const pathname = new URL(request.url, "http://localhost").pathname;
+    const send = (body, type = "application/json", status = 200) => {
+      response.writeHead(status, { "Content-Type": type, "Cache-Control": "no-store" });
+      response.end(typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body));
+    };
+    if (pathname === "/api/state") {
+      const data = dataFor("/gallery.html");
+      send({ project_id: data.project_id, revision: data.project_revision, manifest: data, receipts: {} });
+      return;
+    }
+    if (pathname === "/api/decision" && request.method === "POST") {
+      let body = "";
+      for await (const chunk of request) body += chunk;
+      const payload = JSON.parse(body);
+      const receipt = { committed: true, action: payload.action, request_id: payload.request_id, delivery_id: payload.delivery_id, new_revision: payload.expected_revision + 1, selected: payload.items.map(item => item.id) };
+      receipts.set(payload.request_id, receipt);
+      send(receipt);
+      return;
+    }
+    if (pathname.startsWith("/api/receipt/")) {
+      const receipt = receipts.get(decodeURIComponent(pathname.split("/").pop()));
+      send(receipt || {}, "application/json", receipt ? 200 : 404);
+      return;
+    }
+    if (["/a.png", "/b.png"].includes(pathname) && imageRoot) {
+      const filename = path.join(imageRoot, pathname === "/a.png" ? "material-a.png" : "material-b.png");
+      send(fs.readFileSync(filename), "image/png");
+      return;
+    }
+    if (pathname === "/favicon.ico") { response.writeHead(204); response.end(); return; }
+    if (pathname === "/identity.md") { send("# 核心设定文档\n\n这是本地协议夹具，不是真实项目资产。\n", "text/plain; charset=utf-8"); return; }
+    const data = dataFor(pathname);
+    const template = fs.readFileSync(path.join(assets, "gallery.html"), "utf8");
+    const html = template.replace("__GALLERY_CSS__", () => fs.readFileSync(path.join(assets, "gallery.css"), "utf8")).replace("__GALLERY_DATA__", () => JSON.stringify(data).replace(/</g, "\\u003c")).replace("__GALLERY_JS__", () => fs.readFileSync(path.join(assets, "gallery.js"), "utf8"));
+    send(html, "text/html; charset=utf-8");
+  });
+  server.listen(0, "127.0.0.1", () => console.log(JSON.stringify({ origin: `http://127.0.0.1:${server.address().port}`, mode: "isolated-ui-fixture", production_assets: assets })));
+}
+
+if (process.argv.includes("--serve")) serve();
+else run().catch(error => { console.error(error); process.exitCode = 1; });

@@ -1,6 +1,6 @@
 # 受控更新与作者发行
 
-本文件对应 `scripts/check_update.py`、`scripts/update_runtime.py` 与仓库的 `tools/build_release.py`。更新只处理 Skill 代码，不扫描、迁移或回滚用户项目，也不修改图片服务设置与凭据。
+从 [主流程](../SKILL.md) 进入。本文件对应 `scripts/check_update.py`、`scripts/update_runtime.py` 与仓库的 `tools/build_release.py`。更新只处理 Skill 代码，不扫描、迁移或回滚用户项目，也不修改图片服务设置与凭据；资产与 legacy 项目分流见 [项目状态](project-state.md)。
 
 ## 可信来源与版本
 
@@ -56,6 +56,14 @@
 
 第二步目标代码读 `[1, 2, 3]`、只写 `[3]`，旧项目仍需单独迁移。更新器不自动串联桥接安装，`check.latest` 也不自动改成桥接版。已安装兼容更新器可直接计划更高版本；同版本或降级不走 plan。更早且没有更新入口的安装不能声称原生支持该流程，须由独立安装方式修复。
 
+## schema 4 与工作流边界
+
+当前源码的目标版本为 `0.4.0`，不代表已经存在同号公开 Release。schema 4 代码的项目兼容声明是读 `[1, 2, 3, 4]`、写 `[3, 4]`；发行索引与更新计划仍使用各自的 schema 1，不能与项目 schema 混为一谈。
+
+CLI 新 `init` 默认资产模式，显式 `--workflow legacy` 保留固定商品链；两者新建均为 schema 4。已有 schema 3 legacy 继续读写，不因安装新代码自动切换。schema 1/2 写入前须显式迁移；schema 3 转资产模式也须预览迁移与确认范围，结构迁移不会自动启用资产流程、补造旧过程或审查。命令与保护边界见 [项目状态](project-state.md)。
+
+旧 `0.2.2` 桥接和仅接受 schema 2/3 声明的更新器不因此取得 schema 4 安装资格。升级前运行已安装入口的离线 `selfcheck`，确认 `accepted_project_schemas` 包含上述完整 schema 4 声明；没有则停止，等待已验证的兼容桥接或经明确授权的独立安装方案，不猜测桥接版本号。不能编辑旧接受列表、将新包伪报 schema 3 或假定上节的两步示例可以直达本机未发布源码。
+
 ## 计划与显式安装
 
 `plan` 只读安装目录，把元数据、下载缓存和计划写在外部；不导入或执行候选版本。索引与计划采用固定 schema，未知字段被拒绝。计划列出当前/目标版本、固定来源、commit、包与索引摘要、真实路径、`add`/`modified`/`remove`、本地前置摘要、兼容范围与外部备份位置。目标已存在时不覆盖计划文件。
@@ -97,8 +105,9 @@ reader 注册 gate 默认最多等待约 2 秒；注册后只留 reader 记录�
 | `0.2.1` 旧版 | `[1, 2]` | `[2]` | 仅 schema 2 声明 |
 | `0.2.2` 桥接版 | `[1, 2]` | `[2]` | schema 2 或 schema 3 声明 |
 | schema 3 代码 | `[1, 2, 3]` | `[3]` | schema 2 或 schema 3 声明 |
+| 当前 schema 4 代码 | `[1, 2, 3, 4]` | `[3, 4]` | schema 2、schema 3 或完整 schema 4 声明 |
 
-发行索引/更新计划的 schema 仍为 1，与项目 schema 分开。schema 3 代码只读 schema 1/2，写前用 `migrate_project.py` 对单个项目另行预览和执行；代码安装不扫描项目。项目迁移后回滚到只懂 schema 2 的代码会拒绝 schema 3，不能靠改数字、丢新轮次或删除图片恢复。必须另行决定恢复项目备份的范围。
+具体旧安装仍以它自己的 `selfcheck` 为准，不能从 Skill 版本或仓库当前代码倒推其接受范围。发行索引/更新计划的 schema 仍为 1，与项目 schema 分开。当前项目代码可读 schema 1/2/3/4、写 schema 3/4；schema 1/2 写前用 `migrate_project.py` 对单个项目另行预览并迁移到 4。schema 3 legacy 不必为继续原流程而迁移，代码安装不扫描项目；迁移 schema 3 到 4 后仍保留 legacy 工作流，只有显式资产选择才启用资产模式。回滚到只懂旧 schema 的代码会拒绝新项目；不能靠改数字、丢新轮次、来源、回执或删除图片恢复。必须另行决定恢复项目备份的范围。
 
 ## 作者构建与发行
 
@@ -106,12 +115,13 @@ reader 注册 gate 默认最多等待约 2 秒；注册后只留 reader 记录�
 
 ```text
 <python> -m unittest discover -s skills/jarden-ip-visual/tests -p test_updates.py -v
+<python> -m unittest discover -s skills/jarden-ip-visual/tests -p test_release_schema4.py -v
 <python> tools/build_release.py --version <目标metadata.version> --commit <完整40位commit> --change-type <patch或minor或major> --output-dir <外部发行目录>
 ```
 
-builder 只读 Git blob，不读取未提交改动；要求已有 `jarden-ip-visual/v<目标版本>` 标签指向指定 commit，且该 commit 的 `metadata.version` 相同。项目 read/write 声明从同一 commit 的 `scripts/project.py` 顶层整数 `SCHEMA_VERSION` 派生，不能按目标版本或本地工作树猜测。按固定文件顺序、时间戳和权限生成 ZIP 与外部 `release.json`；目标已存在则拒绝覆盖。命令不会创建提交、标签、Release 或上传资产。
+builder 只读 Git blob，不读取未提交改动；要求已有 `jarden-ip-visual/v<目标版本>` 标签指向指定 commit，且该 commit 的 `metadata.version` 相同。项目 read/write 声明从同一 commit 的 `scripts/project.py` 顶层整数 `SCHEMA_VERSION` 派生，schema 4 映射为读 `[1, 2, 3, 4]`、写 `[3, 4]`，schema 2/3 仍保留各自旧声明，不能按目标版本或本地工作树猜测。按固定文件顺序、时间戳和权限生成 ZIP 与外部 `release.json`；目标已存在则拒绝覆盖。命令不会创建提交、标签、Release 或上传资产。
 
-桥接发行须固定在仍为 schema 2、已带兼容更新器的 commit；schema 3 发行另用对应 commit、标签和独立输出目录。不要把当前 schema 3 工作树只改 metadata 为 `0.2.2` 就称为兼容桥接包。
+桥接发行须固定在旧更新器可接受项目声明、且已带所需兼容更新器的 commit；schema 3/4 发行各用对应 commit、标签和独立输出目录。不要把当前 schema 4 工作树只改 metadata 为 `0.2.2` 就称为兼容桥接包。当前更新器和 builder 支持 schema 4 只说明本机源码能力，不证明远端已有对应桥接、归档或完整安装记录。
 
 作者应先准备并核对两份资产，再由有权限的发布流程上传到同名 Release；不要先宣布没有包的可用版本，不替换已发版本内容。`check` 从 Release 标签发现可用版本，`plan` 从对应 Release 获取外部索引。只读测试 CI 不发布、不上传、也不证明远端路径已经验证。
 

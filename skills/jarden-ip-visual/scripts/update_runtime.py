@@ -33,6 +33,7 @@ SCHEMA_VERSION = 1
 ACCEPTED_PROJECT_SCHEMAS = (
     {"read": [1, 2], "write": [2]},
     {"read": [1, 2, 3], "write": [3]},
+    {"read": [1, 2, 3, 4], "write": [3, 4]},
 )
 REPOSITORY = "Jarden-Jin/jarden-skills"
 SKILL_NAME = "jarden-ip-visual"

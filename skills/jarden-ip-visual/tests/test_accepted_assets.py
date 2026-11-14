@@ -26,7 +26,7 @@ class AcceptedAssetsTests(unittest.TestCase):
         image = Image.new("RGB", (256, 320), "white")
         ImageDraw.Draw(image).ellipse((50, 30, 210, 295), fill=(170, 150, 210))
         image.save(source)
-        self.call("project.py", "init", self.root, "--input", source, "--kind", "wireframe")
+        self.call("project.py", "init", self.root, "--input", source, "--kind", "wireframe", "--workflow", "legacy")
         self.call("project.py", "set", self.root,
                   "answers.product_form=plush", "answers.subject_scope=single",
                   'answers.subjects=["小云"]', "answers.concept_count=1",
