@@ -120,7 +120,8 @@ def renderer_signature() -> dict[str, str]:
     import asset_plan
     scripts = Path(__file__).resolve().parent
     paths = [gallery.TEMPLATE, gallery.ASSETS / "gallery.js", gallery.ASSETS / "gallery.css",
-             asset_plan.CATALOG_PATH, *sorted(scripts.glob("*.py"))]
+             *sorted(gallery.ASSETS.glob("workflow-map.*")), asset_plan.CATALOG_PATH,
+             *sorted(scripts.glob("*.py"))]
     return {path.name: gallery.file_sha256(path) for path in paths}
 
 
@@ -193,6 +194,9 @@ def healthy_server(root: Path, project_id: str, info: dict[str, Any], *,
             return False
         if info.get("project") != str(root) or info.get("project_id", project_id) != project_id:
             return False
+        runtime_signature = info.get("runtime_signature")
+        if runtime_signature != server_runtime_signature() and not (expected_pid is not None and runtime_signature is None):
+            return False
         expires = info.get("expires_at")
         if expires is not None and (type(expires) not in (int, float) or not time.time() < expires):
             return False
@@ -218,7 +222,10 @@ def healthy_server(root: Path, project_id: str, info: dict[str, Any], *,
         if len(encoded) > MAX_HEALTH_BYTES:
             return False
         payload = json.loads(encoded)
-        return isinstance(payload, dict) and payload.get("ok") is True and payload.get("project_id") == project_id
+        return (isinstance(payload, dict) and payload.get("ok") is True
+                and payload.get("project_id") == project_id
+                and isinstance(payload.get("workflow_status"), dict)
+                and payload["workflow_status"].get("schema_version") == 1)
     except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException):
         return False
     finally:
@@ -265,6 +272,13 @@ def stop_created_process(process: subprocess.Popen) -> None:
             process.wait(timeout=0.1)
 
 
+def server_runtime_signature() -> dict[str, str]:
+    scripts = Path(__file__).resolve().parent
+    return {name: gallery.file_sha256(scripts / name)
+            for name in ("serve_gallery.py", "workflow_status.py", "live_photo_workflow.py", "live_photo_native.py")
+            if (scripts / name).is_file()}
+
+
 def ensure_server(root: Path, project_id: str) -> dict[str, Any]:
     directory = workbench_directory(root)
     with server_lock(directory):
@@ -296,7 +310,7 @@ def ensure_server(root: Path, project_id: str) -> dict[str, Any]:
                     info = read_server_info(ready_file)
                     remaining = deadline - time.monotonic()
                     if remaining > 0 and healthy_server(root, project_id, info, timeout=min(HEALTH_TIMEOUT, remaining), expected_pid=process.pid):
-                        info.update(project_id=project_id, expires_at=time.time() + SERVER_TTL,
+                        info.update(project_id=project_id, runtime_signature=server_runtime_signature(),
                                     idle_timeout=SERVER_TTL, stderr_log=str(stderr_file))
                         state.atomic_json(cache, info)
                         cache.chmod(0o600)

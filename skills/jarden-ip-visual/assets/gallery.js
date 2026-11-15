@@ -18,6 +18,7 @@
   const catalogGroups = records(catalogSource?.groups || assetWorkflow?.groups);
   const assetActions = new Set(identifiers(assetWorkflow?.submit_actions || assetWorkflow?.submission?.actions || assetWorkflow?.actions));
   const rawCurrent = data.current || assetWorkflow?.current;
+  const livePhoto = data.live_photo && typeof data.live_photo === "object" ? data.live_photo : null;
   const current = rawCurrent && typeof rawCurrent === "object" ? { ...rawCurrent, items: records(rawCurrent.items) } : null;
   const items = current ? current.items.map(item => ({ ...item, id: String(item.id ?? item.instance_id ?? "") })) : [];
   const offer = data.next || assetWorkflow?.next || null;
@@ -29,13 +30,17 @@
     note: typeof persisted.note === "string" ? persisted.note : "",
     keep: typeof persisted.keep === "string" ? persisted.keep : (Array.isArray(current?.keep) ? current.keep.join("、") : ""),
     fieldValue: persisted.fieldValue ?? "",
-    view: ["design", "assets", "history"].includes(persisted.view) ? persisted.view : (assetWorkflow && !current && !identifiers(assetWorkflow.selected).length ? "assets" : "design"),
+    view: ["design", "assets", "history", ...(livePhoto ? ["live"] : [])].includes(persisted.view) ? persisted.view : (livePhoto?.jobs?.length ? "live" : assetWorkflow && !current && !identifiers(assetWorkflow.selected).length ? "assets" : "design"),
     assetSelected: new Set(identifiers(persisted.assetSelected ?? assetWorkflow?.selected).map(identifier => identifier.padStart(2, "0"))),
     submitting: false,
     result: null,
     adopted: false,
     syncStatus: interactive ? "checking" : "static",
     syncError: "",
+    workflow: data.workflow_status || null,
+    workflowLive: false,
+    workflowCheckedAt: null,
+    workflowDetailPhase: null,
     pendingUpdate: null,
     draftDirty: typeof persisted.draftDirty === "boolean" ? persisted.draftDirty : Boolean(
       identifiers(persisted.selected).length || (typeof persisted.note === "string" && persisted.note.trim()) || persisted.requestId ||
@@ -490,6 +495,9 @@
       if (!manifest) throw new Error("状态接口没有返回当前交付 manifest");
       if (payload.project_id !== data.project_id) throw new Error("实时状态不属于本页项目；没有提交任何选择");
       if (manifest.project_id && manifest.project_id !== data.project_id) throw new Error("交付快照不属于本页项目；保留当前画面");
+      state.workflowLive = payload.workflow_status?.schema_version === 1 && payload.workflow_status.project_id === data.project_id;
+      if (state.workflowLive) state.workflow = payload.workflow_status;
+      state.workflowCheckedAt = new Date().toISOString();
       data.live_revision = payload.revision ?? payload.project?.revision ?? manifest.project_revision;
       data.stale = manifest.delivery_id !== data.delivery_id || data.live_revision !== data.project_revision;
       const ready = /^D\d+$/.test(manifest.delivery_id) && manifest.delivery_id !== data.delivery_id && Number.isInteger(data.live_revision) && manifest.project_revision === data.live_revision;
@@ -509,6 +517,7 @@
     } finally {
       syncRunning = false;
     }
+    updateWorkflowStatus();
     if (state.pendingUpdate && liveWorkbench && !document.hidden && state.view !== "history" && !state.draftDirty && !editingSurface()) {
       openLatestWorkbench();
       return;
@@ -633,25 +642,200 @@
     const modeText = interactive
       ? (state.syncStatus === "synced" ? "本机交互 · 已核对项目状态" : state.syncStatus === "error" ? "本机交互 · 状态核对失败" : "本机交互 · 正在核对状态")
       : `静态快照 · ${data.snapshot_at ? compactTime(data.snapshot_at) : "时间未记录"}`;
-    const activeStep = state.view === "assets" ? 0 : assetWorkflow?.completion?.complete === true || offer?.action === "done" ? 2 : 1;
     return el("header", { class: "topbar" }, [
       el("div", { class: "crumbs", "aria-label": "当前位置" }, [
         el("span", { class: "crumb-root", text: "我的项目" }),
         el("span", { class: "crumb-divider", text: "/", "aria-hidden": "true" }),
         el("strong", { text: projectName() }),
         el("span", { class: "crumb-divider", text: "/", "aria-hidden": "true" }),
-        el("span", { text: state.view === "assets" ? "资产清单" : state.view === "history" ? "创作记录" : "设计工作台" })
+        el("span", { text: state.view === "assets" ? "资产清单" : state.view === "history" ? "创作记录" : state.view === "live" ? "Live 实况图" : "设计工作台" })
       ]),
       el("div", { class: "top-context" }, [
-        assetWorkflow ? el("ol", { class: "progress", "aria-label": "创作流程" }, ["选资产", "做设计", "整理交付"].map((label, index) => el("li", { class: index === activeStep ? "active" : "", "aria-current": index === activeStep ? "step" : undefined }, [el("span", { text: String(index + 1), "aria-hidden": "true" }), el("span", { text: label })]))) : null,
         el("span", { class: "mode", text: modeText })
       ])
     ]);
   }
 
+  const workflowPhases = [
+    { id: "intake", label: "理解需求" }, { id: "scope", label: "选择资产" },
+    { id: "create", label: "设计制作" }, { id: "review", label: "质量审查" },
+    { id: "confirm", label: "确认方案" }, { id: "deliver", label: "整理交付" }
+  ];
+  const workflowStateLabel = value => ({ done: "有完成记录", current: "当前阶段", pending: "按需进入", blocked: "待处理" })[value] || "状态待核对";
+
+  function workflowModel() {
+    const workflow = state.workflow || {};
+    const phases = workflowPhases.map(phase => ({ ...phase, ...(records(workflow.phases).find(entry => entry.id === phase.id) || {}) }));
+    return { ...workflow, phases, title: workflow.title || "正在核对工作状态", detail: workflow.detail || "读取当前项目、制作任务与审查记录后，显示真实下一步。" };
+  }
+
+  function workflowConnection() {
+    if (!interactive) return "快照状态";
+    if (state.syncStatus === "error") return "连接中断";
+    if (state.syncStatus !== "synced") return "连接中";
+    if (!state.workflowLive) return "状态快照";
+    return "实时同步";
+  }
+
+  function workflowMap() {
+    const template = document.getElementById("workflow-map");
+    const graph = template?.content?.firstElementChild?.cloneNode(true);
+    if (!graph) return el("div", { class: "workflow-fallback" }, workflowPhases.map(phase => el("button", {
+      type: "button", class: "workflow-step", "data-flow-node": phase.id,
+      onclick: () => openWorkflowDetail(phase.id), text: phase.label
+    })));
+    graph.setAttribute("class", "workflow-native-map");
+    graph.setAttribute("role", "group");
+    graph.setAttribute("aria-label", "Archify 创作流程，点击阶段查看当前记录");
+    graph.querySelectorAll("[data-flow-node]").forEach(node => {
+      const phaseId = node.getAttribute("data-flow-node");
+      node.setAttribute("role", "button");
+      node.removeAttribute("aria-labelledby");
+      node.setAttribute("tabindex", "0");
+      node.addEventListener("click", () => openWorkflowDetail(phaseId));
+      node.addEventListener("keydown", event => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          openWorkflowDetail(phaseId);
+        }
+      });
+    });
+    return graph;
+  }
+
+  function workflowDock() {
+    return el("section", { class: "workflow-dock", id: "workflow-dock", "aria-label": "常驻创作状态" }, [
+      el("div", { class: "workflow-now" }, [
+        el("div", { class: "workflow-caption" }, [
+          el("span", { class: "workflow-signal", "aria-hidden": "true" }),
+          el("span", { id: "workflow-actor", text: "当前工作" }),
+          el("span", { class: "workflow-connection", id: "workflow-connection", text: workflowConnection() })
+        ]),
+        el("strong", { class: "workflow-title", id: "workflow-title", role: "status", "aria-live": "polite", text: workflowModel().title }),
+        el("p", { class: "workflow-detail", id: "workflow-detail", text: workflowModel().detail }),
+        el("button", { type: "button", class: "workflow-open", onclick: () => openWorkflowDetail(), text: "工作详情", "aria-label": "查看工作详情", "aria-haspopup": "dialog" })
+      ]),
+      el("div", { class: "workflow-route" }, [
+        el("div", { class: "workflow-route-heading" }, [
+          el("span", { text: "工作路线" }),
+          el("span", { class: "workflow-route-meta", id: "workflow-scope" }),
+          el("span", { id: "workflow-observed", class: "workflow-observed" }),
+          el("span", { class: "workflow-credit", text: "ARCHIFY" })
+        ]),
+        workflowMap()
+      ])
+    ]);
+  }
+
+  function setWorkflowText(identifier, value) {
+    const node = document.getElementById(identifier);
+    if (node && node.textContent !== value) node.textContent = value;
+  }
+
+  function updateWorkflowStatus() {
+    const workflow = workflowModel();
+    const dock = document.getElementById("workflow-dock");
+    if (!dock) return;
+    dock.setAttribute("data-work-status", workflow.status || "idle");
+    dock.setAttribute("data-connection", state.syncStatus);
+    dock.setAttribute("data-phase", workflow.phase_id || "");
+    setWorkflowText("workflow-title", workflow.title);
+    setWorkflowText("workflow-detail", state.syncStatus === "error" ? "保留上次工作状态；连接恢复后自动核对。当前草稿继续保留。" : workflow.detail);
+    const actor = ({ user: "你", agent: "Agent", system: "系统" })[workflow.actor] || "Agent";
+    setWorkflowText("workflow-actor", !interactive || state.syncStatus === "synced" && !state.workflowLive ? "快照记录" : state.syncStatus === "error" ? "上次工作状态" : workflow.status === "working" ? `正在执行 · ${actor}` : workflow.status === "complete" ? "本轮工作" : workflow.actor === "user" ? "接下来 · 你来确认" : workflow.actor === "agent" ? "接下来 · Agent" : "当前工作");
+    document.getElementById("workflow-detail")?.setAttribute("title", workflow.detail);
+    setWorkflowText("workflow-connection", workflowConnection());
+    const selected = workflow.counts?.selected;
+    const approved = workflow.counts?.approved;
+    const scopeSummary = Number.isInteger(selected) && selected > 0 ? `本轮 ${selected} 项 · 已采用 ${Number.isInteger(approved) ? approved : 0} 项` : "按本轮所需推进";
+    setWorkflowText("workflow-scope", workflow.current_label ? `${workflow.current_label} · ${scopeSummary}` : scopeSummary);
+    setWorkflowText("workflow-observed", state.workflowLive && state.workflowCheckedAt ? `核对于 ${new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(state.workflowCheckedAt))}` : "以保存记录为准");
+    dock.querySelectorAll("[data-flow-node]").forEach(node => {
+      const phase = workflow.phases.find(entry => entry.id === node.getAttribute("data-flow-node"));
+      if (!phase) return;
+      const phaseState = phase.status || (phase.id === workflow.phase_id ? "current" : "pending");
+      node.setAttribute("data-flow-state", phaseState);
+      node.setAttribute("aria-label", `${phase.label} · ${workflowStateLabel(phaseState)}${phase.detail ? " · " + phase.detail : ""}`);
+      const caption = node.querySelector(".jarden-flow-node-detail");
+      if (caption) caption.textContent = phaseState === "done" ? "有完成记录" : phaseState === "blocked" ? "需要处理" : phaseState === "current" ? workflow.status === "working" ? "正在执行" : workflow.actor === "user" ? "等你确认" : "当前工作" : "按需进入";
+      if (phase.id === workflow.phase_id) node.setAttribute("aria-current", "step");
+      else node.removeAttribute?.("aria-current");
+    });
+    document.querySelectorAll("[data-phase-detail]").forEach(button => {
+      const phase = workflow.phases.find(entry => entry.id === button.getAttribute("data-phase-detail"));
+      const description = button.querySelector("small");
+      if (phase && description) description.textContent = workflowStateLabel(phase.status);
+    });
+    const panel = document.getElementById("workflow-live-detail");
+    const detailSignature = JSON.stringify([workflow, state.syncStatus, state.syncError]);
+    if (panel && panel.getAttribute("data-signature") !== detailSignature) {
+      panel.replaceChildren(...workflowDetailContent(workflow));
+      panel.setAttribute("data-signature", detailSignature);
+    }
+  }
+
+  function workflowDetailContent(workflow) {
+    const phase = workflow.phases.find(entry => entry.id === (state.workflowDetailPhase || workflow.phase_id));
+    const tasks = records(workflow.tasks).filter(task => task.active !== false);
+    const blockers = records(workflow.blockers);
+    const events = records(workflow.recent_events);
+    return [
+      el("div", { class: "workflow-detail-heading" }, [
+        el("span", { class: "eyebrow", text: phase?.label || "当前工作" }),
+        el("h3", { text: phase?.id === workflow.phase_id || !phase ? workflow.title : workflowStateLabel(phase.status) }),
+        el("p", { text: phase?.id === workflow.phase_id || !phase ? workflow.detail : phase.detail || "这个阶段按实际所选资产进入，不需要为补齐流程额外制作。" })
+      ]),
+      state.syncStatus === "error" ? el("p", { class: "notice error", text: state.syncError || "实时连接中断，当前显示上次记录。" }) : null,
+      ...blockers.map(blocker => el("article", { class: "workflow-issue" }, [
+        el("strong", { text: blocker.label || "待处理事项" }), el("p", { text: blocker.detail || "" })
+      ])),
+      tasks.length ? el("section", { class: "workflow-detail-section" }, [
+        el("h3", { text: "当前任务" }),
+        ...tasks.map(task => el("div", { class: "workflow-task" }, [
+          el("strong", { text: task.label || task.id }),
+          el("span", { text: task.status === "waiting" && task.actor === "user" ? "等你确认" : ({ requesting: "生成请求已发出", unknown: "结果待核对", completed: "文件已返回", not_started: "尚未开始", pending: "尚未开始", planned: "尚未开始", idle: "尚未开始", working: "执行中", waiting: "等待处理", blocked: "待处理", complete: "已完成", failed: "请求失败", output_invalid: "文件待核对" })[task.status] || "状态待核对" })
+        ]))
+      ]) : null,
+      events.length ? el("section", { class: "workflow-detail-section" }, [
+        el("h3", { text: "最近记录" }),
+        el("ol", { class: "workflow-events" }, events.slice(0, 5).map(event => el("li", {}, [
+          el("span", { text: event.label || event.id }),
+          el("time", { datetime: event.at, text: event.at ? compactTime(event.at) : "时间未记录" })
+        ])))
+      ]) : null,
+      el("p", { class: "workflow-explanation", text: "流程图只定位当前工作，点击节点不会推进业务或批准方案。制作、审查和回改可以按所选资产往返。" })
+    ].filter(Boolean);
+  }
+
+  function openWorkflowDetail(phaseId) {
+    state.workflowDetailPhase = phaseId || state.workflow?.phase_id || null;
+    state.lastFocused = document.activeElement;
+    const workflow = workflowModel();
+    const panel = el("div", { class: "workflow-live-detail", id: "workflow-live-detail" }, workflowDetailContent(workflow));
+    const modal = el("dialog", { class: "workflow-dialog", id: "workflow-dialog", "aria-label": "创作流程与实时工作状态" }, [
+      el("div", { class: "dialog-toolbar" }, [
+        el("div", {}, [el("strong", { text: "工作路线" }), el("p", { class: "meta", text: `${projectName()} · 当前记录` })]),
+        el("button", { type: "button", text: "关闭", onclick: () => modal.close() })
+      ]),
+      el("div", { class: "workflow-dialog-body" }, [
+        el("nav", { class: "workflow-phase-list", "aria-label": "工作阶段" }, workflow.phases.map(phase => el("button", {
+          type: "button", "data-phase-detail": phase.id, "aria-pressed": phase.id === state.workflowDetailPhase ? "true" : "false",
+          onclick: () => {
+            state.workflowDetailPhase = phase.id;
+            modal.querySelectorAll("[data-phase-detail]").forEach(button => button.setAttribute("aria-pressed", button.getAttribute("data-phase-detail") === phase.id ? "true" : "false"));
+            panel.setAttribute("data-signature", "");
+            updateWorkflowStatus();
+          }
+        }, [el("span", { text: phase.label }), el("small", { text: workflowStateLabel(phase.status) })]))),
+        panel
+      ])
+    ]);
+    showDialog(modal);
+  }
+
   function navigation() {
     const selected = catalog.filter(entry => state.assetSelected.has(entry.id));
-    const entries = [["design", "设计工作台"], ["assets", "资产清单"], ["history", "创作记录"]];
+    const entries = [["design", "设计工作台"], ["assets", "资产清单"], ...(livePhoto ? [["live", "Live 实况图"]] : []), ["history", "创作记录"]];
     return el("aside", { class: "project-nav", "aria-label": "项目导航" }, [
       el("div", { class: "brand" }, [el("span", { class: "brandmark", text: "J", "aria-hidden": "true" }), el("span", { text: "Jarden" })]),
       el("div", { class: "project-identity" }, [
@@ -673,10 +857,10 @@
     const planSaved = !current && assetWorkflow && identifiers(assetWorkflow.selected).length > 0;
     return el("div", { class: "taskhead" }, [
       el("div", {}, [
-        el("h1", { text: state.view === "assets" ? "选择这次的资产" : state.view === "history" ? "创作记录" : planSaved ? "本轮资产计划" : current?.heading || (offer?.action === "ask" ? questionField.label : projectName()) }),
-        el("p", { class: "meta", text: state.view === "assets" ? "按用途挑选，可多选。先确定要做什么，再逐项完善。" : state.view === "history" ? "保留每次交付、原始图片与已经确认的决定。" : planSaved ? "范围已保存。核对内部前置后，回到聊天继续。" : offer?.action === "ask" ? questionField.intro : current?.note || "比较本轮方向；确认后再精修细节。" })
+        el("h1", { text: state.view === "live" ? "让已确认的设计，轻轻动起来" : state.view === "assets" ? "选择这次的资产" : state.view === "history" ? "创作记录" : planSaved ? "本轮资产计划" : current?.heading || (offer?.action === "ask" ? questionField.label : projectName()) }),
+        el("p", { class: "meta", text: state.view === "live" ? "原图与微动态保持可追溯。格式校验、图库播放、手机及发布应用分别验收。" : state.view === "assets" ? "按用途挑选，可多选。先确定要做什么，再逐项完善。" : state.view === "history" ? "保留每次交付、原始图片与已经确认的决定。" : planSaved ? "范围已保存。核对内部前置后，回到聊天继续。" : offer?.action === "ask" ? questionField.intro : current?.note || "比较本轮方向；确认后再精修细节。" })
       ]),
-      el("span", { class: "state" + (data.stale || data.missing || data.readonly ? " warning" : ""), text: state.view === "assets" && !state.adopted && !data.stale && !data.readonly ? "资产规划" : statusLabel(draft), role: "status", "aria-live": "polite" })
+      el("span", { class: "state" + (data.stale || data.missing || data.readonly ? " warning" : ""), text: state.view === "live" ? "可选延展" : state.view === "assets" && !state.adopted && !data.stale && !data.readonly ? "资产规划" : statusLabel(draft), role: "status", "aria-live": "polite" })
     ]);
   }
 
@@ -1150,6 +1334,7 @@
   }
 
   function workarea() {
+    if (state.view === "live" && livePhoto) return livePhotoWorkspace();
     if (state.view === "assets" && assetWorkflow) return assetCatalog();
     if (state.view === "history") return el("section", { class: "workarea history-view", id: "current", tabindex: "-1", "aria-label": "创作记录" }, [previousSection(), comparisonSection(), feedbackSection(), picksSection(), archiveSection(), evidenceSection(), maintenanceSection()]);
     if (!current && !data.post) {
@@ -1177,6 +1362,53 @@
       mobileContinue(),
       previousHint(),
       evidenceSection()
+    ]);
+  }
+
+  function livePhotoWorkspace() {
+    const jobs = records(livePhoto.jobs).slice().reverse();
+    const statusNames = {
+      planned: "计划已保存", requesting: "视频请求进行中", unknown: "生成回执待对账",
+      "video-recorded": "视频已登记", "motion-review": "动作待核对", packaged: "配对校验通过",
+      "macos-verified": "Mac Photos 已验收", "iphone-verified": "iPhone 已验收",
+      "publishing-app-verified": "发布应用已验收", stale: "文件变化，需重验", failed: "任务待恢复",
+      "package-failed": "封装待恢复"
+    };
+    const sourcePath = descriptor => typeof descriptor === "string" ? descriptor : !descriptor || descriptor.exists === false || "display_path" in descriptor && !descriptor.path ? null : descriptor.path || null;
+    const media = (descriptor, video) => {
+      const path = sourcePath(descriptor);
+      return path ? video ? el("video", { class: "live-preview", src: imageSource(path), controls: true, playsinline: true, preload: "auto", "aria-label": "微动态视频预览，不是原生实况验收" }) : el("img", { src: imageSource(path), alt: "Live 任务的原图或封面", loading: "eager" }) : el("div", { class: "placeholder", text: video ? "视频待返回" : "来源待核对" });
+    };
+    return el("section", { class: "workarea live-workarea", id: "current", tabindex: "-1", "aria-label": "Live Photo 工作区" }, [
+        ...jobs.map(job => {
+        const packaged = job.package || job.packaged || {};
+        const verification = packaged.verification || job.verification || {};
+        const acceptance = job.acceptance || job.attestations || {};
+        const resourcesCurrent = Boolean(sourcePath(packaged.photo) && sourcePath(packaged.video));
+        const targetPassed = target => {
+          const entry = Array.isArray(acceptance) ? acceptance.find(record => record.target === target) : acceptance[target];
+          return Boolean(resourcesCurrent && entry && entry.live_badge === true && entry.playback_confirmed === true && job.status !== "stale");
+        };
+        const files = [["静态照片", packaged.photo], ["动态 MOV", packaged.video || packaged.movie], ["导入包", packaged.bundle || packaged.archive], ["校验记录", packaged.report || packaged.receipt]];
+        return el("article", { class: "live-job", "data-live-job": job.id }, [
+          el("div", { class: "sectionhead" }, [el("h2", { text: job.title || "成图微动态" }), el("span", { class: "state", text: job.package && !resourcesCurrent ? "资源不可用，需重验" : statusNames[job.status] || "按实际记录核对" })]),
+          el("div", { class: "live-media-grid" }, [
+            el("figure", {}, [el("figcaption", { text: "已确认来源" }), el("div", { class: "live-media" }, [media(job.source, false)])]),
+            el("figure", {}, [el("figcaption", { text: "微动态预览" }), el("div", { class: "live-media" }, [media(job.video || packaged.video, true)])])
+          ]),
+          el("div", { class: "live-checkpoints", "aria-label": "按目标分别验收" }, [
+            ["配对格式", resourcesCurrent && verification.passed_local_validation === true && job.status !== "stale"],
+            ["Mac Photos", targetPassed("macos-photos")], ["iPhone Photos", targetPassed("iphone-photos")],
+            ["发布应用", targetPassed("publishing-app")]
+          ].map(([label, passed]) => el("div", { class: passed ? "verified" : "pending" }, [el("strong", { text: label }), el("span", { text: passed ? "已有通过证据" : "待验收" })]))),
+          el("div", { class: "live-downloads" }, files.filter(([, descriptor]) => sourcePath(descriptor)).map(([label, descriptor]) => el("a", { href: imageSource(sourcePath(descriptor)), download: true, text: `下载${label}` }))),
+          el("p", { class: "meta live-boundary", text: `${job.quality === "final" ? "正片" : "样片"} · ${job.watermark === "preserved" ? "保留官方水印" : job.watermark === "none-with-entitlement" ? "官方资格允许无社区水印" : "水印资格待核对"}。网页播放器只预览视频，不表示手机或发布应用已识别实况。` }),
+          job.error ? el("p", { class: "notice error", text: String(job.error) }) : null,
+          el("details", { class: "technical-evidence" }, [el("summary", { text: "来源、动作与验收证据" }), el("p", { text: job.prompt || "动作计划见项目记录" }), el("pre", { text: JSON.stringify({ id: job.id, status: job.status, verification, acceptance }, null, 2) })])
+        ]);
+      }),
+      !jobs.length ? el("div", { class: "empty", text: "尚无 Live 任务。先在聊天中确认成图和希望保留的微动态。" }) : null,
+      el("p", { class: "meta live-boundary", text: "Live 是静态交付后的可选延展，不会自动发布或写入图库，也不影响原 21 项资产的完成状态。" })
     ]);
   }
 
@@ -1302,14 +1534,15 @@
   function render() {
     const focused = document.activeElement;
     const savedSelection = focused && focused.getAttribute && focused.getAttribute("data-item-id");
-    const planOverviewOnly = state.view === "design" && !current && assetWorkflow && identifiers(assetWorkflow.selected).length > 0;
+    const planOverviewOnly = state.view === "live" || state.view === "design" && !current && assetWorkflow && identifiers(assetWorkflow.selected).length > 0;
     app.replaceChildren(el("div", { class: "studio-layout" }, [
       navigation(),
-      el("div", { class: "studio-main" }, [header(), el("main", { class: "content", "aria-label": "创作内容" }, [
+      el("div", { class: "studio-main" }, [el("div", { class: "studio-chrome" }, [header(), workflowDock()]), el("main", { class: "content", "aria-label": "创作内容" }, [
         taskHeading(), el("div", { id: "live-sync-status", "aria-live": "polite" }, syncNotice()), ...notices(),
         el("div", { class: "workspace" + (state.view === "history" ? " history-workspace" : planOverviewOnly ? " plan-workspace" : "") }, [workarea(), state.view === "history" || planOverviewOnly ? null : sidebar()])
       ])])
     ]));
+    updateWorkflowStatus();
     if (savedSelection) {
       document.querySelector(`input[data-item-id="${CSS.escape(savedSelection)}"]`)?.focus({ preventScroll: true });
     }

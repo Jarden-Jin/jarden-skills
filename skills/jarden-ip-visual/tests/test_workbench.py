@@ -20,6 +20,7 @@ import threading
 import time
 import unittest
 from unittest import mock
+from urllib.parse import urlsplit
 import uuid
 import zlib
 
@@ -130,6 +131,7 @@ class WorkbenchTests(unittest.TestCase):
         self.addCleanup(close)
         origin = f"http://127.0.0.1:{server.server_port}"
         return {"pid": os.getpid(), "project": str(scope), "origin": origin,
+                "runtime_signature": workbench.server_runtime_signature(),
                 "url": origin + "/gallery.html#token=" + token}
 
     def track_launch(self, command, **options):
@@ -661,6 +663,26 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(result["link_check"]["target"], info["url"])
         self.assertEqual(result["interaction"]["mode"], "interactive")
 
+    def test_registered_resources_support_browser_media_byte_ranges(self):
+        self.run_workbench()
+        info = self.live_server()
+        address = urlsplit(info["origin"])
+        original = (self.root / "gallery.html").read_bytes()
+        for header, expected in (("bytes=0-31", original[:32]), ("bytes=-16", original[-16:])):
+            with self.subTest(header=header), contextlib.closing(http.client.HTTPConnection(address.hostname, address.port, timeout=2)) as connection:
+                connection.request("GET", "/gallery.html", headers={"Range": header})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 206)
+                self.assertEqual(response.getheader("Accept-Ranges"), "bytes")
+                self.assertEqual(response.read(), expected)
+        for header in ("bytes=999999999999-", "bytes=2-1", "bytes=0-1,3-4", "bytes=-0"):
+            with self.subTest(header=header), contextlib.closing(http.client.HTTPConnection(address.hostname, address.port, timeout=2)) as connection:
+                connection.request("GET", "/gallery.html", headers={"Range": header})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 416)
+                self.assertEqual(response.getheader("Content-Range"), f"bytes */{len(original)}")
+                self.assertEqual(response.read(), b"")
+
     def test_live_pid_alone_is_not_health_and_never_killed(self):
         other = self.home / "other"
         other.mkdir()
@@ -684,6 +706,7 @@ class WorkbenchTests(unittest.TestCase):
             ({**info, "project": str(self.home)}, 0o600),
             ({**info, "project_id": "wrong"}, 0o600),
             ({**info, "expires_at": time.time() - 1}, 0o600),
+            ({**info, "runtime_signature": {"serve_gallery.py": "outdated"}}, 0o600),
             ({**info, "pid": True}, 0o600),
             ({**info, "url": info["origin"] + "/gallery.html#token=wrong"}, 0o600),
             (info, 0o644),

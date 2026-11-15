@@ -1,0 +1,287 @@
+{
+  "schema_version": 1,
+  "kind": "archify-workflow-sidecar",
+  "phase_order": [
+    "intake",
+    "scope",
+    "create",
+    "review",
+    "confirm",
+    "deliver"
+  ],
+  "phases": [
+    {
+      "id": "intake",
+      "label": "理解需求",
+      "detail": "原稿与已知信息",
+      "actor": "agent",
+      "user_confirmation_only": false,
+      "selector": "g[data-flow-node='intake']",
+      "sources": [
+        {
+          "path": "skills/jarden-ip-visual/scripts/project.py",
+          "line": 827,
+          "end_line": 860,
+          "label": "保存真实输入与恢复信息"
+        },
+        {
+          "path": "skills/jarden-ip-visual/scripts/project.py",
+          "line": 868,
+          "end_line": 887,
+          "label": "保存需求字段"
+        }
+      ]
+    },
+    {
+      "id": "scope",
+      "label": "选择资产",
+      "detail": "本轮所选范围",
+      "actor": "agent",
+      "user_confirmation_only": false,
+      "selector": "g[data-flow-node='scope']",
+      "sources": [
+        {
+          "path": "skills/jarden-ip-visual/scripts/asset_workflow.py",
+          "line": 146,
+          "end_line": 185,
+          "label": "登记本轮资产范围与依据"
+        },
+        {
+          "path": "skills/jarden-ip-visual/scripts/asset_workflow.py",
+          "line": 765,
+          "end_line": 775,
+          "label": "仅按所选范围判断完成"
+        }
+      ]
+    },
+    {
+      "id": "create",
+      "label": "设计制作",
+      "detail": "按需制作与复用",
+      "actor": "agent",
+      "user_confirmation_only": false,
+      "selector": "g[data-flow-node='create']",
+      "sources": [
+        {
+          "path": "skills/jarden-ip-visual/scripts/asset_workflow.py",
+          "line": 474,
+          "end_line": 526,
+          "label": "范围、候选与已有任务恢复"
+        },
+        {
+          "path": "skills/jarden-ip-visual/scripts/asset_workflow.py",
+          "line": 528,
+          "end_line": 580,
+          "label": "必要依赖与真实生成计划"
+        }
+      ]
+    },
+    {
+      "id": "review",
+      "label": "质量审查",
+      "detail": "按项验收与返修",
+      "actor": "agent",
+      "user_confirmation_only": false,
+      "selector": "g[data-flow-node='review']",
+      "sources": [
+        {
+          "path": "skills/jarden-ip-visual/scripts/asset_workflow.py",
+          "line": 400,
+          "end_line": 453,
+          "label": "当前文件、来源与审查资格"
+        },
+        {
+          "path": "skills/jarden-ip-visual/scripts/asset_workflow.py",
+          "line": 603,
+          "end_line": 641,
+          "label": "不通过保留为待返修"
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "label": "确认方案",
+      "detail": "仅用户明确采用",
+      "actor": "user",
+      "user_confirmation_only": true,
+      "selector": "g[data-flow-node='confirm']",
+      "sources": [
+        {
+          "path": "skills/jarden-ip-visual/scripts/asset_workflow.py",
+          "line": 644,
+          "end_line": 672,
+          "label": "采用来源须为用户确认且资格通过"
+        },
+        {
+          "path": "skills/jarden-ip-visual/scripts/asset_workflow.py",
+          "line": 894,
+          "end_line": 915,
+          "label": "返修意向不等于生成授权或批准"
+        },
+        {
+          "path": "skills/jarden-ip-visual/scripts/project.py",
+          "line": 1845,
+          "end_line": 1859,
+          "label": "保存反馈、保持项与比较基线"
+        }
+      ]
+    },
+    {
+      "id": "deliver",
+      "label": "整理交付",
+      "detail": "按所选资产交付",
+      "actor": "agent",
+      "user_confirmation_only": false,
+      "selector": "g[data-flow-node='deliver']",
+      "sources": [
+        {
+          "path": "skills/jarden-ip-visual/scripts/asset_workflow.py",
+          "line": 706,
+          "end_line": 738,
+          "label": "仅导出合格且已批准的所选资产"
+        },
+        {
+          "path": "skills/jarden-ip-visual/scripts/asset_workflow.py",
+          "line": 765,
+          "end_line": 775,
+          "label": "合格导出后结束，不补未选资产"
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "intake:scope",
+      "from": "intake",
+      "to": "scope",
+      "kind": "reading-order",
+      "label": "",
+      "user_confirmation_only": false
+    },
+    {
+      "id": "scope:create",
+      "from": "scope",
+      "to": "create",
+      "kind": "reading-order",
+      "label": "",
+      "user_confirmation_only": false
+    },
+    {
+      "id": "create:review",
+      "from": "create",
+      "to": "review",
+      "kind": "reading-order",
+      "label": "",
+      "user_confirmation_only": false
+    },
+    {
+      "id": "review:confirm",
+      "from": "review",
+      "to": "confirm",
+      "kind": "reading-order",
+      "label": "合格候选",
+      "user_confirmation_only": false
+    },
+    {
+      "id": "confirm:deliver",
+      "from": "confirm",
+      "to": "deliver",
+      "kind": "reading-order",
+      "label": "用户采用",
+      "user_confirmation_only": true
+    },
+    {
+      "id": "review:create",
+      "from": "review",
+      "to": "create",
+      "kind": "rework",
+      "label": "审查需修改",
+      "user_confirmation_only": false
+    },
+    {
+      "id": "confirm:create",
+      "from": "confirm",
+      "to": "create",
+      "kind": "rework",
+      "label": "用户要求返修",
+      "user_confirmation_only": false
+    }
+  ],
+  "runtime": {
+    "source": "workflow_status",
+    "phase": null,
+    "status": null,
+    "static_map_encodes_progress": false,
+    "main_chain_is_mandatory": false,
+    "infer_completed_from_position": false,
+    "note": "仅由宿主的真实状态标注当前节点；没有数据时保持中性。状态值由宿主接口定义。"
+  },
+  "dom_contract": {
+    "root": "#jarden-flow-map",
+    "node": "g[data-flow-node='{phase}']",
+    "node_state_attribute": "data-flow-state",
+    "node_state_values": [
+      "current",
+      "done",
+      "pending",
+      "blocked"
+    ],
+    "initial_node_state": null,
+    "connection": "g[data-flow-connection='{from}:{to}']",
+    "edge": "path[data-flow-edge='{from}:{to}']",
+    "arrow": "polygon[data-flow-arrow='{from}:{to}']",
+    "edge_label": "g[data-flow-edge-label='{from}:{to}']",
+    "node_css_variables": [
+      "--jarden-flow-node-fill",
+      "--jarden-flow-node-stroke",
+      "--jarden-flow-node-text",
+      "--jarden-flow-node-muted"
+    ],
+    "connection_css_variables": [
+      "--jarden-flow-edge-color"
+    ],
+    "root_css_variables": [
+      "--jarden-flow-surface",
+      "--jarden-flow-background",
+      "--jarden-flow-stroke",
+      "--jarden-flow-text",
+      "--jarden-flow-muted",
+      "--jarden-flow-line",
+      "--jarden-flow-edge-text"
+    ],
+    "note": "节点变量设在 node 组；连线变量设在 connection 组以同步线和箭头。文字组也可单独覆盖。"
+  },
+  "rendering": {
+    "width": 1100,
+    "height": 110,
+    "view_box": [
+      40,
+      0,
+      777,
+      77.7
+    ],
+    "minimum_projected_font_px": 14.157,
+    "minimum_projected_font_px_at_890": 11.4543,
+    "scripts": false,
+    "external_resources": false
+  },
+  "provenance": {
+    "generator": "Archify",
+    "version": "3.2.0",
+    "diagram_type": "workflow",
+    "native_schema_version": 2,
+    "repository_revision": "81a8c1b9e579ac0aeda97c882f073f795e87c544",
+    "native_html": "jarden-workflow.html",
+    "candidate_sha256": "a8a66310660ccfa10bb34b13b163197cd2bcb9a44e35c92c93660a97d0bd1675",
+    "native_html_sha256": "f7840b778ad0386a0fb8812a4ae5612c40f21e5834adef8ca028c7cdc4935174",
+    "svg_sha256": "39ee306ea3f895a5c038f6814beaee6cc97dc7d05483fa8e94d25130814f2c48",
+    "native_finalize": {
+      "validate": "pass",
+      "deliver": "pass",
+      "check": "pass",
+      "browser-check": "pass"
+    },
+    "native_diagnostics": 0,
+    "derivation": "从已验证原生 HTML 复制图形和文字，压缩节点高度及返修回路；保留完整原生 HTML 作为详情。原生 finalize 结论仅绑定原生 HTML；派生 SVG 另做结构、DOM 与浏览器尺寸检查。"
+  }
+}

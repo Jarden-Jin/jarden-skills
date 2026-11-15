@@ -22,6 +22,7 @@ import physics_review
 import product_contract
 import scene_plan
 import update_runtime
+import workflow_status
 
 TEMPLATE = Path(__file__).resolve().parent.parent / "assets" / "gallery.html"
 ASSETS = TEMPLATE.parent
@@ -475,6 +476,11 @@ def build_data(root: Path, project: dict[str, Any], *, prefer_latest: bool = Tru
         result["next"] = workflow.get("next") or state.next_action(project, root)
         result["stage"] = "assets"
         result["missing"] = sum(not item.get("exists") for item in (result["current"] or {}).get("items", []))
+    if project.get("live_photo"):
+        import live_photo_workflow
+        result["live_photo"] = live_photo_workflow.view(root, project)
+    result["workflow_status"] = workflow_status.build_status(
+        root, project, next_action=result["next"], asset_view=result.get("asset_workflow"), gallery_view=result)
     return result
 
 
@@ -601,6 +607,12 @@ def delivery_data(root: Path, project: dict[str, Any], manifest: dict[str, Any])
     data["stale"] = project.get("revision", 0) != manifest.get("project_revision") or (project.get("presentations") or {}).get("latest_delivery_id", manifest["delivery_id"]) != manifest["delivery_id"]
     data["live_revision"] = project.get("revision", 0)
     data["receipts"] = decision_receipts(root, manifest["delivery_id"])
+    if "workflow_status" not in data:
+        data["workflow_status"] = {
+            **workflow_status.build_status(root, project),
+            "snapshot_separate": True, "snapshot_revision": manifest.get("project_revision"),
+            "snapshot_delivery_id": manifest["delivery_id"],
+        }
     def verify_projection(value: Any) -> Any:
         if isinstance(value, list):
             return [verify_projection(child) for child in value]
@@ -612,7 +624,7 @@ def delivery_data(root: Path, project: dict[str, Any], manifest: dict[str, Any])
             except VIEW_ERRORS:
                 return {**value, "path": None, "exists": False, "disabled_reason": "冻结图片待补；未用当前图片替代"}
         return {key: verify_projection(child) for key, child in value.items()}
-    for key in ("product_contract", "scene_plan", "asset_workflow"):
+    for key in ("product_contract", "scene_plan", "asset_workflow", "live_photo"):
         if key in data:
             data[key] = verify_projection(data[key])
     verified = delivery_summary(root, manifest)
@@ -675,6 +687,8 @@ def render(data: dict[str, Any]) -> str:
     payload = json.dumps(data, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     if "__GALLERY_DATA__" not in template:
         raise state.ProjectError("assets/gallery.html 缺少数据占位符")
+    if "__WORKFLOW_MAP__" in template:
+        template = template.replace("__WORKFLOW_MAP__", (ASSETS / "workflow-map.svg").read_text(encoding="utf-8"))
     return template.replace("__GALLERY_CSS__", (ASSETS / "gallery.css").read_text(encoding="utf-8")).replace("__GALLERY_JS__", (ASSETS / "gallery.js").read_text(encoding="utf-8")).replace("__GALLERY_DATA__", payload)
 
 

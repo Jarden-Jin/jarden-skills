@@ -204,11 +204,18 @@ class Element {
   }
   setAttribute(key, value) { this.attributes[key] = value; }
   getAttribute(key) { return this.attributes[key]; }
+  removeAttribute(key) { delete this.attributes[key]; }
   addEventListener(event, handler) { this.listeners[event] = handler; }
   appendChild(child) { this.children.push(child); return child; }
   replaceChildren(...children) { this.children = children; }
   showModal() { this.setAttribute("open", ""); }
   scrollIntoView() {}
+  querySelectorAll(selector) {
+    const attribute = selector.match(/\[([^=\]]+)(?:="([^"]*)")?\]/);
+    const className = selector.match(/^\.([\w-]+)/)?.[1];
+    return walk(this).filter(node => (!attribute || (attribute[2] === undefined ? node.attributes[attribute[1]] !== undefined : node.attributes[attribute[1]] === attribute[2])) && (!className || node.className === className));
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
 }
 const app = new Element("main");
 const walk = node => [node, ...node.children.flatMap(walk)];
@@ -441,6 +448,26 @@ const settle = async () => { for (let turn = 0; turn < 30; turn++) await Promise
                                      "dir": "rounds/02-concept-s1", "status": "recorded", "missing": []})
             project.write_json(target / "round.json", round_data)
             project.save_project(self.root, latest)
+
+    def test_live_freeze_checks_declared_sha256_before_binding_acceptance(self):
+        original = self.root / "inputs" / "source.png"
+        actual = hashlib.sha256(original.read_bytes()).hexdigest()
+        entry = {"id": "live-frozen-fixture", "status": "macos-verified", "package": {"photo": {"path": "inputs/source.png", "sha256": actual}}}
+        with mock.patch.object(present_round, "snapshot_image", return_value=("artifacts/sha256/changed.jpg", "f" * 64)):
+            with self.assertRaises(project.ProjectError):
+                present_round.freeze_view(self.root, {"live_photo": {"jobs": [entry]}})
+
+    def test_stale_live_resources_do_not_block_static_snapshot(self):
+        original = self.root / "inputs" / "source.png"
+        actual = hashlib.sha256(original.read_bytes()).hexdigest()
+        entry = {"id": "live-stale-fixture", "status": "stale", "recorded_status": "macos-verified", "stale": True,
+                 "source": {"path": "inputs/no-longer-present.png", "sha256": "f" * 64},
+                 "acceptance": {"macos-photos": {"verified": False}}}
+        frozen, hashes = present_round.freeze_view(self.root, {"live_photo": {"jobs": [entry]}, "static": {"path": "inputs/source.png", "sha256": actual}})
+        self.assertTrue(frozen["static"]["exists"])
+        self.assertIsNone(frozen["live_photo"]["jobs"][0]["source"]["path"])
+        self.assertFalse(frozen["live_photo"]["jobs"][0]["source"]["exists"])
+        self.assertEqual(hashes, {"inputs/source.png": actual})
 
     def test_snapshot_is_immutable_and_revision_does_not_change(self):
         project_state = self.data()

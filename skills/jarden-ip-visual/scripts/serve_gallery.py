@@ -18,12 +18,34 @@ from socketserver import TCPServer
 from urllib.parse import unquote, urlsplit
 
 import project as state
+import workflow_status
 
 
 class LoopbackHTTPServer(ThreadingHTTPServer):
+    def __init__(self, *args, **kwargs):
+        self.last_activity = time.monotonic()
+        self._activity_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
+
     def server_bind(self) -> None:
         TCPServer.server_bind(self)
         self.server_name, self.server_port = self.server_address[:2]
+
+    def record_activity(self) -> None:
+        with self._activity_lock:
+            self.last_activity = time.monotonic()
+
+    def idle_seconds(self) -> float:
+        with self._activity_lock:
+            return time.monotonic() - self.last_activity
+
+
+def watch_idle(server: LoopbackHTTPServer, timeout: float, stopped: threading.Event) -> None:
+    timeout = max(1.0, timeout)
+    while not stopped.wait(min(1.0, timeout / 4)):
+        if server.idle_seconds() >= timeout:
+            server.shutdown()
+            return
 
 
 def resources(root: Path) -> set[str]:
@@ -94,7 +116,10 @@ def server_for(root: Path, token: str, port: int = 0) -> ThreadingHTTPServer:
                             latest = (project.get("presentations") or {}).get("latest_delivery_id")
                             manifest = state.read_json(root / "deliveries" / latest / "manifest.json") if latest else None
                             payload = state.status_payload(project, root=root)
+                            payload["workflow_status"] = workflow_status.build_status(
+                                root, project, next_action=payload["next"], asset_view=payload.get("asset_workflow"))
                             payload.update(latest_delivery_id=latest, delivery_id=latest, manifest=manifest, receipts=project.get("decision_receipts") or {})
+                            self.server.record_activity()
                         elif route.startswith("/api/receipt/"):
                             request_id = route.removeprefix("/api/receipt/")
                             if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", request_id):
@@ -117,7 +142,31 @@ def server_for(root: Path, token: str, port: int = 0) -> ThreadingHTTPServer:
             except (state.ProjectError, OSError, ValueError):
                 self.json_response(404, {"ok": False, "error": "resource_not_found"})
                 return
-            self.send_response(200)
+            total_bytes = len(data)
+            start, end = 0, total_bytes - 1
+            range_header = self.headers.get("Range")
+            if range_header:
+                match = re.fullmatch(r"bytes=(\d{0,18})-(\d{0,18})", range_header)
+                if match and (match[1] or match[2]) and total_bytes:
+                    if match[1]:
+                        start = int(match[1])
+                        end = min(int(match[2]), end) if match[2] else end
+                    else:
+                        start = max(0, total_bytes - int(match[2]))
+                    valid = 0 <= start <= end < total_bytes
+                else:
+                    valid = False
+                if not valid:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{total_bytes}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                data = data[start:end + 1]
+            self.send_response(206 if range_header else 200)
+            self.send_header("Accept-Ranges", "bytes")
+            if range_header:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{total_bytes}")
             self.send_header("Content-Type", mimetypes.guess_type(target.name)[0] or "application/octet-stream")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
@@ -142,6 +191,7 @@ def server_for(root: Path, token: str, port: int = 0) -> ThreadingHTTPServer:
                 result = state.submit_decision(root, payload)
                 if state.receipt(root, result["request_id"]) != result:
                     raise state.ProjectError("receipt_readback_failed")
+                self.server.record_activity()
                 import workbench
                 try:
                     presented = workbench.ensure_presentation(root)
@@ -199,16 +249,17 @@ def main() -> int:
                 state.atomic_json(ready, info)
                 ready.chmod(0o600)
             print(json.dumps(info, ensure_ascii=False), flush=True)
-            timer = threading.Timer(max(1, args.idle_timeout), server.shutdown)
-            timer.daemon = True
-            timer.start()
+            stopped = threading.Event()
+            watcher = threading.Thread(target=watch_idle, args=(server, args.idle_timeout, stopped), daemon=True)
+            watcher.start()
             try:
                 startup_stage("serving")
                 server.serve_forever(poll_interval=0.2)
             except KeyboardInterrupt:
                 pass
             finally:
-                timer.cancel()
+                stopped.set()
+                watcher.join(timeout=2)
                 server.server_close()
             return 0
     except (state.ProjectError, OSError, ValueError) as error:

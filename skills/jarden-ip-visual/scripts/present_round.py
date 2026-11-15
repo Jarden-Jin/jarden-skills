@@ -42,7 +42,7 @@ def snapshot_image(root: Path, original: str) -> tuple[str | None, str | None]:
                 digest.update(chunk)
                 target.write(chunk)
         image_hash = digest.hexdigest()
-        suffix = source.suffix.lower() if source.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".md", ".json", ".pdf", ".zip"} else ".img"
+        suffix = source.suffix.lower() if source.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".md", ".json", ".pdf", ".zip", ".mov", ".mp4"} else ".img"
         relative = f"artifacts/sha256/{image_hash}{suffix}"
         destination = gallery.project_path(root, relative)
         if destination.exists():
@@ -63,18 +63,30 @@ def freeze_view(root: Path, data: dict[str, Any]) -> tuple[dict[str, Any], dict[
             return [visit(child) for child in value]
         if not isinstance(value, dict):
             return value
+        if value.get("stale") is True and "recorded_status" in value and str(value.get("id", "")).startswith("live-"):
+            return {key: (None if key == "path" else visit_stale(child)) for key, child in value.items()}
         frozen = {key: visit(child) for key, child in value.items()}
         original = value.get("path")
         if isinstance(original, str) and original and not original.endswith(".html"):
             if original not in captured:
                 captured[original] = snapshot_image(root, original)
             display, digest = captured[original]
-            if value.get("image_sha256") and digest != value["image_sha256"]:
+            if any(value.get(field) and digest != value[field] for field in ("image_sha256", "sha256")):
                 raise state.ProjectError("图片在生成交付时发生变化，请重新 present")
             frozen.update(original_path=original, path=display, display_path=display, image_sha256=digest, exists=bool(display))
             if not display:
                 frozen.update(selectable=False, disabled_reason=value.get("disabled_reason") or "图片缺失，不能采用")
         return frozen
+
+    def visit_stale(value: Any) -> Any:
+        if isinstance(value, list):
+            return [visit_stale(child) for child in value]
+        if not isinstance(value, dict):
+            return value
+        result = {key: visit_stale(child) for key, child in value.items()}
+        if "path" in result:
+            result.update(path=None, exists=False, disabled_reason="Live 来源或资源已变化；保留记录，重新核对后再交付")
+        return result
 
     return visit(data), {path: digest for path, (_, digest) in captured.items() if digest}
 

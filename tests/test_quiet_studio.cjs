@@ -34,6 +34,7 @@ function environment(input, options = {}) {
     }
     setAttribute(name, value) { this.attributes[name] = value; if (name === "disabled") this.disabled = true; }
     getAttribute(name) { return this.attributes[name]; }
+    removeAttribute(name) { delete this.attributes[name]; }
     addEventListener(name, handler) { this.listeners[name] = handler; }
     appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
     replaceChildren(...children) { this.children.forEach(child => { child.parentElement = null; }); this.children = []; children.forEach(child => this.appendChild(child)); }
@@ -157,6 +158,22 @@ function baseData(overrides = {}) {
   };
 }
 
+function workStatus(overrides = {}) {
+  return {
+    schema_version: 1, project_id: "quiet-studio-fixture", revision: 8,
+    phase_id: "confirm", status: "waiting", title: "等待确认材质", detail: "比较本轮两个方向后确认。",
+    actor: "user", phases: [
+      { id: "intake", label: "理解需求", status: "done" },
+      { id: "scope", label: "选择资产", status: "done" },
+      { id: "create", label: "设计制作", status: "done" },
+      { id: "review", label: "质量审查", status: "done" },
+      { id: "confirm", label: "确认方案", status: "current" },
+      { id: "deliver", label: "整理交付", status: "pending" }
+    ], tasks: [], blockers: [], recent_events: [], counts: { selected: 2, approved: 0, pending: 2 },
+    ...overrides
+  };
+}
+
 async function run() {
   const staticPage = environment(baseData());
   await settle();
@@ -165,6 +182,29 @@ async function run() {
   assert.equal(staticPage.nodes("[data-submit-action]").length, 0);
   assert.equal(staticPage.requests.length, 0);
   assert.equal(staticPage.timers.size, 0);
+  const livePreview = environment(baseData({ current: null, live_photo: { jobs: [{
+    id: "live-fixture", status: "macos-verified", source: { path: "source.png" }, video: { path: "motion.mp4" },
+    package: { photo: { path: "live.jpg" }, video: { path: "live.mov" }, verification: { passed_local_validation: true } },
+    acceptance: { "macos-photos": { live_badge: true, playback_confirmed: true } }, quality: "draft", watermark: "preserved"
+  }] } }));
+  await settle();
+  assert.equal(livePreview.nodes("video").length, 1);
+  assert.equal(livePreview.nodes(".live-checkpoints")[0].children.filter(node => node.className === "verified").length, 2);
+  assert.match(livePreview.text(), /Mac Photos 已验收/);
+  assert.match(livePreview.text(), /网页播放器只预览视频/);
+  assert.match(livePreview.text(), /iPhone Photos/);
+  assert.match(livePreview.text(), /待验收/);
+  assert.equal(livePreview.posts.length, 0);
+  const corruptDescriptor = { path: null, display_path: "corrupt-resource.jpg", exists: false };
+  const corruptLive = environment(baseData({ current: null, live_photo: { jobs: [{
+    id: "live-corrupt", status: "macos-verified", source: corruptDescriptor, video: { ...corruptDescriptor, display_path: "corrupt-video.mp4" },
+    package: { photo: corruptDescriptor, video: { ...corruptDescriptor, display_path: "corrupt-movie.mov" }, archive: { ...corruptDescriptor, display_path: "corrupt-live.zip" }, verification: { passed_local_validation: true } },
+    acceptance: { "macos-photos": { live_badge: true, playback_confirmed: true } }
+  }] } }));
+  assert.equal(corruptLive.nodes("video").length, 0, "corrupt snapshots must not restore display_path into video URLs");
+  assert.equal(corruptLive.nodes(".live-checkpoints")[0].children.filter(node => node.className === "verified").length, 0);
+  assert.match(corruptLive.text(), /资源不可用，需重验/);
+  assert.ok(!corruptLive.nodes("a").some(node => String(node.getAttribute("href")).includes("corrupt-")));
   assert.equal(staticPage.document.getElementById("technical-evidence").attributes.open, undefined);
   await staticPage.change('input[data-item-id="B"]', "B");
   staticPage.input("decision-note", "脸部再干净一些");
@@ -295,6 +335,47 @@ async function run() {
   assert.ok(environment(baseData(), { storage: malformedDraft }).text());
 
   const updatePayload = (revision = 9, manifestRevision = revision) => ({ project_id: "quiet-studio-fixture", revision, manifest: baseData({ delivery_id: "D0043", project_revision: manifestRevision }), receipts: {} });
+  const statusPage = environment(baseData({ workflow_status: workStatus() }), { interactive: true });
+  await settle();
+  assert.match(statusPage.text(), /等待确认材质/);
+  assert.equal(statusPage.nodes('[data-flow-node="confirm"]')[0].getAttribute("aria-current"), "step");
+  statusPage.input("decision-note", "状态刷新时保留我输入的内容");
+  const statusInput = statusPage.document.getElementById("decision-note");
+  const statusWorkspace = statusPage.app.children[0];
+  const runningStatus = workStatus({
+    phase_id: "create", status: "working", actor: "agent", title: "正在制作平涂图", detail: "原生生图请求已发出。",
+    phases: workStatus().phases.map(phase => ({ ...phase, status: phase.id === "create" ? "current" : phase.id === "confirm" || phase.id === "review" ? "pending" : phase.status })),
+    tasks: [{ id: "task-a", label: "平涂方向 A", status: "requesting" }]
+  });
+  const statusPayload = workflowStatus => ({ project_id: "quiet-studio-fixture", revision: 8, manifest: baseData(), workflow_status: workflowStatus, receipts: {} });
+  statusPage.setLive(statusPayload(runningStatus));
+  await statusPage.poll();
+  assert.equal(statusPage.app.children[0], statusWorkspace, "task state updates must not remount the workspace");
+  assert.equal(statusPage.document.getElementById("decision-note"), statusInput);
+  assert.equal(statusPage.document.activeElement, statusInput);
+  assert.equal(statusInput.value, "状态刷新时保留我输入的内容");
+  assert.match(statusPage.text(), /正在制作平涂图/);
+  assert.equal(statusPage.nodes('[data-flow-node="confirm"]')[0].getAttribute("aria-current"), undefined);
+  assert.equal(statusPage.nodes('[data-flow-node="create"]')[0].getAttribute("aria-current"), "step");
+  assert.equal(statusPage.navigations.length, 0, "task updates at the same revision must not reload");
+  await statusPage.click(statusPage.button("工作详情"));
+  const statusDialog = statusPage.nodes("dialog")[0];
+  statusPage.setLive(statusPayload(workStatus({
+    phase_id: "create", status: "blocked", title: "生成结果待核对", detail: "保留请求，先核对真实输出。",
+    tasks: [{ id: "task-a", label: "平涂方向 A", status: "unknown" }],
+    blockers: [{ id: "task-a", label: "结果未决", detail: "不得重复发送生成请求。" }]
+  })));
+  await statusPage.poll();
+  assert.equal(statusPage.nodes("dialog")[0], statusDialog, "live status must preserve an open workflow dialog");
+  assert.match(content(statusDialog), /生成结果待核对/);
+  assert.match(content(statusDialog), /不得重复发送/);
+  assert.equal(statusPage.posts.length, 0, "inspecting the map must not write decisions");
+  statusDialog.close();
+  const staticStatus = environment(baseData({ workflow_status: workStatus() }));
+  await settle();
+  assert.match(staticStatus.text(), /快照状态/);
+  assert.equal(staticStatus.requests.length, 0);
+
   const live = environment(baseData(), { interactive: true });
   await settle();
   const unchangedTree = live.app.children[0];

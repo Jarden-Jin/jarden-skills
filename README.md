@@ -6,7 +6,7 @@ Jarden 的可复用 Skill 集合，用于把创作与交付流程整理成可重
 
 | Skill | 用途 |
 | --- | --- |
-| [jarden-ip-visual](skills/jarden-ip-visual/README.md) | 把原创 IP 草图、灵感参考或文字，按需做成设计过程、标准规范、产品效果或宣发资产。先从四组 21 项目录选范围，再用「纯白工作室」HTML 工作台比较和确认，不强制走完商品场景或发帖流程。 |
+| [jarden-ip-visual](skills/jarden-ip-visual/README.md) | 从四组 21 项目录按需制作原创 IP 设计与宣发资产，用常驻 Archify 工作台跟踪真实状态；可选将确认成图延展为 Live Photo，分别记录配对、图库播放和设备验收，不强制商品或发帖流水线。 |
 
 ## 安装
 

@@ -785,6 +785,9 @@ def status_payload(project: dict[str, Any], note: str = "", root: Path | None = 
     import asset_workflow
     if asset_workflow.is_enabled(project):
         payload["asset_workflow"] = asset_workflow.view(root, project)
+    if project.get("live_photo"):
+        import live_photo_workflow
+        payload["live_photo"] = live_photo_workflow.view(root, project)
     return payload
 
 
@@ -2045,6 +2048,8 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.set_defaults(func=cmd_resolve_intent)
     import asset_workflow
     asset_workflow.add_parser(sub)
+    import live_photo_workflow
+    live_photo_workflow.add_parser(sub)
     return parser
 
 
@@ -2053,6 +2058,8 @@ def command_changes_state(args: argparse.Namespace) -> bool:
         return False
     if args.command == "assets":
         return args.action not in {"catalog", "status", "next"}
+    if args.command == "live":
+        return args.action != "status"
     if args.command == "task":
         return args.action != "status"
     return True
@@ -2061,6 +2068,8 @@ def command_changes_state(args: argparse.Namespace) -> bool:
 def command_needs_presentation(args: argparse.Namespace) -> bool:
     if args.command == "assets":
         return args.action in {"new", "approve", "export"}
+    if args.command == "live":
+        return args.action in {"plan", "begin", "package", "attest"}
     if args.command == "task":
         return args.action == "begin"
     return args.command in {"new-round", "select", "accept-input", "final"}
@@ -2083,7 +2092,8 @@ def execute_command(args: argparse.Namespace) -> int:
     changes_state = command_changes_state(args)
     needs_presentation = command_needs_presentation(args)
     native_claim = args.command == "task" and args.action == "begin"
-    if native_claim:
+    live_claim = args.command == "live" and args.action == "begin"
+    if native_claim or live_claim:
         try:
             require_current_presentation(root)
         except (ProjectError, OSError, ValueError) as error:
@@ -2096,13 +2106,13 @@ def execute_command(args: argparse.Namespace) -> int:
             with project_lock(root):
                 if args.command not in {"init", "show"}:
                     current = load_project(root, writable=True)
-                    if native_claim:
+                    if native_claim or live_claim:
                         latest = (current.get("presentations") or {}).get("latest_delivery_id")
                         manifest = read_json(project_path(root, f"deliveries/{latest}/manifest.json")) if latest else {}
                         if manifest.get("project_revision") != current.get("revision", 0):
                             raise ProjectError("presentation_required：领取生图任务前项目已变化；先恢复工作台")
                 code = args.func(args)
-                if needs_presentation and not native_claim and not code:
+                if needs_presentation and not native_claim and not live_claim and not code:
                     pending = _TRANSACTION.get()["writes"]
                     staged = copy.deepcopy(pending)
                     pending.clear()

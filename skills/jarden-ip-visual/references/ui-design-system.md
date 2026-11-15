@@ -40,6 +40,14 @@
 - 用户确认：放大、导出和维护请求均使用原生 dialog；Escape 与遮罩关闭，关闭后恢复触发焦点，重复打开不积累旧弹窗。
 - Agent 推断：只使用安静的边框与底色过渡，提交中禁用冲突动作；成功仅在 committed 回执读回后显示。
 
+## 常驻工作状态
+- 用户确认：沿用纯白工作室，用 Archify 工作路线常驻表达编辑者当前阶段、下一步和阻塞；不再用所浏览页签推断业务进度。
+- Agent 推断：顶部固定区域由紧凑身份栏、当前工作摘要和横向流程图组成；滚动与切换内容时保留。手机只保留摘要，通过工作详情查看六个阶段。
+- Agent 推断：流程图素材为 `skills/jarden-ip-visual/assets/workflow-map.svg`，来自校验过的 Archify 原生工作流；只表达路线，不强制每次完整经历六阶段。
+- Agent 推断：当前、已有完成记录、待推进、待处理同时使用文字与颜色表达；只有真实正在请求的任务才显示执行动效。
+- Agent 推断：`workflow_status` 来自项目与任务记录，与不可变交付画面分离；输入和弹窗期间更新状态区，保留编辑控件、焦点与滚动。
+- Agent 推断：点击流程节点打开只读详情，包含任务、阻塞及最近记录；连接中断明确显示上次状态，静态页不声称实时。
+
 ## 前端接线
 - Agent 推断：服务端可在 asset_workflow.submit_actions 数组声明已接通的动作；未声明时不发送资产写入请求。
 - Agent 推断：choose-assets 附 asset_ids；approve-asset 附 asset_id 与 instance_id；asset-intent 另附 intent，继续携带公共 items、note、keep 与并发字段。
