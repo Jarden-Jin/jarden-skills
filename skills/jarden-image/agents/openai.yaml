@@ -1,0 +1,4 @@
+interface:
+  display_name: "Jarden Image"
+  short_description: "Generate and recover images with the remote Jarden API"
+  default_prompt: "Use $jarden-image to create an image with my personal Jarden API Key file."

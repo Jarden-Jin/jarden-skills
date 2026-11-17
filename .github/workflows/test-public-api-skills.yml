@@ -1,0 +1,39 @@
+name: Public API Skill Checks
+
+on:
+  pull_request:
+    paths:
+      - "skills/jarden-image/**"
+      - "skills/jarden-video/**"
+      - "tools/check_public_api_skills.py"
+      - "tests/test_public_api_skills.py"
+      - ".github/workflows/test-public-api-skills.yml"
+  push:
+    paths:
+      - "skills/jarden-image/**"
+      - "skills/jarden-video/**"
+      - "tools/check_public_api_skills.py"
+      - "tests/test_public_api_skills.py"
+      - ".github/workflows/test-public-api-skills.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  public-api-skills:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check public skill structure and secrets
+        run: python tools/check_public_api_skills.py
+      - name: Compile bundled clients
+        run: python -m py_compile skills/jarden-image/scripts/client.py skills/jarden-video/scripts/client.py
+      - name: Test credential handling without real credentials
+        run: python -m unittest discover -s tests -p 'test_public_api_skills.py' -v

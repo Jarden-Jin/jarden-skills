@@ -1,0 +1,4 @@
+interface:
+  display_name: "Jarden Video"
+  short_description: "Generate and recover H3 videos through the Jarden API"
+  default_prompt: "Use $jarden-video to create a video with my personal Jarden API Key file."

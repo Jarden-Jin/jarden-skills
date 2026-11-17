@@ -16,3 +16,10 @@ build/
 *.tmp
 *.skill
 skills/*/evals/
+
+# Local API credentials and generated jobs
+*.key
+.secrets/
+skills/jarden-image/outputs/
+skills/jarden-video/outputs/
+acceptance-output/
