@@ -7,6 +7,7 @@ Jarden 的可复用 Skill 集合，用于把创作与交付流程整理成可重
 | Skill | 用途 |
 | --- | --- |
 | [jarden-ip-visual](skills/jarden-ip-visual/README.md) | 从四组 21 项目录按需制作原创 IP 设计与宣发资产，用常驻 Archify 工作台跟踪真实状态；可选将确认成图延展为 Live Photo，分别记录配对、图库播放和设备验收，不强制商品或发帖流水线。 |
+| [jarden-publisher](skills/jarden-publisher/README.md) | 将定稿图片与文案准备成小红书图文、抖音图文或 B 站专栏，集中预检账号、封面和发布设置，存稿后回读，默认停在发布前。 |
 | [jarden-image](skills/jarden-image/README.md) | 通过 Jarden 的远程 API 调用 MOSS 或专用 H3 Image，查询参数、估时、恢复任务并校验下载图片；不包含模型和任何 API Key。 |
 | [jarden-video](skills/jarden-video/README.md) | 通过 Jarden 的远程 API 生成 H3 文生视频或首帧视频，选择服务支持的采样配置，恢复任务并校验下载；不包含模型和任何 API Key。 |
 
@@ -17,6 +18,8 @@ Jarden 的可复用 Skill 集合，用于把创作与交付流程整理成可重
 ```text
 请帮我安装这个 Skill：https://github.com/Jarden-Jin/jarden-skills/tree/main/skills/jarden-ip-visual
 
+请帮我安装这个 Skill：https://github.com/Jarden-Jin/jarden-skills/tree/main/skills/jarden-publisher
+
 请帮我安装这个 Skill：https://github.com/Jarden-Jin/jarden-skills/tree/main/skills/jarden-image
 
 请帮我安装这个 Skill：https://github.com/Jarden-Jin/jarden-skills/tree/main/skills/jarden-video
@@ -26,6 +29,7 @@ Jarden 的可复用 Skill 集合，用于把创作与交付流程整理成可重
 
 ```sh
 npx skills add Jarden-Jin/jarden-skills --skill jarden-ip-visual
+npx skills add Jarden-Jin/jarden-skills --skill jarden-publisher
 npx skills add Jarden-Jin/jarden-skills --skill jarden-image
 npx skills add Jarden-Jin/jarden-skills --skill jarden-video
 ```
@@ -50,7 +54,9 @@ npx skills add Jarden-Jin/jarden-skills --skill jarden-video
 
 页面确认经本机受控服务写回项目并返回回执；静态页面只保存草稿，不冒充已经采用。更新有独立计划、校验与备份，不会自动迁移用户项目。
 
-配置、数据接收方、费用边界、测试和恢复方法见 [jarden-ip-visual 使用说明](skills/jarden-ip-visual/README.md)。项目和成果默认留在本地；调用图片服务时会发送提示词与指定参考图。不会自动发布社交内容。
+配置、数据接收方、费用边界、测试和恢复方法见 [jarden-ip-visual 使用说明](skills/jarden-ip-visual/README.md)。项目和成果默认留在本地；调用图片服务时会发送提示词与指定参考图。该 Skill 只交付发帖素材，不操作创作中心。
+
+已有定稿时，可以说「用 jarden-publisher 把这组图片和文案准备成小红书和抖音草稿，停在发布前」。浏览器登录、预检和发布边界见 [jarden-publisher 使用说明](skills/jarden-publisher/README.md)。
 
 ## 远程图片和视频 API
 
