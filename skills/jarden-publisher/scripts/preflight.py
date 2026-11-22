@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 from job import CREATOR_HOSTS
-from package import CAPTION_PLATFORMS, caption_topic_count, current_blockers, load_package
+from package import CAPTION_PLATFORMS, caption_topic_count, caption_topics, current_blockers, load_package
 
 
 LOCATION_PLATFORMS = {"xiaohongshu", "douyin"}
@@ -71,14 +71,17 @@ if (!original || original.ownership !== 'agent') {
           const login = /^(?:\/login|\/accounts\/login)(?:\/|$)/.test(path)
             || !!document.querySelector('input[type=password]');
           const verification = /^(?:\/challenge|\/accounts\/onetap|\/accounts\/suspended)(?:\/|$)/.test(path);
-          const accept = [...document.querySelectorAll('input[type=file]')].map(field => field.accept);
-          const types = accept.flatMap(value => value.toLowerCase().split(',').map(type => type.trim()));
-          const imageInput = types.some(type => /^image\/|^\.(?:jpe?g|png|webp|hei[cf])$/.test(type));
-          const videoTypesOnly = types.length > 0 && types.every(type => /^video\/|^\.(?:mp4|mov|webm)$/.test(type));
+          const inputs = [...document.querySelectorAll('input[type=file]')].map(field =>
+            field.accept.toLowerCase().split(',').map(type => type.trim()).filter(Boolean));
+          const imageInput = inputs.flat().some(type => /^image\/|^\.(?:jpe?g|png|webp|hei[cf])$/.test(type));
+          const videoInput = inputs.some(types =>
+            types.length > 0 && types.every(type => /^video\/|^\.(?:mp4|mov|webm)$/.test(type)));
+          const uploadInput = imageInput && videoInput ? 'mixed_inputs'
+            : imageInput ? 'accepts_images' : videoInput ? 'video_only' : 'unverified';
           return {
             session: verification ? 'verification_required' : login ? 'login_required' : 'unknown',
             geolocation,
-            upload_input: imageInput ? 'accepts_images' : videoTypesOnly ? 'video_only' : 'unverified',
+            upload_input: uploadInput,
           };
         }
         const main = document.body?.innerText ?? '';
@@ -196,6 +199,7 @@ def report(jobs, space):
                     caption=content["caption"],
                     caption_chars=len(content["caption"]),
                     caption_topics=caption_topic_count(content),
+                    topics=caption_topics(content),
                 )
                 if platform == "instagram":
                     del plans[platform]["title"]
@@ -215,6 +219,8 @@ def report(jobs, space):
                 actions.append("当前只识别到视频上传控件。检查是否可切换到 Photo Post，否则交接手机 App")
             else:
                 actions.append("从实际页面确认图文模式、账号和允许上传的素材规格")
+            if platform == "tiktok" and site.get("upload_input") == "mixed_inputs":
+                actions.append("页面有独立的视频和图片控件。核对主上传区和 Photo Post 是否可用，只有视频时交接手机 App")
         if platform == "tiktok" and plan["caption_topics"] > 5:
             actions.append("描述含多于 5 个 #标签。预先核对账号上限及要保留的标签")
         if platform in LOCATION_PLATFORMS and site.get("geolocation") in ("prompt", "unknown", None):

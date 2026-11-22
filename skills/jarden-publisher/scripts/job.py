@@ -175,10 +175,36 @@ def check_observation(platform, state, evidence, now):
             raise ValueError("evidence draft_id does not match the job")
 
 
+def expected_content(platform, content):
+    from package import CAPTION_PLATFORMS, caption_topics
+
+    expected = {"topics": content["topics"]}
+    if platform in CAPTION_PLATFORMS:
+        expected.update(mode=content["kind"], caption=content["caption"], topics=caption_topics(content))
+        if platform == "tiktok":
+            expected["title"] = content["title"]
+    else:
+        expected.update(title=content["title"], body=content["body"])
+    expected["image_sha256"] = [image["sha256"] for image in content["images"]]
+    if platform == "bilibili":
+        expected["placements"] = content["placements"]
+    return expected
+
+
+def check_readback(readback, expected, *, with_settings=False):
+    required_fields = set(expected)
+    if with_settings:
+        required_fields.add("settings")
+    if not isinstance(readback, dict) or readback.keys() != required_fields:
+        raise ValueError(f"readback must contain exactly {', '.join(sorted(required_fields))}")
+    for field, value in expected.items():
+        if json.dumps(readback[field], sort_keys=True) != json.dumps(value, sort_keys=True):
+            raise ValueError(f"readback.{field} differs from the package")
+
+
 def check_ready(platform, package, state, evidence):
     from package import CAPTION_PLATFORMS, current_blockers
 
-    content = package["platforms"][platform]
     if current_blockers(package, platform):
         raise ValueError("the selected platform has unresolved package blockers")
     if creator_url(platform, evidence["url"]).path.rstrip("/") != EDITOR_PATHS[platform]:
@@ -189,25 +215,11 @@ def check_ready(platform, package, state, evidence):
     if "draft_id" in state and evidence.get("draft_id") != state["draft_id"]:
         raise ValueError("ready evidence must identify the known draft")
 
-    caption_platform = platform in CAPTION_PLATFORMS
-    expected = {"topics": content["topics"]}
-    if caption_platform:
-        expected.update(mode=content["kind"], caption=content["caption"])
-        if platform == "tiktok":
-            expected["title"] = content["title"]
-    else:
-        expected.update(title=content["title"], body=content["body"])
-    expected["image_sha256"] = [image["sha256"] for image in content["images"]]
-    if platform == "bilibili":
-        expected["placements"] = content["placements"]
+    content = package["platforms"][platform]
+    expected = expected_content(platform, content)
     readback = evidence.get("readback")
-    required_fields = {*expected, "settings"}
-    if not isinstance(readback, dict) or readback.keys() != required_fields:
-        raise ValueError(f"readback must contain exactly {', '.join(sorted(required_fields))}")
-    for field, value in expected.items():
-        if json.dumps(readback[field], sort_keys=True) != json.dumps(value, sort_keys=True):
-            raise ValueError(f"readback.{field} differs from the package")
-
+    check_readback(readback, expected, with_settings=True)
+    caption_platform = platform in CAPTION_PLATFORMS
     settings = readback["settings"]
     if not isinstance(settings, dict):
         raise ValueError("readback.settings must be an object")
@@ -266,6 +278,8 @@ def work_receipt(platform, evidence):
     link_id = work_id_from_url(platform, work_url) if work_url is not None else None
     if work_url is not None and not link_id:
         raise ValueError("work_url must be a platform work permalink")
+    if platform in ("tiktok", "instagram") and not (page_id or link_id):
+        raise ValueError("confirmation requires a verified photo post permalink")
     work_id = evidence.get("work_id")
     if work_id is not None:
         if type(work_id) is int and platform not in ("xiaohongshu", "instagram"):
@@ -284,6 +298,55 @@ def work_receipt(platform, evidence):
     return identifiers.pop(), work_url or (evidence["url"] if page_id else None)
 
 
+def confirm_work(platform, state, evidence):
+    authorization = state.get("authorization")
+    if authorization and timestamp(evidence["observed_at"]) < timestamp(authorization["authorized_at"]):
+        raise ValueError("confirmation predates the publish attempt")
+    publication = evidence.get("publication")
+    if publication not in PUBLICATIONS:
+        raise ValueError("publication must be submitted, in_review, or published")
+    work_id, work_url = work_receipt(platform, evidence)
+    if state.get("work_id", work_id) != work_id:
+        raise ValueError("confirmation refers to a different work")
+    state.update(status="confirmed", publication=publication, work_id=work_id)
+    if work_url:
+        state["work_url"] = work_url
+
+
+def reconcile_manual(platform, package, state, evidence, now):
+    account = evidence.get("account")
+    if not isinstance(account, str) or not account.strip():
+        raise ValueError("manual confirmation requires an observed account")
+    if evidence["status"] != "confirmed" or not evidence["summary"]:
+        raise ValueError("manual confirmation requires a confirmed observation and summary")
+    if evidence.get("fingerprint") != package["fingerprint"]:
+        raise ValueError("evidence fingerprint does not match the job")
+    observed_at = timestamp(evidence["observed_at"])
+    if not now - MAX_AGE <= observed_at <= now:
+        raise ValueError("manual confirmation requires a fresh observation")
+    if state is None:
+        state = {
+            "schema_version": 1,
+            "platform": platform,
+            "account": account,
+            "space": evidence.get("space"),
+            "tab": evidence.get("tab"),
+            "fingerprint": package["fingerprint"],
+            "url": evidence["url"],
+            "started_at": evidence["observed_at"],
+        }
+    if account != state["account"]:
+        raise ValueError("evidence account does not match the job")
+    previous = state.get("evidence")
+    latest = timestamp(previous["observed_at"] if previous else state["started_at"])
+    if observed_at < latest:
+        raise ValueError("manual confirmation predates the job or latest observation")
+    check_readback(evidence.get("readback"), expected_content(platform, package["platforms"][platform]))
+    confirm_work(platform, state, evidence)
+    state["evidence"] = evidence
+    return state
+
+
 def explicit_instruction(platform, instruction):
     text = instruction.strip().rstrip("。.!！")
     chinese = re.sub(r"\s+", "", text)
@@ -293,7 +356,7 @@ def explicit_instruction(platform, instruction):
     noun = r"(?:笔记|图文|专栏|文章|帖子|稿件|内容)"
     verb = r"(?:现在|立即)?(?:发布|发)"
     action = rf"(?:{verb}{reference}?{noun}?|把{reference}{noun}?{verb})"
-    pattern = rf"{prefix}(?:在{target}{action}|{action}(?:到|至){target})(?:吧|了)?"
+    pattern = rf"{prefix}(?:在{target}{action}|{action}(?:到|至){target})吧?"
     english = (
         r"(?:please )?publish(?: (?:it|this|this post))?"
         rf" (?:to|on) {target}(?: now)?"
@@ -304,7 +367,22 @@ def explicit_instruction(platform, instruction):
     )
 
 
+def review_id(state, evidence):
+    from package import fingerprint
+
+    return fingerprint({
+        "platform": state["platform"],
+        "identity": {field: state[field] for field in IDENTITY},
+        "fingerprint": state["fingerprint"],
+        "url": evidence["url"],
+        "draft_id": evidence.get("draft_id"),
+        "readback": evidence["readback"],
+    })
+
+
 def update_state(args, package, state, evidence, now):
+    from package import CAPTION_PLATFORMS
+
     platform, stage = args.platform, state["status"]
     check_observation(platform, state, evidence, now)
     observed = evidence["status"]
@@ -320,6 +398,10 @@ def update_state(args, package, state, evidence, now):
         previous_readback = json.dumps(previous.get("readback"), sort_keys=True)
         if current_readback != previous_readback or any(evidence.get(field) != previous.get(field) for field in fields):
             raise ValueError("authorization evidence must match the ready observation")
+        if platform in CAPTION_PLATFORMS and (
+            not args.review_id or args.review_id != state.get("review_id") or args.review_id != review_id(state, evidence)
+        ):
+            raise ValueError("authorization requires the review_id shown to the user before approval")
         settings = evidence["readback"]["settings"]
         if settings["scheduled"] or settings.get("cross_posting") is True:
             raise ValueError("scheduled or cross-posted publication requires the user to submit manually")
@@ -336,22 +418,16 @@ def update_state(args, package, state, evidence, now):
     elif observed == "confirmed":
         if stage not in {"publish_unknown", "confirmed"} or "authorization" not in state:
             raise ValueError("confirmation requires a recorded publish attempt")
-        if timestamp(evidence["observed_at"]) < timestamp(state["authorization"]["authorized_at"]):
-            raise ValueError("confirmation predates the publish attempt")
-        publication = evidence.get("publication")
-        if publication not in PUBLICATIONS:
-            raise ValueError("publication must be submitted, in_review, or published")
-        work_id, work_url = work_receipt(platform, evidence)
-        if state.get("work_id", work_id) != work_id:
-            raise ValueError("confirmation refers to a different work")
-        state.update(status="confirmed", publication=publication, work_id=work_id)
-        if work_url:
-            state["work_url"] = work_url
+        confirm_work(platform, state, evidence)
     elif stage == "confirmed" or (stage == "publish_unknown" and observed == "ready"):
         raise ValueError("a recorded publish attempt cannot return to editing or readiness")
     elif stage != "publish_unknown":
         if observed == "ready":
             check_ready(platform, package, state, evidence)
+            if platform in CAPTION_PLATFORMS:
+                state["review_id"] = review_id(state, evidence)
+        else:
+            state.pop("review_id", None)
         state["status"] = observed
     if "draft_id" in evidence:
         state["draft_id"] = evidence["draft_id"]
@@ -398,6 +474,8 @@ def run(args):
                 "started_at": now.isoformat(timespec="seconds"),
                 **identity,
             }
+        elif args.command == "reconcile":
+            state = reconcile_manual(platform, package, records.get(platform), read_object(args.file), now)
         else:
             if platform not in records:
                 raise ValueError("platform has not started")
@@ -424,6 +502,11 @@ def main(argv=None):
             command.add_argument("--file", type=Path, required=True)
         if name == "authorize":
             command.add_argument("--instruction", required=True)
+            command.add_argument("--review-id", help="ID of the ready snapshot shown before approval")
+    reconcile = commands.add_parser("reconcile", help="Record a user-published TikTok or Instagram post")
+    reconcile.add_argument("job", type=Path)
+    reconcile.add_argument("platform", choices=("tiktok", "instagram"))
+    reconcile.add_argument("--file", type=Path, required=True)
     try:
         print(json.dumps(run(parser.parse_args(argv)), ensure_ascii=False))
     except (OSError, ValueError, KeyError, TypeError, ImportError) as error:

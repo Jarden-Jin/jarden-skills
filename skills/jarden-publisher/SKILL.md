@@ -2,7 +2,7 @@
 name: jarden-publisher
 description: "Jarden-publisher 将定稿图文准备成小红书、抖音、B 站专栏、海外 TikTok Photo Post 或 Instagram 多图轮播。用户要求准备或恢复这些稿件、核对封面与发布设置，或明确提交已核对稿件时使用。可接 jarden-ip-visual 的 post/ 成品和手动素材。默认小红书，停在发布前。仅在上述图文和专栏场景使用。"
 metadata:
-  version: "0.4.0"
+  version: "0.4.1"
 ---
 
 # Jarden-publisher
@@ -27,7 +27,7 @@ metadata:
 
 ## 最终提交
 
-草稿授权只覆盖草稿。按 [提交记录](references/commands.md#记录提交) 核对当次平台、稿件版本、账号、编辑页和发布范围。仅在用户指明目标并授权本次提交、当次站点允许时，在点击前登记一次尝试。定时、同步发布或实测证据不足时留给用户提交。区分审核中、已公开和 `publish_unknown`；结果不明时只查原稿回执。
+草稿授权只覆盖草稿。按 [提交记录](references/commands.md#记录提交) 绑定用户所审阅的稿件和发布设置。用户授权当次提交且站点允许时，在点击前登记一次尝试。定时、同步发布或实测证据不足时留给用户提交。结果不明时只查原稿回执。海外平台用户自行发布后，可 [回查并记录](references/commands.md#回查手机发布)。
 
 ## 按需读取
 

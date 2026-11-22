@@ -24,7 +24,7 @@ CAPTION_PLATFORMS = {"tiktok", "instagram"}
 FORMATS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP"}
 SIZE_LIMITS = {"xiaohongshu": 32_000_000, "douyin": 50_000_000, "bilibili": 20_000_000}
 IMAGE_LIMITS = {"xiaohongshu": 18, "douyin": 35, "tiktok": 35, "instagram": 20}
-CAPTION_HASHTAG = re.compile(r"(?<![\w#])#\w+")
+CAPTION_HASHTAG = re.compile(r"(?<![\w#])#([\w\u200d\u2600-\u27bf\ufe0f\U0001f000-\U0001faff]+)")
 JARDEN_AI_DECLARATION = re.compile(
     r"^[ \t]*(?:本组为[ \t]*)?AI[ \t]*生成的(?:设计效果图|视觉概念)",
     re.IGNORECASE | re.MULTILINE,
@@ -142,15 +142,17 @@ def normalize_topics(tags):
 def compose_caption(platform, title, body, topics):
     sections = (title, body) if platform == "instagram" else (body,)
     text = "\n\n".join(section for section in sections if section.strip())
-    hashtags = " ".join(
-        f"#{topic}" for topic in topics
-        if not re.search(rf"(?<!\w)#{re.escape(topic)}(?!\w)", text, re.IGNORECASE)
-    )
+    existing = {topic.casefold() for topic in CAPTION_HASHTAG.findall(text)}
+    hashtags = " ".join(f"#{topic}" for topic in topics if topic.casefold() not in existing)
     return "\n\n".join(section for section in (text, hashtags) if section)
 
 
+def caption_topics(content):
+    return CAPTION_HASHTAG.findall(content["caption"])
+
+
 def caption_topic_count(content):
-    return max(len(content["topics"]), len(CAPTION_HASHTAG.findall(content["caption"])))
+    return max(len(content["topics"]), len(caption_topics(content)))
 
 
 def article_placements(article, entries, image_count):
@@ -180,8 +182,8 @@ def platform_blockers(platform, content):
         issues.append("Instagram 多图轮播至少需要两张图片")
     if platform in IMAGE_LIMITS and image_count > IMAGE_LIMITS[platform]:
         issues.append(f"{platform} 图文预检最多支持 {IMAGE_LIMITS[platform]} 张图片")
-    if platform in CAPTION_PLATFORMS and any(re.search(r"\s", topic) for topic in topics):
-        issues.append("话题含空白字符，请确认可用的单个 #标签")
+    if platform in CAPTION_PLATFORMS and any(not CAPTION_HASHTAG.fullmatch(f"#{topic}") for topic in topics):
+        issues.append("话题含当前预检无法核对的字符，请确认可用的单个 #标签")
     if platform == "instagram" and caption_topic_count(content) > 5:
         issues.append("Instagram 的说明超过 5 个 #标签，请确认保留项")
     if platform == "xiaohongshu":

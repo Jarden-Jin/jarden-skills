@@ -8,7 +8,7 @@ python3 "$SKILL_DIR/scripts/preflight.py" "$JOB_DIR" --space "$SPACE"
 
 同一次运行可以传入多份任务目录，实现逐平台查看已冻结的内容。一站使用一份。省略 `--space` 时只检查本地包。在线预检查看已打开的标签和浏览器权限。`attention` 汇总登录、权限和编辑页缺项，`package_blockers` 列出本地素材和文字的缺项。`suggested_setup` 是选项建议，`browser.settings` 是编辑页中可识别的当前值。
 
-对 TikTok 和 Instagram，额外检查 `entry_url`、`ordered_images` 和完整 `caption`。脚本提示可识别的登录、验证状态和文件输入类型。`accepts_images` 仅表示控件接受图片。由浏览器观察者确认实际账号、图文模式、图片数量、格式、尺寸、裁切和文案字数。`video_only` 时检查有无图文切换，再决定是否转手机。
+对 TikTok 和 Instagram，额外检查 `entry_url`、`ordered_images` 和完整 `caption`。脚本提示可识别的登录、验证状态和文件输入类型。由浏览器观察者确认实际账号、图文模式、图片数量、格式、尺寸、裁切和文案字数。TikTok 的 `video_only` 或 `mixed_inputs` 要核对主上传区与图文切换；图片控件可能只用于视频封面。
 
 ## 登录与位置权限
 

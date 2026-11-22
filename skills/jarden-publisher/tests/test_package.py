@@ -344,6 +344,7 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(report[platform]["mode"], target["kind"])
             self.assertEqual(report[platform]["caption"], target["caption"])
             self.assertEqual(report[platform]["ordered_images"], list(map(str, pictures)))
+            self.assertEqual(report[platform]["topics"], ["StudioNotes", "Design"])
             self.assertEqual(report[platform]["package_blockers"], [])
         self.assertEqual(report["tiktok"]["title"], "Character Design")
         self.assertNotIn("title", report["instagram"])
