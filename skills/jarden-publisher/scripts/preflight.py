@@ -7,24 +7,34 @@ import subprocess
 import sys
 
 from job import CREATOR_HOSTS
-from package import current_blockers, load_package
+from package import CAPTION_PLATFORMS, caption_topic_count, current_blockers, load_package
 
 
 LOCATION_PLATFORMS = {"xiaohongshu", "douyin"}
+ENTRY_URLS = {
+    "tiktok": "https://www.tiktok.com/tiktokstudio/upload",
+    "instagram": "https://www.instagram.com/",
+}
 OPTIONS = {
     "xiaohongshu": ("公开范围", "原创与内容类型声明", "定时发布", "允许正文复制", "地点", "合集与活动"),
     "douyin": ("可见范围", "自主声明", "发布时间", "同时发布", "保存权限", "位置", "音乐与合集"),
     "bilibili": ("可见范围", "原创与 AI 辅助创作声明", "定时发布", "评论与精选评论", "话题与文集"),
+    "tiktok": ("受众", "评论", "AI 声明", "商业内容披露", "音乐", "地点", "定时与同步"),
+    "instagram": ("账号隐私与受众", "评论", "AI 信息标签", "品牌合作与协作者", "音乐", "地点", "定时与同步到 Facebook"),
 }
 SUGGESTIONS = {
     "xiaohongshu": "按现有发布范围和复制设置准备。地点、合集和活动按本篇需要配置",
     "douyin": "按现有发布范围和保存权限准备。音乐、定位、合集或同步发布有明确需要时再选",
     "bilibili": "按现有发布范围和评论设置准备。图片封面与文集按本篇用途确认",
+    "tiktok": "先确认账号支持 Photo Post，再核对标题、描述、话题和声明。网页只有视频入口时用手机交接",
+    "instagram": "从 Create → Post 检查多图上传。共用一份说明，逐图核对裁切和顺序。同步到 Facebook 另行确认",
 }
 COVERS = {
     "xiaohongshu": "按图序使用首图，核对笔记与封面预览",
     "douyin": "先核对默认封面是否为首图，有明确选择时再调整封面",
     "bilibili": "需要图片封面时，建议将已选首图设为自定义封面。保留默认时显示正文开头",
+    "tiktok": "选定首图作封面候选，按本篇预览核对实际封面；有选封面控件时按已确认图选择",
+    "instagram": "轮播首图作封面，逐张检查版式和裁切",
 }
 
 
@@ -54,6 +64,23 @@ if (!original || original.ownership !== 'agent') {
       const tab = matching[0];
       const page = tab.label ? task.page(tab.label) : tab.page;
       sites[platform] = await page.evaluate(async (platform) => {
+        let geolocation = 'unknown';
+        try { geolocation = (await navigator.permissions.query({name: 'geolocation'})).state; } catch {}
+        if (platform === 'tiktok' || platform === 'instagram') {
+          const path = location.pathname;
+          const login = /^(?:\/login|\/accounts\/login)(?:\/|$)/.test(path)
+            || !!document.querySelector('input[type=password]');
+          const verification = /^(?:\/challenge|\/accounts\/onetap|\/accounts\/suspended)(?:\/|$)/.test(path);
+          const accept = [...document.querySelectorAll('input[type=file]')].map(field => field.accept);
+          const types = accept.flatMap(value => value.toLowerCase().split(',').map(type => type.trim()));
+          const imageInput = types.some(type => /^image\/|^\.(?:jpe?g|png|webp|hei[cf])$/.test(type));
+          const videoTypesOnly = types.length > 0 && types.every(type => /^video\/|^\.(?:mp4|mov|webm)$/.test(type));
+          return {
+            session: verification ? 'verification_required' : login ? 'login_required' : 'unknown',
+            geolocation,
+            upload_input: imageInput ? 'accepts_images' : videoTypesOnly ? 'video_only' : 'unverified',
+          };
+        }
         const main = document.body?.innerText ?? '';
         const frame = platform === 'bilibili' && [...document.querySelectorAll('iframe')].find(element =>
           element.getAttribute('src')?.startsWith('https://member.bilibili.com/york/read-'));
@@ -71,8 +98,6 @@ if (!original || original.ownership !== 'agent') {
           signedIn = !!frame?.contentDocument && (!!titleField || doc.body?.innerText.includes('草稿箱'));
         }
         const loginPrompt = /扫码登录|手机验证码登录|验证码登录|密码登录|登录后使用丰富/.test(main);
-        let geolocation = 'unknown';
-        try { geolocation = (await navigator.permissions.query({name: 'geolocation'})).state; } catch {}
         const filled = field => field ? (field.value.trim() ? 'filled' : 'empty') : 'not_visible';
         const fieldLabel = field => (field.closest('label') ?? field.parentElement?.parentElement)?.innerText.replace(/\s+/g, ' ').trim();
         const checkedLabels = [...doc.querySelectorAll('input:checked')].flatMap(field => {
@@ -163,6 +188,17 @@ def report(jobs, space):
                 "source_settings": content["settings"],
                 "package_blockers": current_blockers(packet, platform),
             }
+            if platform in CAPTION_PLATFORMS:
+                plans[platform].update(
+                    entry_url=ENTRY_URLS[platform],
+                    mode=content["kind"],
+                    ordered_images=[image["path"] for image in content["images"]],
+                    caption=content["caption"],
+                    caption_chars=len(content["caption"]),
+                    caption_topics=caption_topic_count(content),
+                )
+                if platform == "instagram":
+                    del plans[platform]["title"]
     observed = browser_state(space, plans)
     for platform, plan in plans.items():
         site = observed["sites"].get(platform, {"session": "not_checked"})
@@ -170,8 +206,17 @@ def report(jobs, space):
         actions = []
         if site["session"] == "login_required":
             actions.append("在官方创作页面登录")
+        elif site["session"] == "verification_required":
+            actions.append("在官方页面完成账号验证后回到原标签")
         elif site["session"] != "signed_in":
             actions.append("确认当次创作页面与登录账号")
+        if platform in CAPTION_PLATFORMS:
+            if platform == "tiktok" and site.get("upload_input") == "video_only":
+                actions.append("当前只识别到视频上传控件。检查是否可切换到 Photo Post，否则交接手机 App")
+            else:
+                actions.append("从实际页面确认图文模式、账号和允许上传的素材规格")
+        if platform == "tiktok" and plan["caption_topics"] > 5:
+            actions.append("描述含多于 5 个 #标签。预先核对账号上限及要保留的标签")
         if platform in LOCATION_PLATFORMS and site.get("geolocation") in ("prompt", "unknown", None):
             actions.append("本平台传图后曾请求位置，提前确认站点权限。需要地点时由用户允许")
         if site.get("editor", {}).get("title") == "empty" and plan["title"]:

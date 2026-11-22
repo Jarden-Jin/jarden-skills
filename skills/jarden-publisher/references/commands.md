@@ -29,7 +29,11 @@ python3 "$SKILL_DIR/scripts/job.py" begin "$JOB_DIR" "$PLATFORM" \
 
 对于 `ready`，`checks` 记录七项页面回读：`mode`、`images`、`title`、`body`、`topics`、`settings`、`final_control`。`durable_draft` 仅在草稿可稳定回开且有平台 `draft_id` 时为真；仅恢复最近暂存稿可另外记录 `saved_entry` 和 `saved_fields`。`readback` 记录实际 `title`、`body`、`topics`、按可见顺序映射的 `image_sha256`、`settings`，以及专栏的 `placements`。预览被平台转码时，逐图核对画面与顺序，另外记录预览证据。
 
-`settings` 统一写 `visibility`（`public`、`private`、`friends` 或 `followers`）、`scheduled`、`ai_generated` 和核对到的封面 `cover`。小红书用 `first_image`，再写 `original`、`allow_copy`。抖音用 `first_image` 或 `custom_image`，再写 `allow_save`、`cross_posting`。B 站用 `text_preview` 或 `custom_image`，再写 `original`、`comments_enabled`、`featured_comments`。开关按页面实况写布尔值。`custom_image` 另写 `cover_source_sha256`，记录与用户已确认的封面源图相匹配的摘要。字段未核实就保留 `editing` 或 `blocked`；旧记录无需改写，继续提交前须重新回读。
+国内平台的 `settings` 统一写 `visibility`（`public`、`private`、`friends` 或 `followers`）、`scheduled`、`ai_generated` 和核对到的封面 `cover`。小红书用 `first_image`，再写 `original`、`allow_copy`。抖音用 `first_image` 或 `custom_image`，再写 `allow_save`、`cross_posting`。B 站用 `text_preview` 或 `custom_image`，再写 `original`、`comments_enabled`、`featured_comments`。开关按页面实况写布尔值。`custom_image` 另写 `cover_source_sha256`，记录与用户已确认的封面源图相匹配的摘要。
+
+海外 `readback` 使用 `mode`、`caption`、`topics`、`image_sha256` 和 `settings`。TikTok 加 `title`，`mode` 写 `photo-post`。Instagram 的 `mode` 写 `feed-carousel`，共用说明覆盖正文和标题检查，`title` 和 `body` 都由 `caption` 核对。`topics` 按内容包的顺序记录在说明里逐一核实的计划标签。正文自带标签的位置由 `caption` 核对。
+
+海外 `settings` 写 `visibility`、`scheduled`、`cover`、`ai_generated`、`comments_enabled`、`branded_content` 和 `cross_posting`。TikTok 将 Only you 记为 `private`，Instagram 私密账号的一般帖子记为 `followers`，面向亲密好友的帖子记为 `close_friends`。核对当前生效范围和即时或定时提交。最后四项使用观察到的布尔值，入口确无对应功能时记 `not_available` 并在摘要中说明。`cover` 通常为 `first_image`。TikTok 若有已确认的其他轮播图作为封面，写 `selected_image` 和对应的 `cover_source_sha256`。字段未核实、所需标识缺失或页面并非图文模式时，保留 `editing` 或 `blocked`。
 
 ```sh
 python3 "$SKILL_DIR/scripts/job.py" observe "$JOB_DIR" "$PLATFORM" --file "$EVIDENCE"
@@ -37,14 +41,14 @@ python3 "$SKILL_DIR/scripts/job.py" observe "$JOB_DIR" "$PLATFORM" --file "$EVID
 
 ## 记录提交
 
-用户明确批准本次发布到指定平台后，再读一次同一编辑页。将晚于上次就绪记录的观察证据直接交给 `authorize`，并使用当次原话，例如「确认发布这篇到小红书」。发布范围应已给用户核对；如果版本或设置变化，先更新就绪记录并请用户确认。程序登记一次尝试；返回 `publish_unknown` 后才可执行站点允许的唯一提交动作。定时或同步发布由用户操作。结果不明时只查回执。
+用户明确批准本次发布到指定平台后，再读一次同一编辑页。将晚于上次就绪记录的观察证据直接交给 `authorize`，并使用当次原话，例如「确认发布这篇到小红书」。发布范围应已给用户核对。版本或设置变化时先更新就绪记录，再请用户确认。程序返回 `publish_unknown` 后可执行站点允许的唯一提交动作。定时、同步发布或无法核定唯一发布目的地时由用户操作。结果不明时只查回执。
 
 ```sh
 python3 "$SKILL_DIR/scripts/job.py" authorize "$JOB_DIR" "$PLATFORM" \
   --file "$EVIDENCE" --instruction "$USER_INSTRUCTION"
 ```
 
-平台接受时用 `observe` 记录 `confirmed`，包含实际 `work_id` 或 `work_url`，并用 `publication` 区分提交、审核和已公开。回执尚未出现时沿用 `publish_unknown`，只查原平台的作品管理。程序负责本地字段、文件、时序和状态校验。浏览器的观察者负责核验实际页面。
+平台接受时用 `observe` 记录 `confirmed`，包含实际 `work_id` 或 `work_url`，并用 `publication` 区分提交、审核和已公开。TikTok 图片帖子核对 `/@用户/photo/数字ID`，Instagram 核对 `/p/短码/`，短码区分大小写。回执尚未出现时沿用 `publish_unknown`，只查原平台的作品管理。程序负责本地字段、文件、时序和状态校验。浏览器的观察者负责核验实际页面。
 
 ## 本地回归
 

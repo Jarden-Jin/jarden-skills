@@ -13,10 +13,18 @@ from pathlib import Path
 from PIL import Image
 
 
-KINDS = {"xiaohongshu": "image-note", "douyin": "image-post", "bilibili": "article"}
+KINDS = {
+    "xiaohongshu": "image-note",
+    "douyin": "image-post",
+    "bilibili": "article",
+    "tiktok": "photo-post",
+    "instagram": "feed-carousel",
+}
+CAPTION_PLATFORMS = {"tiktok", "instagram"}
 FORMATS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP"}
 SIZE_LIMITS = {"xiaohongshu": 32_000_000, "douyin": 50_000_000, "bilibili": 20_000_000}
-IMAGE_LIMITS = {"xiaohongshu": 18, "douyin": 35}
+IMAGE_LIMITS = {"xiaohongshu": 18, "douyin": 35, "tiktok": 35, "instagram": 20}
+CAPTION_HASHTAG = re.compile(r"(?<![\w#])#\w+")
 JARDEN_AI_DECLARATION = re.compile(
     r"^[ \t]*(?:本组为[ \t]*)?AI[ \t]*生成的(?:设计效果图|视觉概念)",
     re.IGNORECASE | re.MULTILINE,
@@ -131,6 +139,20 @@ def normalize_topics(tags):
     return topics
 
 
+def compose_caption(platform, title, body, topics):
+    sections = (title, body) if platform == "instagram" else (body,)
+    text = "\n\n".join(section for section in sections if section.strip())
+    hashtags = " ".join(
+        f"#{topic}" for topic in topics
+        if not re.search(rf"(?<!\w)#{re.escape(topic)}(?!\w)", text, re.IGNORECASE)
+    )
+    return "\n\n".join(section for section in (text, hashtags) if section)
+
+
+def caption_topic_count(content):
+    return max(len(content["topics"]), len(CAPTION_HASHTAG.findall(content["caption"])))
+
+
 def article_placements(article, entries, image_count):
     paragraphs = len(re.split(r"\r?\n[ \t]*\r?\n", article.strip())) if article.strip() else 0
     if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
@@ -148,13 +170,20 @@ def article_placements(article, entries, image_count):
 
 def platform_blockers(platform, content):
     title, body, topics = (content[field] for field in ("title", "body", "topics"))
+    image_count = len(content["images"])
     issues = []
-    if not title.strip():
+    if platform not in CAPTION_PLATFORMS and not title.strip():
         issues.append("标题缺失，需拟定或确认")
-    if platform != "bilibili" and not topics:
+    if platform in ("xiaohongshu", "douyin") and not topics:
         issues.append("话题缺失，需按素材拟定或确认")
-    if platform in IMAGE_LIMITS and len(content["images"]) > IMAGE_LIMITS[platform]:
+    if platform == "instagram" and image_count < 2:
+        issues.append("Instagram 多图轮播至少需要两张图片")
+    if platform in IMAGE_LIMITS and image_count > IMAGE_LIMITS[platform]:
         issues.append(f"{platform} 图文预检最多支持 {IMAGE_LIMITS[platform]} 张图片")
+    if platform in CAPTION_PLATFORMS and any(re.search(r"\s", topic) for topic in topics):
+        issues.append("话题含空白字符，请确认可用的单个 #标签")
+    if platform == "instagram" and caption_topic_count(content) > 5:
+        issues.append("Instagram 的说明超过 5 个 #标签，请确认保留项")
     if platform == "xiaohongshu":
         if sum(1 if ord(char) >= 128 else 0.5 for char in title) > 20:
             issues.append("标题超过小红书 20 加权字的预检预算")
@@ -209,7 +238,10 @@ def build(args):
             "kind": KINDS[platform], "title": title, "body": body,
             "topics": normalize_topics(tags), "images": images, "settings": settings,
         }
-        if platform == "bilibili":
+        if platform in CAPTION_PLATFORMS:
+            entry["caption"] = compose_caption(platform, title, body, entry["topics"])
+            entry["settings"] = {"ai_generated": settings["ai_generated"]}
+        elif platform == "bilibili":
             entry["body"] = read_text(args.article_file) if args.article_file else body
             entry["placements"] = []
             if args.placements_file:

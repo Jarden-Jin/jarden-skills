@@ -13,31 +13,50 @@ PLATFORM_NAMES = {
     "xiaohongshu": "小红书|xiaohongshu",
     "douyin": "抖音|douyin",
     "bilibili": "B站|哔哩哔哩|bilibili",
+    "tiktok": "tiktok|海外抖音|国际版抖音",
+    "instagram": "instagram|ins|ig",
 }
 CREATOR_HOSTS = {
     "xiaohongshu": "creator.xiaohongshu.com",
     "douyin": "creator.douyin.com",
     "bilibili": "member.bilibili.com",
+    "tiktok": "www.tiktok.com",
+    "instagram": "www.instagram.com",
 }
 EDITOR_PATHS = {
     "xiaohongshu": "/publish/publish",
     "douyin": "/creator-micro/content/post/image",
     "bilibili": "/platform/upload/text/new-edit",
+    "tiktok": "/tiktokstudio/upload",
+    "instagram": "",
 }
 PLATFORM_SWITCHES = {
     "xiaohongshu": ("allow_copy",),
     "douyin": ("allow_save", "cross_posting"),
     "bilibili": ("comments_enabled", "featured_comments"),
+    "tiktok": ("ai_generated", "comments_enabled", "branded_content", "cross_posting"),
+    "instagram": ("ai_generated", "comments_enabled", "branded_content", "cross_posting"),
 }
 COVER_MODES = {
     "xiaohongshu": {"first_image"},
     "douyin": {"first_image", "custom_image"},
     "bilibili": {"text_preview", "custom_image"},
+    "tiktok": {"first_image", "selected_image"},
+    "instagram": {"first_image"},
 }
-WORK_PATHS = {
-    "xiaohongshu": r"/(?:explore|discovery/item)/([0-9a-f]{24})",
-    "douyin": r"/(?:note|video)/([1-9][0-9]*)",
-    "bilibili": r"/(?:read/cv|opus/)([1-9][0-9]*)",
+WORK_IDS = {
+    "xiaohongshu": r"[0-9a-f]{24}",
+    "douyin": r"[1-9][0-9]*",
+    "bilibili": r"[1-9][0-9]*",
+    "tiktok": r"[1-9][0-9]*",
+    "instagram": r"[A-Za-z0-9_-]+",
+}
+WORK_PATH_PREFIXES = {
+    "xiaohongshu": r"/(?:explore|discovery/item)/",
+    "douyin": r"/(?:note|video)/",
+    "bilibili": r"/(?:read/cv|opus/)",
+    "tiktok": r"/@[\w.]+/photo/",
+    "instagram": r"/p/",
 }
 IDENTITY = ("space", "tab", "account")
 READY_CHECKS = ("mode", "images", "title", "body", "topics", "settings", "final_control")
@@ -157,7 +176,7 @@ def check_observation(platform, state, evidence, now):
 
 
 def check_ready(platform, package, state, evidence):
-    from package import current_blockers
+    from package import CAPTION_PLATFORMS, current_blockers
 
     content = package["platforms"][platform]
     if current_blockers(package, platform):
@@ -170,14 +189,21 @@ def check_ready(platform, package, state, evidence):
     if "draft_id" in state and evidence.get("draft_id") != state["draft_id"]:
         raise ValueError("ready evidence must identify the known draft")
 
-    expected = {field: content[field] for field in ("title", "body", "topics", "settings")}
+    caption_platform = platform in CAPTION_PLATFORMS
+    expected = {"topics": content["topics"]}
+    if caption_platform:
+        expected.update(mode=content["kind"], caption=content["caption"])
+        if platform == "tiktok":
+            expected["title"] = content["title"]
+    else:
+        expected.update(title=content["title"], body=content["body"])
     expected["image_sha256"] = [image["sha256"] for image in content["images"]]
     if platform == "bilibili":
         expected["placements"] = content["placements"]
     readback = evidence.get("readback")
-    if not isinstance(readback, dict) or readback.keys() != expected.keys():
-        raise ValueError(f"readback must contain exactly {', '.join(expected)}")
-    package_settings = expected.pop("settings")
+    required_fields = {*expected, "settings"}
+    if not isinstance(readback, dict) or readback.keys() != required_fields:
+        raise ValueError(f"readback must contain exactly {', '.join(sorted(required_fields))}")
     for field, value in expected.items():
         if json.dumps(readback[field], sort_keys=True) != json.dumps(value, sort_keys=True):
             raise ValueError(f"readback.{field} differs from the package")
@@ -185,12 +211,22 @@ def check_ready(platform, package, state, evidence):
     settings = readback["settings"]
     if not isinstance(settings, dict):
         raise ValueError("readback.settings must be an object")
-    if settings.get("visibility") not in ("public", "private", "friends", "followers"):
+    visibility = ("public", "followers", "close_friends") if platform == "instagram" else (
+        "public", "private", "friends", "followers",
+    )
+    if settings.get("visibility") not in visibility:
         raise ValueError("readback.settings must include the observed visibility")
-    for field in ("scheduled", "ai_generated", *PLATFORM_SWITCHES[platform]):
+    if type(settings.get("scheduled")) is not bool:
+        raise ValueError("readback.settings.scheduled must be an observed boolean")
+    switch_fields = PLATFORM_SWITCHES[platform]
+    if not caption_platform:
+        switch_fields = ("ai_generated", *switch_fields)
+    for field in switch_fields:
+        if caption_platform and settings.get(field) == "not_available":
+            continue
         if type(settings.get(field)) is not bool:
             raise ValueError(f"readback.settings.{field} must be an observed boolean")
-    if platform != "douyin" and type(settings.get("original")) is not bool:
+    if platform in ("xiaohongshu", "bilibili") and type(settings.get("original")) is not bool:
         raise ValueError("readback.settings.original must be an observed boolean")
     if settings.get("cover") not in COVER_MODES[platform]:
         raise ValueError("readback.settings must include the observed platform cover mode")
@@ -198,6 +234,10 @@ def check_ready(platform, package, state, evidence):
         source = settings.get("cover_source_sha256")
         if not isinstance(source, str) or not re.fullmatch(r"[0-9a-f]{64}", source):
             raise ValueError("custom cover requires the verified source image checksum")
+    if settings["cover"] == "selected_image":
+        if settings.get("cover_source_sha256") not in expected["image_sha256"]:
+            raise ValueError("selected cover must identify an image in the frozen photo post")
+    package_settings = content["settings"]
     if package_settings is None:
         package_settings = {}
     if not isinstance(package_settings, dict):
@@ -213,8 +253,11 @@ def check_ready(platform, package, state, evidence):
 
 def work_id_from_url(platform, url):
     path = platform_url(platform, url).path.rstrip("/")
-    match = re.fullmatch(WORK_PATHS[platform], path, re.IGNORECASE)
-    return match[1].lower() if match else None
+    pattern = rf"{WORK_PATH_PREFIXES[platform]}({WORK_IDS[platform]})"
+    match = re.fullmatch(pattern, path, re.IGNORECASE | re.ASCII)
+    if not match:
+        return None
+    return match[1].lower() if platform == "xiaohongshu" else match[1]
 
 
 def work_receipt(platform, evidence):
@@ -225,15 +268,15 @@ def work_receipt(platform, evidence):
         raise ValueError("work_url must be a platform work permalink")
     work_id = evidence.get("work_id")
     if work_id is not None:
-        if type(work_id) is int and platform != "xiaohongshu":
+        if type(work_id) is int and platform not in ("xiaohongshu", "instagram"):
             work_id = str(work_id)
         if not isinstance(work_id, str):
             raise ValueError("invalid platform work_id")
-        work_id = work_id.lower()
-        if platform == "bilibili":
-            work_id = work_id.removeprefix("cv")
-        pattern = r"[0-9a-f]{24}" if platform == "xiaohongshu" else r"[1-9][0-9]*"
-        if not re.fullmatch(pattern, work_id):
+        if platform == "xiaohongshu":
+            work_id = work_id.lower()
+        elif platform == "bilibili":
+            work_id = work_id.lower().removeprefix("cv")
+        if not re.fullmatch(WORK_IDS[platform], work_id):
             raise ValueError("invalid platform work_id")
     identifiers = {value for value in (page_id, link_id, work_id) if value is not None}
     if len(identifiers) != 1:
@@ -280,6 +323,8 @@ def update_state(args, package, state, evidence, now):
         settings = evidence["readback"]["settings"]
         if settings["scheduled"] or settings.get("cross_posting") is True:
             raise ValueError("scheduled or cross-posted publication requires the user to submit manually")
+        if settings.get("cross_posting") == "not_available":
+            raise ValueError("publication requires a verified single-platform destination")
         if not explicit_instruction(platform, args.instruction):
             raise ValueError("an explicit current publish instruction naming the platform is required")
         state["authorization"] = {

@@ -22,6 +22,22 @@
 
 保存后可从草稿箱的「编辑」回到带 `aid` 的同一稿件。若重开后话题栏显示「添加话题」，从内容包恢复已选话题并回读。编辑页回读通过和话题已持久保存分别记录。
 
+## TikTok Photo Post
+
+在 [TikTok Studio 上传页](https://www.tiktok.com/tiktokstudio/upload) 检查当前账号是否提供普通照片帖子。[Studio 网页帮助](https://www.tiktok.com/support/faq_detail?id=7581820704895703564) 描述的是视频上传。能明确选中 Photo Post 并看到接受图片的入口时，按内容包顺序上传，核对逐图预览、实际封面、文案与话题，再审受众和其他选项。
+
+只有视频入口、网页不可达或缺少必需控件时，按下方手机交接继续。TikTok App 从「+ → Photo → Upload」选图，核对封面、图序、文案、话题与受众。用 App 的 `Drafts` 保存时，在同一设备、账号回开核对。参见 [TikTok 发帖帮助](https://www.tiktok.com/support/faq_detail?id=7581826684085606968) 和 [AI 内容标识](https://support.tiktok.com/en/using-tiktok/creating-videos/ai-generated-content)。
+
+## Instagram Feed Carousel
+
+从 [Instagram 网页首页](https://www.instagram.com/) 进入「Create → Post → Select from computer」。确认当前账号和 Feed 多图模式，按计划选图，用多选或继续添加的控件补齐。逐图核对顺序、裁切和首图。进入文案页后按 `caption` 一次填写整条说明，回读其中的 `#` 标签与已有提及。账号隐私和帖子受众都应核实，按实际界面检查是否分享到 Facebook 及是否邀请了协作者。
+
+编辑完成时停在 Share 前。网页编辑中的状态交付为打开的编辑页。真实出现可回开的保存入口时才登记持久草稿。网页无法继续时，在 Instagram App 选「+ → Post」并开启多选。需要 Paid partnership 标签时用 App 核对品牌、资格和批准状态。参见 [Instagram 多图帖子帮助](https://help.instagram.com/269314186824048/?cms_platform=www)、[AI 标签帮助](https://help.instagram.com/761121959519495/) 和 [品牌合作标签帮助](https://help.instagram.com/1109894795810258)。
+
+## 手机交接
+
+给出可打开的有序原图、首图或封面选择、完整可复制文案和待核对设置。用 `preflight.py` 的 `ordered_images` 与 `caption` 生成清单，TikTok 另给 `title`。用户在 App 的正确账号下接手相册权限、验证和平台声明。平台编辑器尚未回读时，交付状态为本地待发包或 `blocked`。有网页未完成内容时先核对现状，避免在第二个设备重复建稿。用户自行发布后，可只读回查匹配账号与图文的作品链接。
+
 ## 恢复与提交
 
 - 账号、同一稿件和操作证据尚在时，重查后处理缺项。浏览器重开后，优先找有平台标识的同一稿件；缺少匹配依据时暂停写入。检查过程中不刷新可能尚未保存的编辑页。

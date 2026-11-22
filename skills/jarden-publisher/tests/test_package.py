@@ -176,11 +176,15 @@ class PackageTests(unittest.TestCase):
         revised = self.root / "new-caption.txt"
         revised.write_text("接下来看看角色的几个角度。", encoding="utf-8")
         package = self.package_json(self.run_cli(
-            "build", "--post", post, "--body-file", revised, "--dry-run",
+            "build", "--post", post, "--body-file", revised, *POST_PLATFORM,
+            "--platform", "tiktok", "--platform", "instagram", "--dry-run",
         ))
-        draft = package["platforms"]["xiaohongshu"]
-        self.assertEqual(draft["body"], revised.read_text(encoding="utf-8"))
-        self.assertIs(draft["settings"]["ai_generated"], True)
+        for platform, draft in package["platforms"].items():
+            with self.subTest(platform=platform):
+                self.assertEqual(draft["body"], revised.read_text(encoding="utf-8"))
+                self.assertIs(draft["settings"]["ai_generated"], True)
+                if platform in ("tiktok", "instagram"):
+                    self.assertNotIn(LEGACY_BODY, draft["caption"])
 
     def test_legacy_rejects_tampered_or_incomplete_picture_set(self):
         for problem in ("changed_bytes", "missing_file", "missing_digest"):
@@ -307,6 +311,75 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(len(package["blockers"]["douyin"]), 1)
         self.assertIn("5 个话题", package["blockers"]["douyin"][0])
         self.assertEqual(len(package["platforms"]["douyin"]["topics"]), 6)
+
+    def test_overseas_copy_and_image_order_are_available_for_handoff(self):
+        pictures = self.manual_images()
+        body = "Three views of the character. 🐾\n\n#StudioNotes"
+        body_file = self.root / "copy.txt"
+        body_file.write_text(body, encoding="utf-8")
+        job = self.root / "overseas"
+        package = self.package_json(self.run_cli(
+            "build", "--out", job, "--platform", "tiktok", "--platform", "instagram",
+            "--title", "Character Design", "--body-file", body_file,
+            "--image", pictures[0], "--image", pictures[1], "--topic", "studionotes",
+            "--topic", "Design", "--ai-generated", "--original",
+        ))
+        self.assertEqual(package["blockers"], {})
+        tiktok = package["platforms"]["tiktok"]
+        instagram = package["platforms"]["instagram"]
+        self.assertEqual(tiktok["kind"], "photo-post")
+        self.assertEqual(instagram["kind"], "feed-carousel")
+        self.assertEqual(tiktok["caption"], f"{body}\n\n#Design")
+        self.assertEqual(instagram["caption"], f"Character Design\n\n{body}\n\n#Design")
+        for draft in (tiktok, instagram):
+            self.assert_images(draft["images"], pictures)
+            self.assertEqual(draft["settings"], {"ai_generated": True})
+        result = subprocess.run(
+            [sys.executable, "-B", str(CLI.with_name("preflight.py")), str(job)],
+            cwd=self.root, capture_output=True, encoding="utf-8", timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)["platforms"]
+        for platform, target in package["platforms"].items():
+            self.assertEqual(report[platform]["mode"], target["kind"])
+            self.assertEqual(report[platform]["caption"], target["caption"])
+            self.assertEqual(report[platform]["ordered_images"], list(map(str, pictures)))
+            self.assertEqual(report[platform]["package_blockers"], [])
+        self.assertEqual(report["tiktok"]["title"], "Character Design")
+        self.assertNotIn("title", report["instagram"])
+        self.assertFalse((job / "job.json").exists())
+
+    def test_overseas_photo_budgets_preserve_all_input_images(self):
+        pictures = self.manual_images(count=36)
+        for count, blocked in (
+            (1, {"instagram"}), (2, set()), (20, set()),
+            (21, {"instagram"}), (35, {"instagram"}), (36, {"tiktok", "instagram"}),
+        ):
+            with self.subTest(count=count):
+                package = self.package_json(self.run_cli(
+                    "build", "--platform", "tiktok", "--platform", "instagram", "--dry-run",
+                    *(argument for path in pictures[:count] for argument in ("--image", path)),
+                ))
+                self.assertEqual(set(package["blockers"]), blocked)
+                for entry in package["platforms"].values():
+                    self.assertEqual(len(entry["images"]), count)
+                    self.assertEqual(entry["caption"], "")
+
+    def test_instagram_review_counts_existing_caption_hashtags(self):
+        pictures = self.manual_images()
+        body = self.root / "copy.txt"
+        body.write_text("#One #Two #Three #Four #Five", encoding="utf-8")
+        package = self.package_json(self.run_cli(
+            "build", "--platform", "tiktok", "--platform", "instagram",
+            "--image", pictures[0], "--image", pictures[1], "--body-file", body,
+            "--topic", "one", "--topic", "Six", "--dry-run",
+        ))
+        self.assertEqual(set(package["blockers"]), {"instagram"})
+        self.assertIn("5 个 #标签", package["blockers"]["instagram"][0])
+        self.assertEqual(
+            package["platforms"]["instagram"]["caption"],
+            "#One #Two #Three #Four #Five\n\n#Six",
+        )
 
     def test_bilibili_preserves_article_and_orders_placements_by_paragraph(self):
         pictures = self.manual_images(count=3)

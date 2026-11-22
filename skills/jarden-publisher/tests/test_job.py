@@ -14,6 +14,8 @@ EDITOR_URLS = {
     "xiaohongshu": "https://creator.xiaohongshu.com/publish/publish?target=image",
     "douyin": "https://creator.douyin.com/creator-micro/content/post/image?enter_from=draft",
     "bilibili": "https://member.bilibili.com/platform/upload/text/new-edit",
+    "tiktok": "https://www.tiktok.com/tiktokstudio/upload",
+    "instagram": "https://www.instagram.com/",
 }
 READY_CHECKS = ("mode", "images", "title", "body", "topics", "settings", "final_control")
 WORK_ID = "0123456789abcdef01234567"
@@ -51,6 +53,7 @@ class JobTests(unittest.TestCase):
         self.package = self.succeed(self.run_cli(
             "package.py", "build", "--out", self.job,
             "--platform", "xiaohongshu", "--platform", "douyin", "--platform", "bilibili",
+            "--platform", "tiktok", "--platform", "instagram",
             "--title", "毛绒设计", "--body-file", body,
             "--article-file", body, "--placements-file", placements,
             "--image", cover, "--image", scene, "--topic", "设计记录",
@@ -108,6 +111,14 @@ class JobTests(unittest.TestCase):
             "douyin": {"allow_save": True, "cross_posting": False},
             "bilibili": {"original": False, "comments_enabled": True, "featured_comments": False},
         }
+        if platform in ("tiktok", "instagram"):
+            del readback["body"]
+            readback.update(mode=target["kind"], caption=target["caption"])
+            if platform == "instagram":
+                del readback["title"]
+            platform_settings[platform] = {
+                "comments_enabled": True, "branded_content": "not_available", "cross_posting": False,
+            }
         readback["settings"] = {
             "visibility": "public", "scheduled": False, "ai_generated": False,
             "cover": "text_preview" if platform == "bilibili" else "first_image",
@@ -250,6 +261,8 @@ class JobTests(unittest.TestCase):
         for platform, instruction, settings in (
             ("xiaohongshu", "确认发布这篇到小红书", {"scheduled": True}),
             ("douyin", "确认发布这篇到抖音", {"cross_posting": True}),
+            ("instagram", "确认发布这篇到 Instagram", {"cross_posting": True}),
+            ("tiktok", "确认发布这篇到 TikTok", {"scheduled": True}),
         ):
             with self.subTest(platform=platform):
                 self.make_ready(platform, **settings)
@@ -307,6 +320,76 @@ class JobTests(unittest.TestCase):
         receipt = self.evidence(platform, "confirmed", work_url=WORK_URL, publication="published")
         self.reject(self.record("observe", platform, receipt), before)
         self.assertEqual(self.status()["platforms"][platform]["status"], "ready")
+
+    def test_overseas_readback_requires_photo_mode_and_exact_caption(self):
+        for platform, wrong_mode, wrong_url in (
+            ("tiktok", "video", "https://www.tiktok.com/login"),
+            ("instagram", "reel", "https://www.instagram.com/accounts/login/"),
+        ):
+            with self.subTest(platform=platform):
+                self.succeed(self.begin(platform))
+                before = self.state_file.read_bytes()
+                ready = self.ready_evidence(platform, visibility="followers")
+                invalid = self.ready_evidence(platform)
+                del invalid["readback"]["settings"]["branded_content"]
+                self.reject(self.record("observe", platform, invalid), before)
+                self.reject(self.record("observe", platform, {**ready, "url": wrong_url}), before)
+                for field, wrong in (
+                    ("mode", wrong_mode), ("caption", "Wrong caption"),
+                    ("image_sha256", ready["readback"]["image_sha256"][::-1]),
+                ):
+                    invalid = {**ready, "readback": {**ready["readback"], field: wrong}}
+                    self.reject(self.record("observe", platform, invalid), before)
+                self.succeed(self.record("observe", platform, ready))
+
+    def test_tiktok_cover_must_match_one_of_the_frozen_photos(self):
+        platform = "tiktok"
+        self.succeed(self.begin(platform))
+        before = self.state_file.read_bytes()
+        invalid = self.ready_evidence(platform, cover="selected_image", cover_source_sha256="0" * 64)
+        self.reject(self.record("observe", platform, invalid), before)
+        second = self.package["platforms"][platform]["images"][1]["sha256"]
+        ready = self.ready_evidence(platform, cover="selected_image", cover_source_sha256=second)
+        self.succeed(self.record("observe", platform, ready))
+
+    def test_instagram_authorization_requires_the_effective_sharing_destination(self):
+        platform = "instagram"
+        self.make_ready(platform, cross_posting="not_available")
+        before = self.state_file.read_bytes()
+        evidence = self.ready_evidence(platform, cross_posting="not_available")
+        self.reject(
+            self.record("authorize", platform, evidence, "--instruction", "确认发布这篇到 Instagram"),
+            before,
+        )
+
+    def test_overseas_authorization_and_receipts_are_platform_specific(self):
+        for platform, instruction, wrong_instruction, identifier, work_url, wrong_url in (
+            ("tiktok", "确认发布这篇到 TikTok", "确认发布这篇到抖音", "12345",
+             "https://www.tiktok.com/@test_account/photo/12345", "https://www.tiktok.com/@test_account/video/12345"),
+            ("instagram", "Publish this post on Instagram", "确认发布这篇到 TikTok", "AbCdef12_3-",
+             "https://www.instagram.com/p/AbCdef12_3-/", "https://www.instagram.com/reel/AbCdef12_3-/"),
+        ):
+            with self.subTest(platform=platform):
+                self.make_ready(platform)
+                before = self.state_file.read_bytes()
+                self.reject(self.authorize(platform, wrong_instruction), before)
+                self.succeed(self.authorize(platform, instruction))
+                attempt = self.state_file.read_bytes()
+                self.reject(self.authorize(platform, instruction), attempt)
+                wrong_media = self.evidence(platform, "confirmed", work_url=wrong_url, publication="published")
+                self.reject(self.record("observe", platform, wrong_media), attempt)
+                if platform == "instagram":
+                    wrong_case = self.evidence(
+                        platform, "confirmed", work_id=identifier.lower(), work_url=work_url,
+                        publication="published",
+                    )
+                    self.reject(self.record("observe", platform, wrong_case), attempt)
+                receipt = self.evidence(
+                    platform, "confirmed", work_id=identifier, work_url=work_url, publication="published",
+                )
+                result = self.succeed(self.record("observe", platform, receipt))
+                self.assertEqual(result["work_id"], identifier)
+                self.assertEqual(result["work_url"], work_url)
 
     def test_confirmation_requires_a_consistent_platform_receipt_and_publication(self):
         platform = "xiaohongshu"
