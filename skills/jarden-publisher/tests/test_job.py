@@ -90,10 +90,9 @@ class JobTests(unittest.TestCase):
     def record(self, command, platform, evidence, *args):
         evidence_file = self.root / "evidence.json"
         write_json(evidence_file, evidence)
-        if command == "authorize" and platform in ("tiktok", "instagram") and "--review-id" not in args:
-            review = self.status()["platforms"][platform].get("review_id")
-            if review:
-                args += ("--review-id", review)
+        if command == "handoff" and "--review-id" not in args:
+            review = self.status()["platforms"][platform].get("review_id", "")
+            args += ("--review-id", review)
         return self.run_cli("job.py", command, self.job, platform, "--file", evidence_file, *args)
 
     def evidence(self, platform, status, **fields):
@@ -141,11 +140,16 @@ class JobTests(unittest.TestCase):
         self.succeed(self.record("observe", platform, self.ready_evidence(platform, **settings)))
         self.assertEqual(self.status()["platforms"][platform]["status"], "ready")
 
-    def authorize(self, platform, instruction="确认发布这篇到小红书"):
+    def handoff(self, platform, instruction="请发布这篇到小红书"):
         return self.record(
-            "authorize", platform, self.ready_evidence(platform),
+            "handoff", platform, self.ready_evidence(platform),
             "--instruction", instruction,
         )
+
+    def receipt(self, platform, **fields):
+        readback = self.ready_evidence(platform)["readback"]
+        del readback["settings"]
+        return self.evidence(platform, "confirmed", readback=readback, **fields)
 
     def test_frozen_package_starts_each_platform_once(self):
         package_file = self.job / "package.json"
@@ -261,7 +265,7 @@ class JobTests(unittest.TestCase):
         verified = self.ready_evidence(platform, cover="custom_image", cover_source_sha256=unverified["readback"]["image_sha256"][0])
         self.succeed(self.record("observe", platform, verified))
 
-    def test_authorization_refuses_scheduled_or_cross_posted_submission(self):
+    def test_handoff_refuses_scheduled_or_cross_posted_submission(self):
         for platform, instruction, settings in (
             ("xiaohongshu", "确认发布这篇到小红书", {"scheduled": True}),
             ("douyin", "确认发布这篇到抖音", {"cross_posting": True}),
@@ -272,9 +276,9 @@ class JobTests(unittest.TestCase):
                 self.make_ready(platform, **settings)
                 before = self.state_file.read_bytes()
                 evidence = self.ready_evidence(platform, **settings)
-                self.reject(self.record("authorize", platform, evidence, "--instruction", instruction), before)
+                self.reject(self.record("handoff", platform, evidence, "--instruction", instruction), before)
 
-    def test_authorization_refuses_stale_or_changed_options(self):
+    def test_handoff_refuses_stale_or_changed_options(self):
         platform = "xiaohongshu"
         self.make_ready(platform)
         before = self.state_file.read_bytes()
@@ -283,9 +287,9 @@ class JobTests(unittest.TestCase):
         stale["observed_at"] = (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat()
         previous = self.status()["platforms"][platform]["evidence"]
         for evidence in (changed, stale, previous):
-            self.reject(self.record("authorize", platform, evidence, "--instruction", "确认发布这篇到小红书"), before)
+            self.reject(self.record("handoff", platform, evidence, "--instruction", "确认发布这篇到小红书"), before)
 
-    def test_single_platform_authorization_still_names_target(self):
+    def test_single_platform_handoff_still_names_target(self):
         platform = "xiaohongshu"
         write_json(self.job / "package.json", self.succeed(self.run_cli(
             "package.py", "build", "--dry-run", "--title", "毛绒设计",
@@ -294,36 +298,45 @@ class JobTests(unittest.TestCase):
         self.package = json.loads((self.job / "package.json").read_text())
         self.make_ready(platform)
         before = self.state_file.read_bytes()
-        self.reject(self.authorize(platform, "确认发布这篇"), before)
-        self.succeed(self.authorize(platform, "确认发布这篇到小红书"))
+        self.reject(self.handoff(platform, "确认发布这篇"), before)
+        self.succeed(self.handoff(platform))
 
-    def test_authorization_reserves_one_attempt_and_keeps_unknown_without_receipt(self):
+    def test_xiaohongshu_and_douyin_wait_for_the_user_to_publish(self):
+        for platform, name, other_platform in (
+            ("xiaohongshu", "小红书", "抖音"), ("douyin", "抖音", "小红书"),
+        ):
+            with self.subTest(platform=platform):
+                self.make_ready(platform)
+                before = self.state_file.read_bytes()
+                for message in (
+                    "请准备草稿", "继续", "好了", "可以", "确认", "就按这个",
+                    "确认发布这篇", f"确认发布这篇到{other_platform}", f"发到{name}了",
+                ):
+                    with self.subTest(message=message):
+                        self.reject(self.handoff(platform, message), before)
+                instruction = f"请帮我发布这篇到{name}"
+                handed_off = self.succeed(self.handoff(platform, instruction))
+                self.assertEqual(handed_off["status"], "awaiting_user_publish")
+                self.assertEqual(handed_off["handoff"]["instruction"], instruction)
+                self.assertNotIn("authorization", handed_off)
+                self.assertNotIn("publication", handed_off)
+                self.succeed(self.record(
+                    "observe", platform, self.evidence(platform, "blocked", summary="尚未看到发布回执"),
+                ))
+                observed = self.status()["platforms"][platform]
+                self.assertEqual(observed["status"], "awaiting_user_publish")
+                self.assertEqual(observed["handoff"], handed_off["handoff"])
+                self.reject(self.handoff(platform, instruction), self.state_file.read_bytes())
+
+    def test_old_authorize_command_has_no_publish_path(self):
         platform = "xiaohongshu"
         self.make_ready(platform)
         before = self.state_file.read_bytes()
-        for unauthorized in ("请准备草稿", "确认发布这篇", "确认发布这篇到抖音"):
-            with self.subTest(instruction=unauthorized):
-                self.reject(self.authorize(platform, unauthorized), before)
-        instruction = "确认发布这篇到小红书"
-        self.succeed(self.authorize(platform, instruction))
-        authorized = self.status()["platforms"][platform]
-        self.assertEqual(authorized["status"], "publish_unknown")
-        self.assertEqual(authorized["authorization"]["instruction"], instruction)
-        self.succeed(self.record(
-            "observe", platform, self.evidence(platform, "blocked", summary="尚未看到提交回执"),
-        ))
-        observed = self.status()["platforms"][platform]
-        self.assertEqual(observed["status"], "publish_unknown")
-        self.assertEqual(observed["authorization"], authorized["authorization"])
-        self.reject(self.authorize(platform, instruction), self.state_file.read_bytes())
-
-    def test_cannot_confirm_publication_without_authorization(self):
-        platform = "xiaohongshu"
-        self.make_ready(platform)
-        before = self.state_file.read_bytes()
-        receipt = self.evidence(platform, "confirmed", work_url=WORK_URL, publication="published")
-        self.reject(self.record("observe", platform, receipt), before)
-        self.assertEqual(self.status()["platforms"][platform]["status"], "ready")
+        result = self.record(
+            "authorize", platform, self.ready_evidence(platform), "--instruction", "确认发布这篇到小红书",
+        )
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertEqual(self.state_file.read_bytes(), before)
 
     def test_overseas_readback_requires_photo_mode_and_exact_caption(self):
         for platform, wrong_mode, wrong_url in (
@@ -357,36 +370,55 @@ class JobTests(unittest.TestCase):
         ready = self.ready_evidence(platform, cover="selected_image", cover_source_sha256=second)
         self.succeed(self.record("observe", platform, ready))
 
-    def test_instagram_authorization_requires_the_effective_sharing_destination(self):
+    def test_instagram_handoff_requires_the_effective_sharing_destination(self):
         platform = "instagram"
         self.make_ready(platform, cross_posting="not_available")
         before = self.state_file.read_bytes()
         evidence = self.ready_evidence(platform, cross_posting="not_available")
         self.reject(
-            self.record("authorize", platform, evidence, "--instruction", "确认发布这篇到 Instagram"),
+            self.record("handoff", platform, evidence, "--instruction", "确认发布这篇到 Instagram"),
             before,
         )
 
-    def test_instagram_audience_change_requires_a_new_review(self):
-        platform = "instagram"
-        self.make_ready(platform, visibility="followers")
-        reviewed = self.status()["platforms"][platform]["review_id"]
-        updated = self.succeed(self.record("observe", platform, self.ready_evidence(platform, visibility="public")))
-        self.assertNotEqual(updated["review_id"], reviewed)
-        before = self.state_file.read_bytes()
-        instruction = "确认发布这篇到 Instagram"
-        for unused_review in ("", reviewed):
-            with self.subTest(review=unused_review):
-                self.reject(self.record(
-                    "authorize", platform, self.ready_evidence(platform, visibility="public"),
-                    "--instruction", instruction, "--review-id", unused_review,
-                ), before)
-        self.succeed(self.record(
-            "authorize", platform, self.ready_evidence(platform, visibility="public"),
-            "--instruction", instruction, "--review-id", updated["review_id"],
-        ))
+    def test_audience_change_requires_a_new_review(self):
+        for platform in EDITOR_URLS:
+            with self.subTest(platform=platform):
+                self.make_ready(platform, visibility="followers")
+                reviewed = self.status()["platforms"][platform]["review_id"]
+                updated = self.succeed(self.record("observe", platform, self.ready_evidence(platform, visibility="public")))
+                self.assertNotEqual(updated["review_id"], reviewed)
+                before = self.state_file.read_bytes()
+                instruction = f"确认发布这篇到 {platform}"
+                for unused_review in ("", reviewed):
+                    with self.subTest(review=unused_review):
+                        self.reject(self.record(
+                            "handoff", platform, self.ready_evidence(platform, visibility="public"),
+                            "--instruction", instruction, "--review-id", unused_review,
+                        ), before)
+                result = self.succeed(self.record(
+                    "handoff", platform, self.ready_evidence(platform, visibility="public"),
+                    "--instruction", instruction, "--review-id", updated["review_id"],
+                ))
+                self.assertEqual(result["status"], "awaiting_user_publish")
 
-    def test_overseas_authorization_and_receipts_are_platform_specific(self):
+    def test_existing_ready_draft_can_be_reviewed_and_resumed(self):
+        platform = "xiaohongshu"
+        self.make_ready(platform)
+        legacy = self.status()
+        del legacy["platforms"][platform]["review_id"]
+        write_json(self.state_file, legacy)
+        self.reject(self.handoff(platform), self.state_file.read_bytes())
+        self.succeed(self.record("observe", platform, self.ready_evidence(platform)))
+        self.succeed(self.handoff(platform))
+        before = self.state_file.read_bytes()
+        self.reject(self.record("observe", platform, self.ready_evidence(platform)), before)
+        wrong_draft = {**self.ready_evidence(platform), "url": f"{EDITOR_URLS[platform]}&draft=other"}
+        self.reject(self.record("observe", platform, wrong_draft, "--resume-draft"), before)
+        resumed = self.succeed(self.record("observe", platform, self.ready_evidence(platform), "--resume-draft"))
+        self.assertEqual(resumed["status"], "ready")
+        self.assertNotIn("handoff", resumed)
+
+    def test_overseas_handoffs_and_receipts_are_platform_specific(self):
         for platform, instruction, wrong_instruction, identifier, work_url, wrong_url in (
             ("tiktok", "确认发布这篇到 TikTok", "确认发布这篇到抖音", "12345",
              "https://www.tiktok.com/@test_account/photo/12345", "https://www.tiktok.com/@test_account/video/12345"),
@@ -396,27 +428,23 @@ class JobTests(unittest.TestCase):
             with self.subTest(platform=platform):
                 self.make_ready(platform)
                 before = self.state_file.read_bytes()
-                self.reject(self.authorize(platform, wrong_instruction), before)
-                self.reject(self.authorize(platform, f"发到 {platform} 了"), before)
-                self.succeed(self.authorize(platform, instruction))
-                attempt = self.state_file.read_bytes()
-                self.reject(self.authorize(platform, instruction), attempt)
-                wrong_media = self.evidence(platform, "confirmed", work_url=wrong_url, publication="published")
-                self.reject(self.record("observe", platform, wrong_media), attempt)
-                wrong_page = self.evidence(
-                    platform, "confirmed", url=wrong_url, work_id=identifier, publication="published",
-                )
-                self.reject(self.record("observe", platform, wrong_page), attempt)
+                self.reject(self.handoff(platform, wrong_instruction), before)
+                self.reject(self.handoff(platform, f"发到 {platform} 了"), before)
+                self.succeed(self.handoff(platform, instruction))
+                pending = self.state_file.read_bytes()
+                self.reject(self.handoff(platform, instruction), pending)
+                wrong_media = self.receipt(platform, work_url=wrong_url, publication="published")
+                self.reject(self.record("reconcile", platform, wrong_media), pending)
+                wrong_page = self.receipt(platform, url=wrong_url, work_id=identifier, publication="published")
+                self.reject(self.record("reconcile", platform, wrong_page), pending)
                 if platform == "instagram":
-                    wrong_case = self.evidence(
-                        platform, "confirmed", work_id=identifier.lower(), work_url=work_url,
+                    wrong_case = self.receipt(
+                        platform, work_id=identifier.lower(), work_url=work_url,
                         publication="published",
                     )
-                    self.reject(self.record("observe", platform, wrong_case), attempt)
-                receipt = self.evidence(
-                    platform, "confirmed", work_id=identifier, work_url=work_url, publication="published",
-                )
-                result = self.succeed(self.record("observe", platform, receipt))
+                    self.reject(self.record("reconcile", platform, wrong_case), pending)
+                receipt = self.receipt(platform, work_id=identifier, work_url=work_url, publication="published")
+                result = self.succeed(self.record("reconcile", platform, receipt))
                 self.assertEqual(result["work_id"], identifier)
                 self.assertEqual(result["work_url"], work_url)
 
@@ -445,13 +473,34 @@ class JobTests(unittest.TestCase):
                 self.assertEqual(result["work_url"], url)
                 self.assertNotIn("authorization", result)
                 self.assertEqual(self.status()["platforms"][platform], result)
-                self.reject(self.authorize(platform, f"确认发布这篇到 {platform}"), self.state_file.read_bytes())
+                self.reject(self.handoff(platform, f"确认发布这篇到 {platform}"), self.state_file.read_bytes())
 
-    def test_confirmation_requires_a_consistent_platform_receipt_and_publication(self):
+    def test_legacy_publish_attempt_remains_read_only_until_verified(self):
         platform = "xiaohongshu"
         self.make_ready(platform)
-        self.succeed(self.authorize(platform))
+        legacy = self.status()
+        record = legacy["platforms"][platform]
+        record.update(status="publish_unknown", authorization={
+            "authorized_at": now_iso(), "instruction": "确认发布这篇到小红书", "evidence": record["evidence"],
+        })
+        write_json(self.state_file, legacy)
         before = self.state_file.read_bytes()
+        self.reject(self.handoff(platform), before)
+        self.reject(self.record("observe", platform, self.ready_evidence(platform)), before)
+        receipt = self.evidence(platform, "confirmed", work_url=WORK_URL, publication="published")
+        self.succeed(self.record("observe", platform, receipt))
+        confirmed = self.status()["platforms"][platform]
+        self.assertEqual(confirmed["status"], "confirmed")
+        self.assertEqual(confirmed["authorization"], record["authorization"])
+
+    def test_user_publication_requires_a_consistent_platform_receipt(self):
+        platform = "xiaohongshu"
+        self.make_ready(platform)
+        self.succeed(self.handoff(platform))
+        before = self.state_file.read_bytes()
+        without_readback = self.evidence(platform, "confirmed", work_url=WORK_URL, publication="published")
+        self.reject(self.record("observe", platform, without_readback), before)
+        self.reject(self.record("reconcile", platform, without_readback), before)
         invalid_receipts = {
             "missing work identity": {"publication": "published"},
             "wrong platform": {"work_url": "https://www.douyin.com/note/12345", "publication": "published"},
@@ -461,23 +510,33 @@ class JobTests(unittest.TestCase):
         }
         for mismatch, receipt in invalid_receipts.items():
             with self.subTest(mismatch=mismatch):
-                evidence = self.evidence(platform, "confirmed", **receipt)
-                self.reject(self.record("observe", platform, evidence), before)
+                evidence = self.receipt(platform, **receipt)
+                self.reject(self.record("reconcile", platform, evidence), before)
         for publication, identifier in (
             ("submitted", {"work_id": WORK_ID}),
             ("in_review", {"work_id": WORK_ID, "work_url": WORK_URL}),
             ("published", {"work_url": WORK_URL}),
         ):
             with self.subTest(publication=publication):
-                evidence = self.evidence(platform, "confirmed", publication=publication, **identifier)
-                self.succeed(self.record("observe", platform, evidence))
+                evidence = self.receipt(platform, publication=publication, **identifier)
+                self.succeed(self.record("reconcile", platform, evidence))
                 state = self.status()["platforms"][platform]
                 self.assertEqual(state["status"], "confirmed")
                 self.assertEqual(state["work_id"], WORK_ID)
                 self.assertEqual(state["publication"], publication)
         before = self.state_file.read_bytes()
-        other_work = self.evidence(platform, "confirmed", work_id="f" * 24, publication="published")
-        self.reject(self.record("observe", platform, other_work), before)
+        other_work = self.receipt(platform, work_id="f" * 24, publication="published")
+        self.reject(self.record("reconcile", platform, other_work), before)
+
+    def test_douyin_handoff_can_be_reconciled_after_the_user_publishes(self):
+        platform = "douyin"
+        self.make_ready(platform)
+        self.succeed(self.handoff(platform, "请发布这篇到抖音"))
+        evidence = self.receipt(platform, work_url="https://www.douyin.com/note/12345", publication="published")
+        result = self.succeed(self.record("reconcile", platform, evidence))
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual(result["work_id"], "12345")
+        self.assertNotIn("authorization", result)
 
 
 if __name__ == "__main__":

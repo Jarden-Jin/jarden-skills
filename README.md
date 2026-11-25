@@ -7,7 +7,7 @@ Jarden 的可复用 Skill 集合，用于把创作与交付流程整理成可重
 | Skill | 用途 |
 | --- | --- |
 | [jarden-ip-visual](skills/jarden-ip-visual/README.md) | 从四组 21 项目录按需制作原创 IP 设计与宣发资产，用常驻 Archify 工作台跟踪真实状态；可选将确认成图延展为 Live Photo，分别记录配对、图库播放和设备验收，不强制商品或发帖流水线。 |
-| [jarden-publisher](skills/jarden-publisher/README.md) | 将定稿图文准备到小红书、抖音、B 站专栏、TikTok Photo Post 或 Instagram 多图轮播。集中预检账号、封面和发布设置，默认停在发布前。 |
+| [jarden-publisher](skills/jarden-publisher/README.md) | 将定稿图文准备到小红书、抖音、B 站专栏、TikTok Photo Post 或 Instagram 多图轮播。集中预检账号、封面和设置，最终发布由用户在平台确认。 |
 | [jarden-image](skills/jarden-image/README.md) | 通过 Jarden 的远程 API 调用 MOSS 或专用 H3 Image，查询参数、估时、恢复任务并校验下载图片；不包含模型和任何 API Key。 |
 | [jarden-video](skills/jarden-video/README.md) | 通过 Jarden 的远程 API 生成 H3 文生视频或首帧视频，选择服务支持的采样配置，恢复任务并校验下载；不包含模型和任何 API Key。 |
 

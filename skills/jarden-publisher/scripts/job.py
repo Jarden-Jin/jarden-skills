@@ -351,7 +351,7 @@ def explicit_instruction(platform, instruction):
     text = instruction.strip().rstrip("。.!！")
     chinese = re.sub(r"\s+", "", text)
     target = rf"(?:{PLATFORM_NAMES[platform]})"
-    prefix = r"(?:(?:我?(?:确认|同意|授权)|好)[，,]?|可以|请|就)?"
+    prefix = r"(?:(?:我?(?:确认|同意|授权)|好)[，,]?|可以|请(?:帮我)?|帮我|就)?"
     reference = r"(?:这[篇条个]|本[篇条])"
     noun = r"(?:笔记|图文|专栏|文章|帖子|稿件|内容)"
     verb = r"(?:现在|立即)?(?:发布|发)"
@@ -380,54 +380,57 @@ def review_id(state, evidence):
     })
 
 
-def update_state(args, package, state, evidence, now):
-    from package import CAPTION_PLATFORMS
+def record_handoff(args, package, state, evidence, now):
+    if state["status"] != "ready" or "authorization" in state or evidence["status"] != "ready":
+        raise ValueError("handoff requires a ready draft without a pending or previous submission")
+    check_ready(args.platform, package, state, evidence)
+    if timestamp(evidence["observed_at"]) <= timestamp(state["evidence"]["observed_at"]):
+        raise ValueError("handoff requires a new editor observation")
+    if args.review_id != state.get("review_id") or args.review_id != review_id(state, evidence):
+        raise ValueError("handoff requires the same review shown to the user")
+    settings = evidence["readback"]["settings"]
+    if settings["scheduled"] or settings.get("cross_posting") is True:
+        raise ValueError("scheduled or cross-posted publication stays outside this handoff")
+    if settings.get("cross_posting") == "not_available":
+        raise ValueError("handoff requires a verified single-platform destination")
+    if not explicit_instruction(args.platform, args.instruction):
+        raise ValueError("handoff requires an explicit current user request naming the platform")
+    state["handoff"] = {
+        "instruction": args.instruction,
+        "requested_at": now.isoformat(),
+        "review_id": args.review_id,
+        "url": evidence["url"],
+    }
+    state["status"] = "awaiting_user_publish"
 
+
+def update_state(args, package, state, evidence, now):
     platform, stage = args.platform, state["status"]
     check_observation(platform, state, evidence, now)
     observed = evidence["status"]
-    if args.command == "authorize":
-        if stage != "ready" or "authorization" in state or observed != "ready":
-            raise ValueError("authorization requires a ready job without a publish attempt")
-        check_ready(platform, package, state, evidence)
-        previous = state["evidence"]
-        if timestamp(evidence["observed_at"]) <= timestamp(previous["observed_at"]):
-            raise ValueError("authorization requires a new editor observation")
-        fields = ("fingerprint", "url", "draft_id")
-        current_readback = json.dumps(evidence["readback"], sort_keys=True)
-        previous_readback = json.dumps(previous.get("readback"), sort_keys=True)
-        if current_readback != previous_readback or any(evidence.get(field) != previous.get(field) for field in fields):
-            raise ValueError("authorization evidence must match the ready observation")
-        if platform in CAPTION_PLATFORMS and (
-            not args.review_id or args.review_id != state.get("review_id") or args.review_id != review_id(state, evidence)
-        ):
-            raise ValueError("authorization requires the review_id shown to the user before approval")
-        settings = evidence["readback"]["settings"]
-        if settings["scheduled"] or settings.get("cross_posting") is True:
-            raise ValueError("scheduled or cross-posted publication requires the user to submit manually")
-        if settings.get("cross_posting") == "not_available":
-            raise ValueError("publication requires a verified single-platform destination")
-        if not explicit_instruction(platform, args.instruction):
-            raise ValueError("an explicit current publish instruction naming the platform is required")
-        state["authorization"] = {
-            "instruction": args.instruction,
-            "authorized_at": now.isoformat(timespec="seconds"),
-            "evidence": evidence,
-        }
-        state["status"] = "publish_unknown"
+    if args.command == "handoff":
+        record_handoff(args, package, state, evidence, now)
+    elif args.resume_draft and (
+        stage != "awaiting_user_publish" or observed not in {"editing", "ready"}
+        or evidence["url"] != state["handoff"]["url"]
+    ):
+        raise ValueError("resuming requires the original editor after the user ends the publish handoff")
     elif observed == "confirmed":
         if stage not in {"publish_unknown", "confirmed"} or "authorization" not in state:
-            raise ValueError("confirmation requires a recorded publish attempt")
+            raise ValueError("use reconcile to record a verified user publication")
         confirm_work(platform, state, evidence)
     elif stage == "confirmed" or (stage == "publish_unknown" and observed == "ready"):
         raise ValueError("a recorded publish attempt cannot return to editing or readiness")
+    elif stage == "awaiting_user_publish" and not args.resume_draft:
+        if observed != "blocked":
+            raise ValueError("the user publish handoff is still pending")
     elif stage != "publish_unknown":
         if observed == "ready":
             check_ready(platform, package, state, evidence)
-            if platform in CAPTION_PLATFORMS:
-                state["review_id"] = review_id(state, evidence)
+            state["review_id"] = review_id(state, evidence)
         else:
             state.pop("review_id", None)
+        state.pop("handoff", None)
         state["status"] = observed
     if "draft_id" in evidence:
         state["draft_id"] = evidence["draft_id"]
@@ -491,7 +494,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Record publishing job stages and readbacks")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status").add_argument("job", type=Path)
-    for name in ("begin", "observe", "authorize"):
+    for name in ("begin", "observe", "handoff", "reconcile"):
         command = commands.add_parser(name)
         command.add_argument("job", type=Path)
         command.add_argument("platform", choices=PLATFORM_NAMES)
@@ -500,13 +503,11 @@ def main(argv=None):
                 command.add_argument(f"--{field}", required=True)
         else:
             command.add_argument("--file", type=Path, required=True)
-        if name == "authorize":
+        if name == "handoff":
             command.add_argument("--instruction", required=True)
-            command.add_argument("--review-id", help="ID of the ready snapshot shown before approval")
-    reconcile = commands.add_parser("reconcile", help="Record a user-published TikTok or Instagram post")
-    reconcile.add_argument("job", type=Path)
-    reconcile.add_argument("platform", choices=("tiktok", "instagram"))
-    reconcile.add_argument("--file", type=Path, required=True)
+            command.add_argument("--review-id", required=True, help="ID of the editor review shown to the user")
+        elif name == "observe":
+            command.add_argument("--resume-draft", action="store_true", help="User ended the handoff without publishing")
     try:
         print(json.dumps(run(parser.parse_args(argv)), ensure_ascii=False))
     except (OSError, ValueError, KeyError, TypeError, ImportError) as error:

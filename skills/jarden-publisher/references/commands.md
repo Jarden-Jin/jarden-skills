@@ -39,26 +39,28 @@ python3 "$SKILL_DIR/scripts/job.py" begin "$JOB_DIR" "$PLATFORM" \
 python3 "$SKILL_DIR/scripts/job.py" observe "$JOB_DIR" "$PLATFORM" --file "$EVIDENCE"
 ```
 
-## 记录提交
+## 发布交接
 
-给用户核对稿件、账号、受众和设置。海外两站同时留存这份 `ready` 记录的 `review_id`，供本次授权使用。版本、账号或设置变化时重做审阅并取得新的批准。收到明确提交指令后，再读一次同一编辑页，将晚于上次就绪记录的证据和用户原话交给 `authorize`。用户告知已经发布时走回查。程序返回 `publish_unknown` 后可执行站点允许的唯一提交动作。定时、同步发布或无法核定唯一发布目的地时由用户操作。结果不明时只查回执。
+草稿任务报告预览或已确认的草稿状态后结束。用户明确要求发布当前稿件到指定平台时，给用户看实际稿件、封面、账号、受众和关键设置，同时留存这份 `ready` 记录的 `review_id`。定时、同步或目的地未核实的设置只交给用户自行处理。
+
+交还控制前再读一次同一编辑页。使用晚于上次就绪记录的证据、用户本次原话和给用户看过的 `review_id`。较早的任务可重新回读生成 ID。稿件、账号或设置发生变化时先重新展示，并等待用户对更新内容明确提出发布请求。
 
 ```sh
-python3 "$SKILL_DIR/scripts/job.py" authorize "$JOB_DIR" "$PLATFORM" \
-  --file "$EVIDENCE" --instruction "$USER_INSTRUCTION"
+python3 "$SKILL_DIR/scripts/job.py" handoff "$JOB_DIR" "$PLATFORM" \
+  --file "$EVIDENCE" --instruction "$USER_INSTRUCTION" --review-id "$REVIEW_ID"
 ```
 
-海外两站在上述命令追加 `--review-id "$REVIEW_ID"`。使用给用户看过的版本所对应的 ID。较早的海外记录可以重新回读生成此 ID。
+`awaiting_user_publish` 是等待用户在原页面完成最后确认的状态。将页面交还用户后结束浏览器写入。用户明确说没有提交并要继续编辑时，回到原账号下的同一草稿核对，再用 `observe --resume-draft` 结束这次交接。用户告知已提交或结果不明时只读回查。
 
-平台接受时用 `observe` 记录 `confirmed`，并用 `publication` 区分提交、审核和已发布。国内平台按实际作品 ID 或链接核对。TikTok 与 Instagram 使用实际图文链接，TikTok 核对 `/@用户/photo/数字ID`，Instagram 核对 `/p/短码/`，短码区分大小写。回执尚未出现时沿用 `publish_unknown`，只查原平台的作品管理。程序负责本地字段、文件、时序和状态校验。浏览器的观察者负责核验实际页面。
+## 回查发布结果
 
-## 回查手机发布
-
-用户自行发布后，从实际图文页回读作者、图序和完整文案。对 TikTok 或 Instagram 使用 `reconcile` 把结果写回原任务。证据填写 `status: confirmed`、`account`、`url`、`observed_at`、`summary`、`publication` 和 `fingerprint`。当 `url` 是管理页时，另填图文作品的 `work_url`。`readback` 使用该平台的图片、模式与文案字段。发布页可核对到的范围或设置写入摘要。已有记录时，账号和已知作品 ID 须一致。仅有本地内容包也可回查。
+用户自行发布后，从实际图文页回读作者、图序和完整文案。用 `reconcile` 把五个平台的已核实回执写回原任务，只有本地内容包也可回查。证据填写 `status: confirmed`、`account`、`url`、`observed_at`、`summary`、`publication` 和 `fingerprint`。`publication` 区分 `submitted`、`in_review` 和 `published`。国内平台用实际 `work_id` 或 `work_url`。TikTok 用 `/@用户/photo/数字ID` 链接，Instagram 用 `/p/短码/` 链接，短码区分大小写。`readback` 使用该平台的内容字段，范围或设置写入摘要。已有记录时，账号和已知作品 ID 须一致。
 
 ```sh
 python3 "$SKILL_DIR/scripts/job.py" reconcile "$JOB_DIR" "$PLATFORM" --file "$EVIDENCE"
 ```
+
+较早的 `publish_unknown` 记录保留原提交历史，可用 `observe` 记录已核实回执。回执尚未出现时继续只读查证。
 
 ## 本地回归
 
